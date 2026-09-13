@@ -628,14 +628,27 @@ class ExpertLoader:
 
     def __init__(self, get, layer: int, device: str):
         self.get, self.layer, self.device = get, layer, device
+        # DSV41_REF_CB: re-quantize each expert through a B-bit row codebook before the forward, so
+        # the teacher-forced NLL this tool already reports becomes a direct measurement of what the
+        # served expert format costs. The serving path is CB3; the checkpoint is FP4; nothing else
+        # compares them end to end, and doing it here needs one layer shard at a time rather than
+        # the 296 GB an engine A/B would want.
+        b = os.environ.get("DSV41_REF_CB")
+        self.sim = None
+        if b:
+            from engine.codebook_sim import CodebookSim
+            self.sim = CodebookSim(int(b), device)
 
     def __call__(self, e: int):
         p = f"layers.{self.layer}.ffn.experts.{e}."
         d = self.device
-        w1 = dequant_fp4_packed(self.get(p + "w1.weight").to(d), self.get(p + "w1.scale").to(d))
-        w2 = dequant_fp4_packed(self.get(p + "w2.weight").to(d), self.get(p + "w2.scale").to(d))
-        w3 = dequant_fp4_packed(self.get(p + "w3.weight").to(d), self.get(p + "w3.scale").to(d))
-        return w1, w2, w3
+        out = []
+        for n in ("w1", "w2", "w3"):
+            w, s = self.get(p + n + ".weight").to(d), self.get(p + n + ".scale").to(d)
+            if self.sim is not None:
+                w = self.sim.requant_packed(w, s)
+            out.append(dequant_fp4_packed(w, s))
+        return tuple(out)
 
 
 # ----------------------------------------------------------------------------- attention (prefill, T <= 512)
