@@ -648,6 +648,8 @@ class V41Engine:
                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
                 "steps": steps,
                 "accept_len_mean": round(float(np.mean(accepted_hist)) + 1, 2) if accepted_hist else None,
+                **({"nonfinite_attn": int(self.fast.nan_probe[0]), "nan_probes": int(self.fast.nan_probe[1])}
+                   if getattr(getattr(self, "fast", None), "nan_probe", None) is not None else {}),
                 "expert_hit_rate": round(self.store.hit_rate(), 4), "expert_misses": st["misses"],
                 "prefill_expert_misses": st["prefill_misses"], "nvme_gb": round(st["bytes_read"] / 1e9, 2),
                 "nvme_read_s": round(st["read_s"], 2),

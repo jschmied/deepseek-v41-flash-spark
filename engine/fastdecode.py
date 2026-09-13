@@ -133,6 +133,10 @@ class FastDecoder:
         # draft
         self.d_tok = torch.zeros(1, dtype=torch.long, device=dev)
         self.d_last = torch.zeros(1, dtype=torch.long, device=dev)   # last main position
+        # DSV41_NAN_PROBE=1: count non-finite values in every layer's attention output, inside
+        # the graph. [0] = non-finite elements seen, [1] = (layer, step) probes taken.
+        self.nan_probe = (torch.zeros(2, dtype=torch.long, device=dev)
+                          if os.environ.get('DSV41_NAN_PROBE') == '1' else None)
         self.d_noise = torch.zeros(T_DRAFT, a.vocab_size, dtype=torch.float32, device=dev)  # gumbel noise
         self.d_temp = torch.zeros(1, dtype=torch.float32, device=dev)
         self.d_out = torch.zeros(T_DRAFT, dtype=torch.long, device=dev)
@@ -294,6 +298,12 @@ class FastDecoder:
         f = getattr(self, 'tap', None)
         if f is not None:
             f(name, L, t)
+        if self.nan_probe is not None and name == 'attn_out':
+            # Device-side, so it is CAPTURED INTO the CUDA graph and runs on every replay. A Python
+            # callback would only fire at capture time, which is exactly why a token-exact greedy
+            # gate cannot see an intermittent NaN (CiphemonJY: 17 of 997 steps, gate PASSED).
+            self.nan_probe[0] += (~torch.isfinite(t)).sum()
+            self.nan_probe[1] += 1
 
     def _layer_a(self, L, sh_state):
         """attention + HC + router for backbone layer L, reading self.h/self.pre_mix/self.pos."""
