@@ -133,6 +133,14 @@ class ExpertStore:
         self.transient_pos = 0
         self.transient_map: dict[tuple, int] = {}
         io_threads = int(os.environ.get("DSV41_IO_THREADS", io_threads))
+        # Optional native CB3 cache (engine/cb3_cache.py). When present a miss is one aligned
+        # 13,774,848 B read whose bytes are already the arena's layout, instead of 18,800,640 B of
+        # packed FP4 in two runs plus an fp4_to_cb3_v2 repack on the GPU.
+        self.cb3_cache = None
+        _cc = os.environ.get("DSV41_CB3_CACHE")
+        if _cc:
+            from .cb3_cache import CB3Cache
+            self.cb3_cache = CB3Cache(_cc, arena.device if hasattr(arena, "device") else "cuda")
         if read_threads is None:
             read_threads = int(os.environ.get("DSV41_READ_THREADS", 24))
         if read_chunk_mb is None:
@@ -253,6 +261,8 @@ class ExpertStore:
         first: the clone was a second 18.8 MB CPU memcpy per expert AND it made the H2D copy run
         from pageable memory, which PyTorch has to stage through a bounce buffer of its own.
         """
+        if self.cb3_cache is not None:
+            return self._load_into_slot_cached(key, slot)
         stream = self._copy_stream()
         compute = torch.cuda.current_stream()  # capture OUTSIDE the `with`, where it is still ours
 
@@ -282,6 +292,39 @@ class ExpertStore:
             return slot
 
         return self._read_leased(key[0], key[1], prefix, sink)
+
+    def _load_into_slot_cached(self, key: tuple, slot: int):
+        """The same contract as `_load_into_slot`, reading the native CB3 cache instead.
+
+        Keeps the staging lease and the copy stream exactly as the FP4 path does, so the only
+        differences are the byte count (13,774,848 vs 18,800,640), one extent instead of two runs,
+        and no `fp4_to_cb3_v2`: the record is already in the arena's layout and only the 3-bit
+        scale planes are expanded, on the device.
+        """
+        c = self.cb3_cache
+        stream = self._copy_stream()
+        compute = torch.cuda.current_stream()
+        t_lease = time.perf_counter()
+        sid = self._lease()
+        self.stats["lease_s"] += time.perf_counter() - t_lease
+        try:
+            buf = self.stage[sid]
+            mv = self.stage_mv[sid]
+            cur = (-buf.data_ptr()) % ALIGN
+            t0 = time.perf_counter()
+            c.read_into(mv[cur:cur + c.record], key[0], key[1])
+            self.stats["bytes_read"] += c.record
+            self.stats["read_s"] += time.perf_counter() - t0
+            self.stats["loads"] += 1
+            t1 = time.perf_counter()
+            with torch.cuda.stream(stream):
+                stream.wait_stream(compute)
+                c.load_slot(self.arena, slot, buf[cur:cur + c.record], non_blocking=True)
+            stream.synchronize()
+            self.stats["h2d_s"] += time.perf_counter() - t1
+            return slot
+        finally:
+            self._release(sid)
 
     # ------------------------------------------------------------------ cache policy
     def _lru_slot_for(self, key: tuple, used: set | frozenset = frozenset()) -> int:
