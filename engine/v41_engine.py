@@ -664,10 +664,42 @@ class V41Engine:
                 "kernel_s": round(m.stats["moe_s"] - st["resolve_s"], 2),
                 "nvme_gb_per_token": round(st["bytes_read"] / 1e9 / max(n_out, 1), 3),
                 "promoted": st["promoted"],
+                # decode-only, from the prefill snapshot: the totals above are prefill + decode and
+                # prefill dominates every I/O counter, so these are the ones to reason about.
+                **({"decode_only": {k: (round(v, 3) if isinstance(v, float) else v)
+                                    for k, v in (self._decode_delta() or {}).items()}}
+                   if getattr(self, "_pf", None) is not None else {}),
             }
+
+    def _snap_prefill(self):
+        """Freeze every counter at the prefill -> decode boundary.
+
+        `_reset()` zeroes model, table and store stats at the start of EVERY request, so what
+        `x_engine_stats` reports is a per-request total of prefill PLUS decode. There is no way to
+        recover the decode half from outside: differencing two requests just differences two
+        prefills, which on this engine dominate (thousands of expert loads against tens). Two
+        attempts to do it from the exported totals produced a negative kernel_s and then negative
+        attn_s deltas before this was obvious.
+        """
+        self._pf = {"store": dict(self.store.stats), "model": dict(self.model.stats),
+                    "tables": {k: dict(v.stats) for k, v in self.tables.items()}}
+
+    def _decode_delta(self):
+        """Counters accumulated during DECODE only, or None if no snapshot was taken."""
+        pf = getattr(self, "_pf", None)
+        if pf is None:
+            return None
+        d = {k: self.store.stats[k] - pf["store"].get(k, 0) for k in self.store.stats}
+        d.update({k: self.model.stats[k] - pf["model"].get(k, 0) for k in self.model.stats})
+        d["engram_rows"] = sum(v.stats["rows"] - pf["tables"].get(k, {}).get("rows", 0)
+                               for k, v in self.tables.items())
+        d["engram_s"] = sum(v.stats["seconds"] - pf["tables"].get(k, {}).get("seconds", 0.0)
+                            for k, v in self.tables.items())
+        return d
 
     def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None, penalties=None):
         m = self.model
+        self._snap_prefill()
         t_start = time.perf_counter()
         out_st["t_decode0"] = t_start
         # prefill in chunks
