@@ -137,6 +137,11 @@ class FastDecoder:
         # the graph. [0] = non-finite elements seen, [1] = (layer, step) probes taken.
         self.nan_probe = (torch.zeros(2, dtype=torch.long, device=dev)
                           if os.environ.get('DSV41_NAN_PROBE') == '1' else None)
+        # DSV41_ENGRAM_ABLATE=1: fill every Engram row with zeros instead of the table's.
+        # A degeneration gate cannot see a feature being silently disabled -- the field proved it
+        # by doing exactly this and watching a token-exact greedy gate still PASS. So the test is
+        # the inverse of a gate: ablate on purpose and require the output to CHANGE.
+        self.engram_ablate = os.environ.get('DSV41_ENGRAM_ABLATE') == '1'
         self.d_noise = torch.zeros(T_DRAFT, a.vocab_size, dtype=torch.float32, device=dev)  # gumbel noise
         self.d_temp = torch.zeros(1, dtype=torch.float32, device=dev)
         self.d_out = torch.zeros(T_DRAFT, dtype=torch.long, device=dev)
@@ -536,7 +541,11 @@ class FastDecoder:
             self.ids.copy_(block_ids)
             self.pos.copy_(S + torch.arange(T_VERIFY, device=self.dev))
         rows_fn = engram_rows if callable(engram_rows) else None
-        if rows_fn is None:
+        if self.engram_ablate:
+            rows_fn = None
+            for L in self.eg_rows:
+                self.eg_rows[L].zero_()
+        elif rows_fn is None:
             for L, rows in engram_rows.items():
                 self.eg_rows[L].copy_(rows)
         if LEAN_STEP:
