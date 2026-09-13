@@ -15,10 +15,15 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
 import torch
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+import scale_codec as SC  # noqa: E402  the writer uses the same module, by design
+
 ALIGN = 4096
+FORMAT_VERSION = 1
 
 
 class CB3Cache:
@@ -31,11 +36,16 @@ class CB3Cache:
         self.n_experts = int(self.man["n_experts"])
         self.planes = {k: tuple(v) for k, v in self.man["planes"].items()}
         self.groups = {k: int(v) for k, v in self.man["scale_groups"].items()}
-        assert int(self.man["scale_bits"]) == 3, "only the 3-bit scale codec is implemented"
+        v = int(self.man.get("format_version", 0))
+        if v != FORMAT_VERSION:
+            raise ValueError(f"{path}: record format v{v}, this engine reads v{FORMAT_VERSION}. "
+                             f"Rebuild with tools/cb3_cache_build.py.")
+        if self.man.get("codec") != SC.CODEC:
+            raise ValueError(f"{path}: scale codec {self.man.get('codec')!r} != {SC.CODEC!r}")
+        assert int(self.man["scale_bits"]) == SC.BITS
         assert self.record % ALIGN == 0
         self.device = torch.device(device)
         self.fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-        self._sh = torch.arange(8, device=self.device, dtype=torch.int32) * 3
 
     def close(self):
         if getattr(self, "fd", None) is not None:
@@ -61,12 +71,7 @@ class CB3Cache:
 
     def _unpack_scales(self, buf: torch.Tensor, name: str, rows: int) -> torch.Tensor:
         g = self.groups[name]
-        p = buf.reshape(rows, 1 + g * 3 // 8)
-        base = p[:, :1].to(torch.int16)
-        b = p[:, 1:].reshape(rows, g // 8, 3).to(torch.int32)
-        w = b[..., 0] | (b[..., 1] << 8) | (b[..., 2] << 16)
-        d = ((w.unsqueeze(-1) >> self._sh) & 7).reshape(rows, g).to(torch.int16)
-        return (d + base).to(torch.uint8)
+        return SC.unpack_torch(buf.reshape(rows, SC.packed_row_bytes(g)), g)
 
     def load_slot(self, arena, slot: int, staged: torch.Tensor, non_blocking: bool = False) -> None:
         """Copy one cached record from `staged` (a uint8 CPU tensor holding the record) into `slot`.
