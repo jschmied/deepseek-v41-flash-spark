@@ -45,6 +45,15 @@ ROUTE_LOG = open(_RL, "w", buffering=1 << 16) if _RL else None
 # is exactly what the pipelined design wants to remove, so never leave it on for a timing number.
 ROUTE_SYNC = os.environ.get("DSV41_ROUTE_SYNC", "0") == "1"
 
+# DIAGNOSTIC ONLY, AND UNSAFE. Skips the `stream.wait_stream(compute)` that each loader thread does
+# before overwriting a slot. That barrier exists because the previous layer's MoE kernel may still
+# be reading the slot -- a PER-SLOT dependency, implemented as "wait for all compute". It was free
+# under chunk-major, where resolve() blocked and nothing was on the compute stream; under
+# EARLY_SUBMIT it makes every H2D wait for the attention it was supposed to overlap with, parks the
+# worker, and stalls the read pool. This gate removes it to find out how much of the measured 1.03x
+# is that barrier rather than real contention. It can corrupt an in-flight slot. Never for serving.
+UNSAFE_NO_COMPUTE_WAIT = os.environ.get("DSV41_UNSAFE_NO_COMPUTE_WAIT", "0") == "1"
+
 ZERO_STATS = {"hits": 0, "misses": 0, "prefill_misses": 0, "bytes_read": 0, "read_s": 0.0,
               "resolve_s": 0.0, "route_s": 0.0, "load_s": 0.0, "lease_s": 0.0, "h2d_s": 0.0,
               "sync_s": 0.0, "load_submit_s": 0.0, "load_wait_s": 0.0,
@@ -292,7 +301,8 @@ class ExpertStore:
                 if b:
                     kw["sim"] = self.cb_sims[b]
             with torch.cuda.stream(stream):
-                stream.wait_stream(compute)
+                if not UNSAFE_NO_COMPUTE_WAIT:
+                    stream.wait_stream(compute)
                 self.arena.load_slot(slot, w1.view(*W13_SHAPE), s1.view(*S13_SHAPE), w2.view(*W2_SHAPE),
                                      s2.view(*S2_SHAPE), w3.view(*W13_SHAPE), s3.view(*S13_SHAPE),
                                      non_blocking=True, **kw)
@@ -332,7 +342,8 @@ class ExpertStore:
             self.stats["loads"] += 1
             t1 = time.perf_counter()
             with torch.cuda.stream(stream):
-                stream.wait_stream(compute)
+                if not UNSAFE_NO_COMPUTE_WAIT:
+                    stream.wait_stream(compute)
                 c.load_slot(self.arena, slot, buf[cur:cur + c.record], non_blocking=True)
             stream.synchronize()
             self.stats["h2d_s"] += time.perf_counter() - t1
