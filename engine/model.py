@@ -37,10 +37,6 @@ RING = int(os.environ.get("DSV41_RING", 4096))
 # experts and quadrupling the chunk quarters it. The ceiling is activation memory: at T=2048 the
 # gathered window+compressed KV of one layer is ~2.7 GB.
 MAX_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", 2048))
-# Per-layer phase timing for the layer-major pass. Every scheduling idea on the table is a claim
-# about where time goes INSIDE a layer, and route_s/load_s/moe_s are per-request totals that
-# cannot see it. Costs a device sync per layer, so it is a diagnostic, never a serving setting.
-LM_PHASES = os.environ.get("DSV41_LM_PHASES", "0") == "1"
 
 # Chunk invariance requires every GEMM to give the same row whatever the batch length M. cuBLAS
 # picks split-K kernels for small M and, with this flag on, reduces the K-splits in bf16, so
@@ -660,10 +656,8 @@ class Model:
         # chunk keeps at most `window_size` rows of them rather than its whole [T, n_c] mask
         tails = []
 
-        phase = [] if LM_PHASES else None
         for L in range(last_L + 1):
             w = self.W.layers[L]
-            t_layer = time.perf_counter()
             post = []           # per chunk: (residual, ffn_post, ffn_comb)
             ys, idxs, wts = [], [], []
             for ci, (lo, hi) in enumerate(bounds):
@@ -687,7 +681,6 @@ class Model:
                     n = min(a.window_size, hi - lo)
                     tails.append((sh.topk[-n:],
                                   sh.candidates[-n:] if sh.candidates is not None else None))
-            t_routed = time.perf_counter()
             # ONE resolve for the whole layer: every missing expert is read exactly once, and its
             # slot stays valid for every chunk below because nothing else claims the ring meanwhile.
             lut = getattr(self, "slot_lut", None)
@@ -696,7 +689,6 @@ class Model:
                 self.stats["hits"] = self.stats.get("hits", 0) + sum(i.numel() for i in idxs)
             else:
                 all_slots = store.resolve(L, torch.cat(idxs), True)
-            t_resolved = time.perf_counter()
             off = 0
             for ci, y in enumerate(ys):
                 n = y.size(0)
@@ -704,25 +696,12 @@ class Model:
                 off += n
                 resid, ffn_post, ffn_comb = post[ci]
                 H[ci] = R.hc_post(out, resid, ffn_post, ffn_comb)
-            if phase is not None:
-                torch.cuda.synchronize()
-                phase.append((L, t_routed - t_layer, t_resolved - t_routed,
-                              time.perf_counter() - t_resolved))
 
         # `c.len` is written once, at the end. Verified rather than assumed: nothing on the encoder
         # path reads it -- `_compressed` derives its indices from S, T and `pending[L]` alone, and
         # `pending` is per-layer, so walking chunks inside a layer advances exactly the state that
         # layer owns. The only readers are `forward`'s assert and `Caches.rollback`, neither of
         # which runs during this pass.
-        if phase is not None:
-            a_, b_, c_ = (sum(p[i] for p in phase) for i in (1, 2, 3))
-            tot = a_ + b_ + c_
-            print(f"[layer-major phases] {len(phase)} encoder layers, {tot:.1f}s: "
-                  f"attn+route {a_:.1f}s ({100*a_/tot:.0f}%), resolve {b_:.1f}s "
-                  f"({100*b_/tot:.0f}%), ffn {c_:.1f}s ({100*c_/tot:.0f}%)", flush=True)
-            print("  per layer attn+route/resolve/ffn (s): "
-                  + " ".join(f"L{p[0]}:{p[1]:.2f}/{p[2]:.2f}/{p[3]:.2f}" for p in phase[:8])
-                  + (" ..." if len(phase) > 8 else ""), flush=True)
         for n, per_layer in pend.items():
             if len(per_layer) == last_L + 1:      # every encoder layer passed this boundary
                 self.c._ckpt[n] = dict(per_layer)
