@@ -17,9 +17,12 @@ Pipeline for one call (T tokens, K experts per token), three Triton launches and
      decodes them with the hardware `cvt.rn.f16x2.e2m1x2` instruction (one instruction per byte -> two
      fp16), does tl.dot against the (up to BM) pairs of the block and applies the UE8M0 scale on the fp32
      partial sum of each 32-wide K group. Epilogue = clamps + SiLU + routing weight; writes h[pair, :]
-     (bf16 [T*K, 2304]). Its n-block-0 programs also zero the fp32 output rows for step 3.
-  3. _moe_down_kernel: same structure over w2, atomically scatter-adds the fp32 tile into y32[token, :];
-     y32 is cast to bf16 at the end.
+     (bf16 [T*K, 2304]).
+  3. _moe_down_kernel: same structure over w2, writes its fp32 tile into parts[(k, token), :], a
+     [TOPK, T, DIM] buffer where every (k, token) pair is written exactly once; torch sums over the
+     outermost axis and casts to bf16. NOT atomics -- see the comment above the kernel: atomic_add
+     made the summation order depend on block scheduling, so a token's value changed between a short
+     and a long prefill chunk and the next layer's router amplified it.
 
 K-permutation trick: because a dot product is order-invariant along K, the even/odd nibbles never have to
 be interleaved. The decoder returns the even K elements and the odd K elements as two [BN, 16] fp16 tiles
