@@ -44,13 +44,17 @@ STEP_TIMING = os.environ.get("DSV41_STEP_TIMING", "0") == "1"
 # Sampling semantics are untouched: the temperature > 0 path is the ORIGINAL code, RNG draw for RNG
 # draw, and the greedy path computes argmax of the same logits in the same order.
 LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
-# Extend-only prompt cache. Off by default until it is measured: it changes what a request
-# computes, and every number in notes/ was taken without it.
-PROMPT_CACHE = os.environ.get("DSV41_PROMPT_CACHE", "0") == "1"
+# Extend-only prompt cache. ON by default since 2026-09-14. Measured: turn 2 of a conversation
+# costs ~21 s at ANY context (2.85x / 5.83x / 9.12x at 5.9k / 11.4k / 22.2k tokens), because the
+# resumed suffix is always just the reply plus the follow-up. Set DSV41_PROMPT_CACHE=0 to disable.
+PROMPT_CACHE = os.environ.get("DSV41_PROMPT_CACHE", "1") == "1"
 # Layer-major encoder prefill: visit layers outermost so each layer's experts are read once for the
-# whole prompt instead of once per chunk. Measured ceiling 3.88x at 11.3k tokens and 9.38x at 27.2k
-# (notes/layer-major-prefill.md). Off by default until it is measured on the engine.
-LAYER_MAJOR = os.environ.get("DSV41_LAYER_MAJOR", "0") == "1"
+# whole prompt instead of once per chunk. ON by default since 2026-09-14. Measured on the engine,
+# three separate servers per arm, 16,776-token prompt: TTFT 156.3 -> 72.7 s (2.15x), prefill
+# 107.4 -> 230.8 tok/s, NVMe 438.5 -> 80.8 GB (5.43x); 20/20 tokens identical, 14/14 rare
+# identifiers byte-exact and 5/5 degeneration gate on BOTH arms. The load floor is
+# context-independent, so the win grows with prompt length. DSV41_LAYER_MAJOR=0 to disable.
+LAYER_MAJOR = os.environ.get("DSV41_LAYER_MAJOR", "1") == "1"
 
 
 class StepPhases:
