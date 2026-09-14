@@ -142,6 +142,7 @@ class ExpertStore:
         self.transient_index = {s: i for i, s in enumerate(self.transient_ring)}
         self.transient_pos = 0
         self.transient_map: dict[tuple, int] = {}
+        self._pending: list = []          # futures from resolve(defer=True)
         io_threads = int(os.environ.get("DSV41_IO_THREADS", io_threads))
         # Optional native CB3 cache (engine/cb3_cache.py). When present a miss is one aligned
         # 13,774,848 B read whose bytes are already the arena's layout, instead of 18,800,640 B of
@@ -418,9 +419,16 @@ class ExpertStore:
         self.stats["promoted"] += 1
         return True
 
-    def resolve(self, layer: int, experts: torch.Tensor, prefill: bool) -> torch.Tensor:
+    def resolve(self, layer: int, experts: torch.Tensor, prefill: bool,
+                defer: bool = False) -> torch.Tensor:
         """experts: int tensor [T, K] of expert ids for `layer`. Returns the slot ids [T, K],
-        loading misses (in parallel) first."""
+        loading misses (in parallel) first.
+
+        `defer=True` returns as soon as the slots are assigned and leaves the reads in flight, for a
+        caller that has other work to do first -- measured: after chunk 0 of a layer has routed,
+        85.4 % of that layer's entire expert set is already known, and there is ~2.4x more remaining
+        attention than the reads need. The caller owns `join_pending()`.
+        """
         if ROUTE_SYNC:
             # The first statement below is a BLOCKING .to("cpu"), so without this the device wait is
             # charged to route_s and reads as host bookkeeping. Measured offline, the actual host
@@ -489,10 +497,34 @@ class ExpertStore:
         self.stats["route_s"] += time.perf_counter() - t_res
         if to_load:
             t0 = time.perf_counter()
-            list(self.pool.map(lambda ks: self._load_into_slot(*ks), to_load))
+            if defer:
+                # Hand the futures back instead of collapsing them. `slots` is ALREADY correct --
+                # assignment happened synchronously in passes 1 and 2 above and `used` guarantees
+                # nothing else claims those slots -- so the only thing the wait provides is data
+                # readiness. The caller must `join_pending()` before the next resolve() on this
+                # store: the transient ring is ~400 slots and one layer wants up to ~384, so a
+                # second resolve could hand out a slot this one is still writing.
+                self._pending += [self.pool.submit(self._load_into_slot, k, sl) for k, sl in to_load]
+            else:
+                list(self.pool.map(lambda ks: self._load_into_slot(*ks), to_load))
             self.stats["load_s"] += time.perf_counter() - t0
         self.stats["resolve_s"] += time.perf_counter() - t_res
         return slots
+
+    def join_pending(self):
+        """Block until every read submitted with `defer=True` has landed.
+
+        Each io worker already `stream.synchronize()`s its own copy stream before releasing its
+        pinned staging lease, so a resolved future IS a completion guarantee -- no CUDA events are
+        needed for this to be safe.
+        """
+        if not self._pending:
+            return
+        t0 = time.perf_counter()
+        for f in self._pending:
+            f.result()
+        self._pending = []
+        self.stats["load_s"] += time.perf_counter() - t0
 
     def warm_start(self, ranked_keys: list[tuple], log=print):
         """Fill the LRU with `ranked_keys` (most important first) up to capacity."""

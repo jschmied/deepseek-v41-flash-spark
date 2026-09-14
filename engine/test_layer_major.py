@@ -62,17 +62,30 @@ def main() -> int:
         log("FAIL: fewer than 3 chunks -- the transpose has almost nothing to do, test is vacuous")
         return 2
 
+    # The prompt cache is ON by default since 2026-09-14, and this test runs both arms on the SAME
+    # prompt in one process -- so arm 2 would resume arm 1's context instead of prefilling, and
+    # report a spectacular speedup for the wrong reason. It did exactly that once (37.2s -> 6.5s,
+    # which is a resumed turn, not a transpose). Off for the whole test.
+    E.PROMPT_CACHE = False
+    eng._reset()
+
     E.LAYER_MAJOR = False
     ref, st_ref = run(eng, ids, a.max_tokens)
     log(f"chunk-major: prefill {st_ref['prefill_s']}s, nvme {st_ref['nvme_gb']} GB, "
         f"prefill misses {st_ref['prefill_expert_misses']}")
 
     E.LAYER_MAJOR = True
+    eng._reset()                       # arm 2 must prefill, not resume
     got, st_lm = run(eng, ids, a.max_tokens)
     log(f"layer-major: prefill {st_lm['prefill_s']}s, nvme {st_lm['nvme_gb']} GB, "
         f"prefill misses {st_lm['prefill_expert_misses']}")
 
     failed = 0
+    for lbl, st in (("chunk-major", st_ref), ("layer-major", st_lm)):
+        if st.get("prompt_cache_reused"):
+            log(f"FAIL: {lbl} arm resumed {st['prompt_cache_reused']} tokens from the cache -- "
+                f"it is measuring a resume, not a prefill")
+            failed = 1
     n = min(len(ref), len(got))
     first = next((j for j in range(n) if ref[j] != got[j]), None)
     if first is None and len(ref) == len(got):

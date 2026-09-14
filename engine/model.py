@@ -41,6 +41,9 @@ MAX_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", 2048))
 # about where time goes INSIDE a layer, and route_s/load_s/moe_s are per-request totals that
 # cannot see it. Costs a device sync per layer, so it is a diagnostic, never a serving setting.
 LM_PHASES = os.environ.get("DSV41_LM_PHASES", "0") == "1"
+# Submit a chunk's expert reads as soon as IT has routed, instead of waiting for the whole layer.
+# Off by default until measured on the engine.
+EARLY_SUBMIT = os.environ.get("DSV41_EARLY_SUBMIT", "0") == "1"
 
 # Chunk invariance requires every GEMM to give the same row whatever the batch length M. cuBLAS
 # picks split-K kernels for small M and, with this flag on, reduces the K-splits in bf16, so
@@ -666,6 +669,9 @@ class Model:
             t_layer = time.perf_counter()
             post = []           # per chunk: (residual, ffn_post, ffn_comb)
             ys, idxs, wts = [], [], []
+            lut = getattr(self, "slot_lut", None)
+            lut = lut if (lut is not None and n_experts != 128) else None
+            part = {}           # ci -> slots, when EARLY_SUBMIT resolved this chunk on its own
             for ci, (lo, hi) in enumerate(bounds):
                 h = H[ci]
                 if L in self.W.engram:
@@ -683,6 +689,14 @@ class Model:
                 ys.append(y); post.append((h, ffn_post, ffn_comb)); PM[ci] = ffn_pre
                 i_c, w_c = self.moe_route(y, w, L, n_experts)
                 idxs.append(i_c); wts.append(w_c)
+                if EARLY_SUBMIT and lut is None:
+                    # This chunk's expert ids are final the moment it has routed, so its reads can
+                    # start while the remaining chunks are still doing attention. Measured on the
+                    # recorded routes: chunk 0 alone names 85.4 % of the layer's ENTIRE expert set
+                    # (worst layer 76.4 %), and there is ~0.74 s of remaining attention per layer
+                    # against ~0.30 s of delivery -- 2.4x more lead time than the reads need.
+                    # Slots are assigned synchronously inside resolve(); only the data is deferred.
+                    part[ci] = store.resolve(L, i_c, True, defer=True)
                 if L == last_L:
                     n = min(a.window_size, hi - lo)
                     tails.append((sh.topk[-n:],
@@ -690,10 +704,15 @@ class Model:
             t_routed = time.perf_counter()
             # ONE resolve for the whole layer: every missing expert is read exactly once, and its
             # slot stays valid for every chunk below because nothing else claims the ring meanwhile.
-            lut = getattr(self, "slot_lut", None)
-            if lut is not None and n_experts != 128:
+            if lut is not None:
                 all_slots = lut[L][torch.cat(idxs)]
                 self.stats["hits"] = self.stats.get("hits", 0) + sum(i.numel() for i in idxs)
+            elif part:
+                # Every chunk already resolved itself as it routed; the reads are in flight. Nothing
+                # is left to assign, so this is purely the join. Experts shared between chunks were
+                # hits on the later ones, so each is still read exactly once per layer.
+                store.join_pending()
+                all_slots = torch.cat([part[ci] for ci in range(len(ys))])
             else:
                 all_slots = store.resolve(L, torch.cat(idxs), True)
             t_resolved = time.perf_counter()
