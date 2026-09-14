@@ -47,7 +47,8 @@ ROUTE_SYNC = os.environ.get("DSV41_ROUTE_SYNC", "0") == "1"
 
 ZERO_STATS = {"hits": 0, "misses": 0, "prefill_misses": 0, "bytes_read": 0, "read_s": 0.0,
               "resolve_s": 0.0, "route_s": 0.0, "load_s": 0.0, "lease_s": 0.0, "h2d_s": 0.0,
-              "sync_s": 0.0, "loads": 0, "promoted": 0}
+              "sync_s": 0.0, "load_submit_s": 0.0, "load_wait_s": 0.0,
+              "loads": 0, "promoted": 0}
 W13_SHAPE = (2304, 2560)
 S13_SHAPE = (2304, 160)
 W2_SHAPE = (5120, 1152)
@@ -143,6 +144,8 @@ class ExpertStore:
         self.transient_pos = 0
         self.transient_map: dict[tuple, int] = {}
         self._pending: list = []          # futures from resolve(defer=True)
+        self._pending_slots: set[int] = set()   # slots those futures are still writing
+        self._pending_layer: int | None = None
         io_threads = int(os.environ.get("DSV41_IO_THREADS", io_threads))
         # Optional native CB3 cache (engine/cb3_cache.py). When present a miss is one aligned
         # 13,774,848 B read whose bytes are already the arena's layout, instead of 18,800,640 B of
@@ -362,15 +365,25 @@ class ExpertStore:
         return slot
 
     def _transient_slot_for(self, key: tuple, used: set | frozenset = frozenset()) -> int:
-        """Next slot of the transient ring, skipping any slot already promised in this call."""
+        """Next slot of the transient ring, skipping any slot already promised in this call.
+
+        `_pending_slots` is skipped too, and that is what makes `resolve(defer=True)` safe. `used`
+        is local to ONE resolve call, so a sequence of deferred resolves inside a layer each start
+        with an empty `used` and would otherwise be free to recycle a slot whose read is still in
+        flight -- silently, with no exception. Invisible at TRANSIENT_SLOTS=400 against a layer's
+        ~362 distinct experts; immediate at the 8 that env.example documents.
+        """
         n = len(self.transient_ring)
         for _ in range(n):
             slot = self.transient_ring[self.transient_pos % n]
             self.transient_pos += 1
-            if slot not in used:
+            if slot not in used and slot not in self._pending_slots:
                 break
         else:
-            raise RuntimeError("transient ring exhausted: more experts in one call than transient_slots")
+            raise RuntimeError(
+                f"transient ring exhausted: {len(used)} promised here + "
+                f"{len(self._pending_slots)} still loading > transient_slots={self.transient_slots}. "
+                f"Deferred submission needs the ring to hold a layer's distinct experts.")
         old = self.slot_key.pop(slot, None)
         if old is not None:
             self.transient_map.pop(old, None)
@@ -504,7 +517,13 @@ class ExpertStore:
                 # readiness. The caller must `join_pending()` before the next resolve() on this
                 # store: the transient ring is ~400 slots and one layer wants up to ~384, so a
                 # second resolve could hand out a slot this one is still writing.
+                assert self._pending_layer in (None, layer), (
+                    f"deferred resolves span layers {self._pending_layer} and {layer}; "
+                    f"join_pending() must be called at a layer boundary")
+                self._pending_layer = layer
+                self._pending_slots.update(sl for _, sl in to_load)
                 self._pending += [self.pool.submit(self._load_into_slot, k, sl) for k, sl in to_load]
+                self.stats["load_submit_s"] += time.perf_counter() - t0
             else:
                 list(self.pool.map(lambda ks: self._load_into_slot(*ks), to_load))
             self.stats["load_s"] += time.perf_counter() - t0
@@ -524,7 +543,12 @@ class ExpertStore:
         for f in self._pending:
             f.result()
         self._pending = []
-        self.stats["load_s"] += time.perf_counter() - t0
+        self._pending_slots.clear()
+        self._pending_layer = None
+        # NOT load_s. With deferred submission the overlapped part of a load disappears from every
+        # counter, so load_s would silently mean different things depending on `defer`. This is the
+        # residual the overlap failed to hide -- the number the scheduler is judged on.
+        self.stats["load_wait_s"] += time.perf_counter() - t0
 
     def warm_start(self, ranked_keys: list[tuple], log=print):
         """Fill the LRU with `ranked_keys` (most important first) up to capacity."""

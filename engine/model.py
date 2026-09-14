@@ -41,9 +41,20 @@ MAX_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", 2048))
 # about where time goes INSIDE a layer, and route_s/load_s/moe_s are per-request totals that
 # cannot see it. Costs a device sync per layer, so it is a diagnostic, never a serving setting.
 LM_PHASES = os.environ.get("DSV41_LM_PHASES", "0") == "1"
-# Submit a chunk's expert reads as soon as IT has routed, instead of waiting for the whole layer.
-# Off by default until measured on the engine.
-EARLY_SUBMIT = os.environ.get("DSV41_EARLY_SUBMIT", "0") == "1"
+# Submit expert reads before the whole layer has routed. Modes, so the +3.7 s that all-chunk
+# submission put back into attn+route can be ATTRIBUTED rather than assumed:
+#   off       today's behaviour: one resolve after every chunk has routed
+#   all       resolve(defer=True) after every chunk  (7 blocking route-id D2H per layer)
+#   chunk0    resolve(defer=True) after chunk 0 only (1 D2H; chunk 0 already names 85.4 % of the
+#             layer's expert set, so the union resolve at the end loads only the ~15 % tail)
+#   synconly  the per-chunk D2H barrier and nothing else -- the control that separates the cost of
+#             synchronising from the cost of overlapping
+EARLY_SUBMIT = os.environ.get("DSV41_EARLY_SUBMIT", "off").lower()
+if EARLY_SUBMIT in ("1", "true", "yes"):
+    EARLY_SUBMIT = "all"
+elif EARLY_SUBMIT in ("0", "false", "no", ""):
+    EARLY_SUBMIT = "off"
+assert EARLY_SUBMIT in ("off", "all", "chunk0", "synconly"), EARLY_SUBMIT
 
 # Chunk invariance requires every GEMM to give the same row whatever the batch length M. cuBLAS
 # picks split-K kernels for small M and, with this flag on, reduces the K-splits in bf16, so
@@ -689,7 +700,11 @@ class Model:
                 ys.append(y); post.append((h, ffn_post, ffn_comb)); PM[ci] = ffn_pre
                 i_c, w_c = self.moe_route(y, w, L, n_experts)
                 idxs.append(i_c); wts.append(w_c)
-                if EARLY_SUBMIT and lut is None:
+                if EARLY_SUBMIT == "synconly" and lut is None:
+                    # the barrier alone: the same blocking device->host copy of the route ids that
+                    # resolve() opens with, and none of the work that follows it
+                    i_c.to("cpu", dtype=torch.int32, non_blocking=False)
+                elif EARLY_SUBMIT != "off" and lut is None and (EARLY_SUBMIT == "all" or ci == 0):
                     # This chunk's expert ids are final the moment it has routed, so its reads can
                     # start while the remaining chunks are still doing attention. Measured on the
                     # recorded routes: chunk 0 alone names 85.4 % of the layer's ENTIRE expert set
@@ -707,12 +722,16 @@ class Model:
             if lut is not None:
                 all_slots = lut[L][torch.cat(idxs)]
                 self.stats["hits"] = self.stats.get("hits", 0) + sum(i.numel() for i in idxs)
-            elif part:
-                # Every chunk already resolved itself as it routed; the reads are in flight. Nothing
-                # is left to assign, so this is purely the join. Experts shared between chunks were
-                # hits on the later ones, so each is still read exactly once per layer.
+            elif part and len(part) == len(ys):
+                # every chunk resolved itself as it routed; nothing left to assign, so this is the join
                 store.join_pending()
                 all_slots = torch.cat([part[ci] for ci in range(len(ys))])
+            elif part:
+                # chunk0 mode: chunk 0's reads are in flight and cover ~85 % of the layer. Join them,
+                # then one union resolve picks up the ~15 % tail the later chunks discovered -- the
+                # early experts are transient-ring hits by then, so each is still read once per layer.
+                store.join_pending()
+                all_slots = store.resolve(L, torch.cat(idxs), True)
             else:
                 all_slots = store.resolve(L, torch.cat(idxs), True)
             t_resolved = time.perf_counter()
