@@ -624,6 +624,29 @@ def expert_ffn(x: torch.Tensor, w1, w2, w3, limit: float, weights: torch.Tensor 
     return qlinear(h.to(dtype), w2)
 
 
+def _ref_cb_bits(spec: str | None, layer: int) -> int | None:
+    """"3" -> 3 for every layer. "3,18-22:2,30:4" -> 3 by default, 2 on layers 18..22, 4 on layer 30.
+
+    Returns None when unset, so the FP4 path is untouched.
+    """
+    if not spec:
+        return None
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    default, out = None, None
+    for p in parts:
+        if ":" not in p:
+            default = int(p)
+            continue
+        rng, bits = p.split(":")
+        lo, hi = (rng.split("-") + [rng.split("-")[0]])[:2] if "-" in rng else (rng, rng)
+        if int(lo) <= layer <= int(hi):
+            out = int(bits)
+    if out is not None:
+        return out
+    assert default is not None, f"DSV41_REF_CB={spec!r} gives no width for layer {layer}"
+    return default
+
+
 class ExpertLoader:
     """Loads one routed expert's three FP4 matrices from an open safetensors shard and dequantizes."""
 
@@ -634,7 +657,13 @@ class ExpertLoader:
         # served expert format costs. The serving path is CB3; the checkpoint is FP4; nothing else
         # compares them end to end, and doing it here needs one layer shard at a time rather than
         # the 296 GB an engine A/B would want.
-        b = os.environ.get("DSV41_REF_CB")
+        # Accepts a uniform width ("3") or a PER-LAYER spec ("3,18-22:2" = 3 bits everywhere except
+        # layers 18..22 at 2). MiaAI-Lab's EXL3 build of this checkpoint spends bits by tensor role
+        # AND by layer -- routed experts K=3 except layers 18-22 at K=2, shared K=4-5, attention
+        # K=5, head 6 -- which implies per-layer sensitivity they measured and we never have. Our
+        # CB3 is uniform, and uniform CB2 costs 2.16 pp of coding top-1 (§20); the open question is
+        # whether the bits can be moved rather than uniformly removed.
+        b = _ref_cb_bits(os.environ.get("DSV41_REF_CB"), layer)
         self.sim = None
         if b:
             # expert_trace.py puts only tools/ on sys.path, so `engine` is not importable here
@@ -643,7 +672,7 @@ class ExpertLoader:
             if _root not in sys.path:
                 sys.path.insert(0, _root)
             from engine.codebook_sim import CodebookSim
-            self.sim = CodebookSim(int(b), device)
+            self.sim = CodebookSim(b, device)
 
     def __call__(self, e: int):
         p = f"layers.{self.layer}.ffn.experts.{e}."
