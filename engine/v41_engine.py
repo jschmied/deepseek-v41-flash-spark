@@ -759,6 +759,13 @@ class V41Engine:
         prefills, which on this engine dominate (thousands of expert loads against tens). Two
         attempts to do it from the exported totals produced a negative kernel_s and then negative
         attn_s deltas before this was obvious.
+
+        **Call this AFTER the prefill loop and before the first decode step.** It was called at the
+        top of `_decode_loop` from the day it was added until 2026-09-14, i.e. before prefill, so
+        `decode_delta` reported prefill plus decode for every counter that both phases touch
+        (everything except `misses` / `prefill_misses`, which are already split by phase). That is
+        what produced §10c's 2,860 ms of `resolve()` per decode step -- a number I explained as an
+        unrepresentative thrashing request instead of doubting the instrument that produced it.
         """
         self._pf = {"store": dict(self.store.stats), "model": dict(self.model.stats),
                     "tables": {k: dict(v.stats) for k, v in self.tables.items()}}
@@ -778,7 +785,6 @@ class V41Engine:
 
     def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None, penalties=None):
         m = self.model
-        self._snap_prefill()
         t_start = time.perf_counter()
         out_st["t_decode0"] = t_start
         # prefill in chunks
@@ -804,6 +810,12 @@ class V41Engine:
                     m.dspark_seed(mh, s)
         t_prefill = time.perf_counter() - t_start
         out_st["t_prefill"] = t_prefill
+        # HERE, not at the top of this function. Every counter except `misses`/`prefill_misses` is
+        # incremented in BOTH phases, so a snapshot taken before the prefill loop makes
+        # `decode_delta` report prefill PLUS decode -- which is what it did until 2026-09-14, and
+        # which is why §10c read 2,860 ms of resolve() per decode step and I explained it as a
+        # thrashing request instead of checking the instrument.
+        self._snap_prefill()
         pen = penalties if (penalties is not None and penalties.active) else None
         p = sample_probs(logits[-1], temperature, top_p)
         tok = int(torch.multinomial(p, 1)) if temperature > 0 else int(p.argmax())
