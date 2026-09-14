@@ -396,18 +396,57 @@ def _cb3v2_down_kernel(
 UNPACK_BATCH = int(os.environ.get("DSV41_CB3_UNPACK_BATCH", 32))
 PREFILL_MODE = os.environ.get("DSV41_CB3_PREFILL", "fp4")   # "fp4" = unpack fallback, "direct" = CB3 kernel
 PREFILL_MIN_P = int(os.environ.get("DSV41_CB3_PREFILL_MIN_P", 65))
+# Scratch slots kept across the chunks of ONE layer. 0 = the old per-call behaviour.
+#
+# Why this exists. `moe_forward_prefill` unpacks the experts of one (layer, chunk) call, and
+# layer-major prefill runs ~7 chunks over nearly the same expert set -- a layer has ~362 distinct
+# experts and every chunk touches almost all of them. Measured in the 2026-09-14 nsys trace:
+# 1512 `_unpack_into` calls x <=32 experts = up to 48,384 expert-unpacks where 21 x 362 = 7,600 are
+# needed, a 6.4x redundancy. At 33.25 MB per unpack (read 14.45 CB3 + write 18.80 FP4) that is
+# 1.61 TB, and `_cb3_unpack_kernel` was the largest single GPU consumer in the profile at 7.44 s of
+# a 40.3 s GPU-busy prefill (18.5 %) -- running at ~90 % of this box's 240 GB/s stream rate, so the
+# only way to make it cheaper is to do less of it.
+#
+# This is the same re-read that layer-major already removed for NVMe (74.2 % of loads were an
+# expert the layer had fetched in an earlier chunk), still fully present in a buffer 17x larger
+# than the NVMe traffic it was measured against.
+#
+# Holding a layer's union costs scratch: 400 slots x 18.80 MB = 7.5 GB, ~3.4 pp of expert
+# residency. That is the trade the A/B has to beat.
+SCRATCH_SLOTS = int(os.environ.get("DSV41_CB3_SCRATCH_SLOTS", 0))
 
 
 class CB3ArenaV2(CB3Arena):
     """Same tensors as CB3Arena, v2 bit layout inside them."""
 
     def fp4_scratch(self, slots: int):
-        """A small packed-FP4 arena the prefill path unpacks into. Allocated once and reused; at the
-        default batch of 32 it is 0.6 GB."""
+        """A packed-FP4 arena the prefill path unpacks into. Allocated once and reused; at the
+        default batch of 32 it is 0.6 GB, at SCRATCH_SLOTS=400 it is 7.5 GB."""
         sc = getattr(self, "_scratch", None)
-        if sc is None or sc.slots < slots:
-            self._scratch = sc = F4.ExpertArena(max(slots, UNPACK_BATCH), self.device)
+        want = max(slots, UNPACK_BATCH, SCRATCH_SLOTS)
+        if sc is None or sc.slots < want:
+            self._scratch = sc = F4.ExpertArena(want, self.device)
+            self.scratch_epoch()
         return sc
+
+    # ------------------------------------------------- the layer-scoped unpack cache
+    # `_scratch_of` maps an ARENA slot to the scratch slot holding its unpacked FP4 copy. It is
+    # valid only while that arena slot still holds the same expert, so every write to a slot drops
+    # its entry (see `load_slot` here and CB3Cache.load_slot), and `scratch_epoch()` drops the lot
+    # at a layer boundary. Without both, a chunk would read another expert's weights -- silently.
+    def scratch_epoch(self) -> None:
+        """Forget the layer's unpacked experts. Call at a layer boundary."""
+        sc = getattr(self, "_scratch", None)
+        self._scratch_of: dict[int, int] = {}
+        self._scratch_free: list[int] = list(range(sc.slots)) if sc is not None else []
+
+    def invalidate_scratch(self, slot: int) -> None:
+        """The expert in arena slot `slot` changed; its unpacked copy is stale."""
+        m = getattr(self, "_scratch_of", None)
+        if m:
+            s = m.pop(int(slot), None)
+            if s is not None:
+                self._scratch_free.append(s)
 
     def load_slot(self, slot: int, w1, s1, w2, s2, w3, s3, non_blocking: bool = False, sim=None) -> None:
         """`sim` overrides the arena's own CodebookSim for this slot only.
@@ -417,6 +456,7 @@ class CB3ArenaV2(CB3Arena):
         the narrower format. That is how a 2-bit tier is measured for quality before it is built."""
         sim = sim or self.sim
         assert sim is not None, "CB3ArenaV2.sim must be a CodebookSim(3)"
+        self.invalidate_scratch(slot)   # this slot's unpacked FP4 copy is about to be stale
         dev = self.device
         for (w, s, lo_t, hi_t, cb_t, s_t) in ((w1, s1, self.w1_lo, self.w1_hi, self.w1_cb, self.s1),
                                               (w3, s3, self.w3_lo, self.w3_hi, self.w3_cb, self.s3),
@@ -750,16 +790,17 @@ def _unpack_pair(out_base, Lk, Hm, A, B, KPAR: tl.constexpr, BN: tl.constexpr, K
 
 
 @triton.jit
-def _cb3_unpack_kernel(LO, HI, CB, OUT, SRC, N,
+def _cb3_unpack_kernel(LO, HI, CB, OUT, SRC, DST, N,
                        KL: tl.constexpr, KH: tl.constexpr, KB: tl.constexpr,
                        BN: tl.constexpr, NB512: tl.constexpr, NB256: tl.constexpr):
-    b = tl.program_id(0)          # destination scratch slot
+    b = tl.program_id(0)          # which entry of SRC/DST
     nb = tl.program_id(1)         # row block
     src = tl.load(SRC + b).to(tl.int64)
+    dst = tl.load(DST + b).to(tl.int64)   # scratch slot to write; the layer cache picks free ones
     offs_n = nb * BN + tl.arange(0, BN)
     lo = LO + src * (N * KL) + offs_n[:, None] * KL
     hi = HI + src * (N * KH) + offs_n[:, None] * KH
-    out = OUT + b.to(tl.int64) * (N * KB) + offs_n[:, None] * KB
+    out = OUT + dst * (N * KB) + offs_n[:, None] * KB
     A, Bc = _cb_ab(CB + src * (N * 8) + offs_n[:, None] * 8, BN)
     for j in range(0, NB512):
         L = tl.load(lo + (j * 128 + tl.arange(0, 128))[None, :])
@@ -792,10 +833,16 @@ def _cb3_unpack_kernel(LO, HI, CB, OUT, SRC, N,
             _unpack_pair(o + 96, L3, H1, A, Bc, 1, BN, KB)
 
 
-def _unpack_into(arena, src_slots: torch.Tensor, scratch) -> None:
-    """CB3 slots `src_slots` (int32 [B]) -> packed-FP4 scratch slots 0..B-1 (scales are copied: the
-    UE8M0 bytes are the same in both formats)."""
+def _unpack_into(arena, src_slots: torch.Tensor, scratch, dst_slots: torch.Tensor | None = None) -> None:
+    """CB3 slots `src_slots` (int32 [B]) -> packed-FP4 scratch slots `dst_slots` (default 0..B-1).
+
+    Scales are copied rather than unpacked: the UE8M0 bytes are the same in both formats. An
+    explicit `dst_slots` is what lets the layer-scoped cache leave already-unpacked experts alone
+    and drop the new ones into whatever slots are free.
+    """
     B = src_slots.numel()
+    if dst_slots is None:
+        dst_slots = torch.arange(B, dtype=torch.int32, device=src_slots.device)
     BN = 64
     for (lo, hi, cb, N, K, out, s_src, s_dst) in (
             (arena.w1_lo, arena.w1_hi, arena.w1_cb, INTER, DIM, scratch.w1, arena.s1, scratch.s1),
@@ -803,9 +850,9 @@ def _unpack_into(arena, src_slots: torch.Tensor, scratch) -> None:
             (arena.w2_lo, arena.w2_hi, arena.w2_cb, DIM, INTER, scratch.w2, arena.s2, scratch.s2)):
         n512, n256 = CB3.block_plan(K)
         _cb3_unpack_kernel[(B, triton.cdiv(N, BN))](
-            lo, hi, cb, out, src_slots, N, KL=K // 4, KH=K // 8, KB=K // 2,
+            lo, hi, cb, out, src_slots, dst_slots, N, KL=K // 4, KH=K // 8, KB=K // 2,
             BN=BN, NB512=n512, NB256=n256, num_warps=4, num_stages=2)
-        s_dst[:B].copy_(s_src[src_slots.long()])
+        s_dst[dst_slots.long()] = s_src[src_slots.long()]
 
 
 def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor,
@@ -833,6 +880,38 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
     # expert is in exactly one batch -- so neither needs zeroing and the reduction runs once.
     h = torch.empty((P, INTER), dtype=torch.bfloat16, device=dev)
     parts = torch.empty((P, DIM), dtype=torch.float32, device=dev)
+    # The layer-scoped cache turns the batch loop into a single pass whenever the scratch can hold
+    # this call's whole expert set: experts already unpacked by an earlier chunk of the same layer
+    # keep their scratch slot and are not touched, and only the new ones are unpacked -- in ONE
+    # launch rather than one per batch of 32. Falls back to the original per-call batching when the
+    # scratch is too small (SCRATCH_SLOTS=0, the old default).
+    cache = getattr(arena, "_scratch_of", None) if SCRATCH_SLOTS > 0 else None
+    if cache is not None and scratch.slots >= n:
+        new_sel = [int(v) for v in uniq.tolist() if int(v) not in cache]
+        if len(new_sel) > len(arena._scratch_free):
+            arena.scratch_epoch()                       # cannot fit: start the epoch over
+            cache = arena._scratch_of
+            new_sel = [int(v) for v in uniq.tolist()]
+        if new_sel:
+            dst = [arena._scratch_free.pop() for _ in new_sel]
+            _unpack_into(arena, torch.tensor(new_sel, dtype=torch.int32, device=dev), scratch,
+                         torch.tensor(dst, dtype=torch.int32, device=dev))
+            cache.update(zip(new_sel, dst))
+        inv.fill_(-1)
+        src_t = uniq.long()
+        inv[src_t] = torch.tensor([cache[int(v)] for v in uniq.tolist()],
+                                  dtype=torch.int32, device=dev)
+        s2 = torch.where(slots >= 0, inv[slots.long().clamp_min(0)], slots.to(torch.int32))
+        block_slot, block_pair, NB = build_routing(s2, scratch.slots, BM)
+        F4._moe_up_kernel[(NB, INTER // bn1)](
+            x, scratch.w1, scratch.s1, scratch.w3, scratch.s3, h, wgt, block_slot, block_pair,
+            x.stride(0), h.stride(0), float(swiglu_limit),
+            TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, num_warps=nw1, num_stages=ns1)
+        F4._moe_down_kernel[(NB, DIM // bn2)](
+            h, scratch.w2, scratch.s2, parts, block_slot, block_pair, h.stride(0), parts.stride(0),
+            TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, num_warps=nw2, num_stages=ns2)
+        return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
+
     for i in range(0, n, batch):
         sel = uniq[i:i + batch]
         b = int(sel.numel())

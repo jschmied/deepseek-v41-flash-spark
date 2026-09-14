@@ -80,6 +80,9 @@ class CB3Cache:
         three scale planes need expanding, which is a handful of integer ops on the device and
         replaces the per-miss `fp4_to_cb3_v2` the FP4 path pays.
         """
+        inv = getattr(arena, "invalidate_scratch", None)
+        if inv is not None:
+            inv(slot)   # the layer-scoped unpack cache must not keep the outgoing expert
         for name in ("w1_lo", "w1_hi", "w1_cb", "w3_lo", "w3_hi", "w3_cb", "w2_lo", "w2_hi", "w2_cb"):
             lo, hi = self.planes[name]
             dst = getattr(arena, name)[slot]
