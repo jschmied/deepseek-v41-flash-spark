@@ -1,0 +1,36 @@
+{
+ "a": "/home/jschmied/git/deepseek-v41-flash-spark/results/trace-cb3-20260913",
+ "b": "/home/jschmied/git/deepseek-v41-flash-spark/results/trace-cb2-20260914",
+ "cats": {
+  "coding": {
+   "n": 11415,
+   "nll_a": 0.9642179608345032,
+   "nll_b": 1.0084037780761719,
+   "delta_nll": 0.04418593645095825,
+   "sem_paired": 0.00812473427504301,
+   "t": 5.438446998596191,
+   "top1_a": 0.8066579103469849,
+   "top1_b": 0.7939553260803223,
+   "top1_agree": 0.9501532912254333,
+   "mcnemar_a_only": 357,
+   "mcnemar_b_only": 212,
+   "entropy_a": 0.577604353427887,
+   "entropy_b": 0.6825615167617798
+  },
+  "general": {
+   "n": 6194,
+   "nll_a": 3.2230892181396484,
+   "nll_b": 3.1594154834747314,
+   "delta_nll": -0.06367351114749908,
+   "sem_paired": 0.015929903835058212,
+   "t": -3.997105836868286,
+   "top1_a": 0.46819502115249634,
+   "top1_b": 0.4570552110671997,
+   "top1_agree": 0.9078140258789062,
+   "mcnemar_a_only": 320,
+   "mcnemar_b_only": 251,
+   "entropy_a": 1.712130069732666,
+   "entropy_b": 1.9313502311706543
+  }
+ }
+}
