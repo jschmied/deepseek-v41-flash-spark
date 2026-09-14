@@ -40,9 +40,14 @@ ALIGN = 4096
 _RL = os.environ.get("DSV41_ROUTE_LOG")
 ROUTE_LOG = open(_RL, "w", buffering=1 << 16) if _RL else None
 
+# DSV41_ROUTE_SYNC: synchronize BEFORE the resolve() timer starts, so the GPU wait lands in its own
+# counter instead of inside route_s. Diagnostic only -- it adds a full-device sync per layer, which
+# is exactly what the pipelined design wants to remove, so never leave it on for a timing number.
+ROUTE_SYNC = os.environ.get("DSV41_ROUTE_SYNC", "0") == "1"
+
 ZERO_STATS = {"hits": 0, "misses": 0, "prefill_misses": 0, "bytes_read": 0, "read_s": 0.0,
               "resolve_s": 0.0, "route_s": 0.0, "load_s": 0.0, "lease_s": 0.0, "h2d_s": 0.0,
-              "loads": 0, "promoted": 0}
+              "sync_s": 0.0, "loads": 0, "promoted": 0}
 W13_SHAPE = (2304, 2560)
 S13_SHAPE = (2304, 160)
 W2_SHAPE = (5120, 1152)
@@ -416,6 +421,14 @@ class ExpertStore:
     def resolve(self, layer: int, experts: torch.Tensor, prefill: bool) -> torch.Tensor:
         """experts: int tensor [T, K] of expert ids for `layer`. Returns the slot ids [T, K],
         loading misses (in parallel) first."""
+        if ROUTE_SYNC:
+            # The first statement below is a BLOCKING .to("cpu"), so without this the device wait is
+            # charged to route_s and reads as host bookkeeping. Measured offline, the actual host
+            # work in this function is 0.010 ms per call; route_s is 12.7 ms per layer. This moves
+            # the difference somewhere it can be named.
+            _t = time.perf_counter()
+            torch.cuda.synchronize()
+            self.stats["sync_s"] += time.perf_counter() - _t
         t_res = time.perf_counter()
         # One device->host copy, and the set/LUT work in numpy on the host. The old path ran
         # torch.unique on the GPU, synchronised on .tolist(), built a 384-entry LUT, copied that
