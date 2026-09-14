@@ -645,6 +645,13 @@ class Model:
         # loops means holding one per chunk for the entire pass -- a fresh one per (layer, chunk)
         # trips `_compressed`'s own `sh.ratio == r` assert at the first layer that reuses.
         SH = [Shared() for _ in bounds]
+        # Prompt-cache checkpoints. `Caches.checkpoint(n)` wants every layer's compressor state as
+        # of position n, and chunk-major can take it in one go because the whole stack is at n at
+        # the same moment. Layer-major never is -- layer L is at the end of the prompt while L+1 is
+        # still at the start -- so the pieces are collected as each layer passes each boundary and
+        # assembled at the end. Without this the pass takes ONE checkpoint, at the resume point, and
+        # a later turn has nothing to resume from: the cache is silently dead.
+        pend = {S0 + lo: {} for lo, _ in bounds}
         # the replay needs layer 20's top-k and candidate pool for the prompt TAIL only, so each
         # chunk keeps at most `window_size` rows of them rather than its whole [T, n_c] mask
         tails = []
@@ -661,6 +668,8 @@ class Model:
                     rows = self.engram_rows(L, hashes[ci][:, li, :])
                     h = R.engram_forward(h, rows, self.W.engram[L], a)
                     self.stats["engram_s"] += time.perf_counter() - te
+                pv = self.c.pending.get(L)
+                pend[S0 + lo][L] = None if pv is None else (pv[0].clone(), pv[1].clone())
                 sh = SH[ci]
                 h, attn_pre = self.block_attn(h, PM[ci], w, L, S0 + lo, sh, self.c.win[L],
                                               self.freqs_c if w.ratio else self.freqs_w)
@@ -693,6 +702,9 @@ class Model:
         # `pending` is per-layer, so walking chunks inside a layer advances exactly the state that
         # layer owns. The only readers are `forward`'s assert and `Caches.rollback`, neither of
         # which runs during this pass.
+        for n, per_layer in pend.items():
+            if len(per_layer) == last_L + 1:      # every encoder layer passed this boundary
+                self.c._ckpt[n] = dict(per_layer)
         self.c.len = S0 + P
         self.stats["tokens"] += P
         for ci, (lo, hi) in enumerate(bounds):

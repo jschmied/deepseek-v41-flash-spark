@@ -814,11 +814,9 @@ class V41Engine:
             # (layers 0..20, which is everything that writes global KV), and the decoder half is
             # replayed once over the last `window_size` prompt tokens.
             if LAYER_MAJOR:
-                # one checkpoint at the resume point only: the layer-major pass walks every chunk
-                # inside every layer, so there is no single moment at which "the cache is valid up
-                # to chunk k and no further" -- the compressor state of layer L is ahead of layer
-                # L+1 for most of the pass. Resuming mid-prompt therefore needs the chunk-major
-                # path, which is what the prompt cache uses.
+                # The pass collects each layer's compressor state as it crosses each chunk boundary
+                # and assembles the checkpoints itself -- there is no single moment at which the
+                # whole stack sits at one position, so `checkpoint()` cannot be called from here.
                 m.c.checkpoint(self._resumed_from)
                 m.encoder_prefill_layer_major(ids[self._resumed_from:], self._resumed_from,
                                               self.store, self.store.arena, self.args.n_routed_experts)
