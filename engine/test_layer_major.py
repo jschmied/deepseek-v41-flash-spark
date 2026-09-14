@@ -23,7 +23,9 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 
 from engine.v41_engine import V41Engine, log  # noqa: E402
 
-FILLER = "The following is background material that should be summarised at the end. " * 420
+import sys as _s
+_MULT = int(os.environ.get("DSV41_TEST_FILLER", "420"))
+FILLER = "The following is background material that should be summarised at the end. " * _MULT
 PROMPT = ("Here is a document.\n\n" + FILLER +
           "\n\nName one topic it covers, in one short sentence.")
 
@@ -49,7 +51,7 @@ def main() -> int:
     kw.setdefault("keep_free_gb", 6.0)
 
     import engine.v41_engine as E
-    eng = V41Engine(a.model_dir, max_seq=16384, **kw)
+    eng = V41Engine(a.model_dir, max_seq=32768, **kw)
     sys.path.insert(0, os.path.join(eng.model_dir, "encoding"))
     from encoding import encode_messages  # noqa: E402
     pr = encode_messages([{"role": "user", "content": PROMPT}], thinking_mode="chat")
