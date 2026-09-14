@@ -447,15 +447,30 @@ class V41Engine:
             # box actually does -- a 98 GB arena loads with ~110 GB available and settles with 6 GB
             # free -- rather than a pessimistic sum, because refusing a configuration that works is
             # its own failure. The MemoryWatchdog below is the backstop if this estimate is wrong.
+            # What is still to come once the arena is full: a PREFILL CHUNK. Upstream measured it
+            # at ~5 MB per prefill token on this box (0xBakeer 122350f, 2026-09-12) -- about 10 GB
+            # at the default 2,048-token chunk, which is more than `keep_free_gb` defaults to. So
+            # the old check could pass a configuration that loaded, logged `ready`, and was killed
+            # by the watchdog on the first request: a 98 GB arena left 5.5 GB and died on request
+            # one; an 87 GB arena left 16.5 GB and served. Reserve the larger of the two floors.
+            #
+            # Taken WITHOUT upstream's companion change to the auto-sizer, which raises its reserve
+            # from 8 GB to the same MAX_CHUNK * 5 MB and would shrink our auto arena by ~2.2 GB
+            # (~150 slots, ~1 pp of coverage). We run 83 GB and complete 27k-token prefills today,
+            # so that would buy safety we have not yet needed. Queued as an A/B.
             pack_scratch = 3e9 if self.expert_format != "fp4" else 1e9
-            need = arena_gb * 1e9 + pack_scratch + keep_free_gb * 1e9
+            prefill_reserve = MAX_CHUNK * 5e6
+            floor = max(keep_free_gb * 1e9, prefill_reserve)
+            need = arena_gb * 1e9 + pack_scratch + floor
             if need > host_avail:
                 raise RuntimeError(
                     f"refusing to start: arena {arena_gb:.1f} GB + {pack_scratch / 1e9:.1f} GB "
-                    f"warm-start scratch + {keep_free_gb:.1f} GB floor = {need / 1e9:.1f} GB, but "
-                    f"MemAvailable is {host_avail / 1e9:.1f} GB. Lower --arena-gb by at least "
-                    f"{(need - host_avail) / 1e9:.1f} GB, or stop whatever else holds memory "
-                    f"(on this box a boot-time vLLM container used to take 85 GB).")
+                    f"warm-start scratch + {floor / 1e9:.1f} GB floor "
+                    f"({'a prefill chunk' if prefill_reserve > keep_free_gb * 1e9 else 'keep_free'}) "
+                    f"= {need / 1e9:.1f} GB, but MemAvailable is {host_avail / 1e9:.1f} GB. Lower "
+                    f"--arena-gb by at least {(need - host_avail) / 1e9:.1f} GB, lower "
+                    f"DSV41_PREFILL_CHUNK, or stop whatever else holds memory (on this box a "
+                    f"boot-time vLLM container used to take 85 GB).")
         slots = int(arena_gb * 1e9 / self.expert_bytes)
         self.arena_gb, self.slots = round(arena_gb, 1), slots
         log(f"CUDA free {free / 1e9:.1f} GB of {total / 1e9:.1f}; host MemAvailable "
