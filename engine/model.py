@@ -509,6 +509,34 @@ class Model:
         return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
     # ------------------------------------------------------------------ blocks
+    def moe_route(self, y: torch.Tensor, w, L: int, n_experts: int):
+        """Routing only: (indices [T, k], weights [T, k]). Split out of `moe` so a layer-major
+        prefill can route every chunk, resolve the layer's whole expert set in ONE call, and then
+        apply the kernel per chunk. Byte for byte the code `moe` used to run."""
+        a = self.args
+        self._tap("moe_in", L, y)
+        scores = F.softplus(R.mm(y.float(), w.gate_w)).sqrt()
+        k = 3 if n_experts == 128 else a.n_activated_experts
+        logits = scores + w.gate_bias
+        pm = getattr(self, "prune_mask", None)
+        if pm is not None and n_experts != 128 and L in pm:
+            logits = logits.masked_fill(~pm[L], float("-inf"))
+        indices = logits.topk(k, dim=-1)[1]
+        weights = scores.gather(1, indices)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+        self._tap("route_idx", L, indices); self._tap("route_w", L, weights)
+        return indices, weights
+
+    def moe_apply(self, y: torch.Tensor, slots, weights, w, arena):
+        """The kernel half: routed experts through their slots, plus the shared expert."""
+        a = self.args
+        t0 = time.perf_counter()
+        routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
+        shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+        out = routed + shared
+        self.stats["moe_s"] += time.perf_counter() - t0
+        return out.to(y.dtype)
+
     def moe(self, y: torch.Tensor, w, L: int, prefill: bool, store, arena, n_experts: int):
         a = self.args
         self._tap("moe_in", L, y)
@@ -542,8 +570,9 @@ class Model:
         self.stats["moe_s"] += time.perf_counter() - t0
         return out.to(y.dtype)
 
-    def block(self, h, pre_mix, w, L, S, sh, ring, freqs, prefill, store, arena, n_experts, mtp_extra=None,
-              win_lo: int = 0):
+    def block_attn(self, h, pre_mix, w, L, S, sh, ring, freqs, mtp_extra=None, win_lo: int = 0):
+        """The attention half of a block: everything up to and including its residual mix.
+        Returns (h, attn_pre); `attn_pre` is what the FFN half needs as its own pre-mix."""
         a = self.args
         residual = h
         attn_pre, attn_post, attn_comb = R.hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, a)
@@ -552,14 +581,126 @@ class Model:
         t0 = time.perf_counter()
         y = self.attention(y, w, L, S, sh, ring, freqs, mtp_extra, win_lo=win_lo)
         self.stats["attn_s"] += time.perf_counter() - t0
-        h = R.hc_post(y, residual, attn_post, attn_comb)
-        residual = h
+        return R.hc_post(y, residual, attn_post, attn_comb), attn_pre
+
+    def block_ffn_in(self, h, attn_pre, w):
+        """The FFN half's input and the mixes its output needs. Returns (y, ffn_pre, post, comb)."""
+        a = self.args
         ffn_pre, ffn_post, ffn_comb = R.hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, a)
         y = R.hc_pre(h, attn_pre)
-        y = R.rmsnorm(y, w.ffn_norm, a.norm_eps)
+        return R.rmsnorm(y, w.ffn_norm, a.norm_eps), ffn_pre, ffn_post, ffn_comb
+
+    def block(self, h, pre_mix, w, L, S, sh, ring, freqs, prefill, store, arena, n_experts, mtp_extra=None,
+              win_lo: int = 0):
+        h, attn_pre = self.block_attn(h, pre_mix, w, L, S, sh, ring, freqs, mtp_extra, win_lo=win_lo)
+        residual = h
+        y, ffn_pre, ffn_post, ffn_comb = self.block_ffn_in(h, attn_pre, w)
         y = self.moe(y, w, L, prefill, store, arena, n_experts)
         h = R.hc_post(y, residual, ffn_post, ffn_comb)
         return h, ffn_pre
+
+    # ------------------------------------------------------- layer-major encoder prefill
+    @torch.inference_mode()
+    def encoder_prefill_layer_major(self, ids: torch.Tensor, S0: int, store, arena, n_experts: int):
+        """The CED encoder half, visiting LAYERS outermost and chunks innermost.
+
+        Chunk-major prefill reads a layer's experts once per chunk. Measured on the real routes:
+        74.2 % of prefill expert loads at an 11.3k prompt are a re-read, 89.3 % at 27.2k, and the
+        engine moves 327.8 GB / 772.7 GB where the union of what it actually needs is 84.5 GB /
+        82.3 GB (`notes/layer-major-prefill.md`). Transposing the loops reads each expert once per
+        layer instead, and the floor is context-INDEPENDENT because it is bounded by the number of
+        distinct (layer, expert) pairs, not by the chunk count.
+
+        What stays exactly as it was, deliberately:
+          * attention is still chunked at MAX_CHUNK, and the chunks of a layer still run in order --
+            chunk k's attention reads the KV that chunks < k wrote. Enlarging the chunk is a
+            different (and measured-worse) lever: 8192 reads 58 % less and is 16 % slower.
+          * the MoE kernel still runs per chunk. Only the ROUTE and the RESOLVE are hoisted, so the
+            transient ring holds a layer's expert set once instead of refilling it per chunk. That
+            keeps the working set at one chunk's activations rather than the whole prompt's.
+
+        Costs one `[T, hc_mult, dim]` bf16 buffer for the prompt: 0.46 GB at 11k, 1.34 GB at 32k.
+        """
+        a = self.args
+        assert self.c.len == S0, (self.c.len, S0)
+        P = ids.size(0)
+        bounds = [(s, min(s + MAX_CHUNK, P)) for s in range(0, P, MAX_CHUNK)]
+        last_L = a.candidate_source_layer
+
+        t0 = time.perf_counter()
+        hashes = [self.hash_state(ids[lo:hi][None], S0 + lo)[0] if self.hash_state is not None else None
+                  for lo, hi in bounds]
+        self.stats["engram_s"] += time.perf_counter() - t0
+
+        H, PM = [], []
+        for lo, hi in bounds:
+            h = self.W.embed[ids[lo:hi]].unsqueeze(1).repeat(1, a.hc_mult, 1)
+            pm = torch.zeros(hi - lo, a.hc_mult, device=self.dev)
+            pm[:, 0] = 1.0
+            H.append(h); PM.append(pm)
+        # `Shared` is per-CHUNK but lives ACROSS layers: a kv-source layer fills ckv/ik/ratio and
+        # the layers above it reuse that same compressed cache and candidate pool (layers 21..23
+        # reuse layer 20's top-k, 24..39 search inside its candidate set). Chunk-major gets this for
+        # free because one `Shared` is threaded down a chunk's whole layer stack. Transposing the
+        # loops means holding one per chunk for the entire pass -- a fresh one per (layer, chunk)
+        # trips `_compressed`'s own `sh.ratio == r` assert at the first layer that reuses.
+        SH = [Shared() for _ in bounds]
+        # the replay needs layer 20's top-k and candidate pool for the prompt TAIL only, so each
+        # chunk keeps at most `window_size` rows of them rather than its whole [T, n_c] mask
+        tails = []
+
+        for L in range(last_L + 1):
+            w = self.W.layers[L]
+            post = []           # per chunk: (residual, ffn_post, ffn_comb)
+            ys, idxs, wts = [], [], []
+            for ci, (lo, hi) in enumerate(bounds):
+                h = H[ci]
+                if L in self.W.engram:
+                    te = time.perf_counter()
+                    li = list(a.engram_layer_ids).index(L)
+                    rows = self.engram_rows(L, hashes[ci][:, li, :])
+                    h = R.engram_forward(h, rows, self.W.engram[L], a)
+                    self.stats["engram_s"] += time.perf_counter() - te
+                sh = SH[ci]
+                h, attn_pre = self.block_attn(h, PM[ci], w, L, S0 + lo, sh, self.c.win[L],
+                                              self.freqs_c if w.ratio else self.freqs_w)
+                y, ffn_pre, ffn_post, ffn_comb = self.block_ffn_in(h, attn_pre, w)
+                ys.append(y); post.append((h, ffn_post, ffn_comb)); PM[ci] = ffn_pre
+                i_c, w_c = self.moe_route(y, w, L, n_experts)
+                idxs.append(i_c); wts.append(w_c)
+                if L == last_L:
+                    n = min(a.window_size, hi - lo)
+                    tails.append((sh.topk[-n:],
+                                  sh.candidates[-n:] if sh.candidates is not None else None))
+            # ONE resolve for the whole layer: every missing expert is read exactly once, and its
+            # slot stays valid for every chunk below because nothing else claims the ring meanwhile.
+            lut = getattr(self, "slot_lut", None)
+            if lut is not None and n_experts != 128:
+                all_slots = lut[L][torch.cat(idxs)]
+                self.stats["hits"] = self.stats.get("hits", 0) + sum(i.numel() for i in idxs)
+            else:
+                all_slots = store.resolve(L, torch.cat(idxs), True)
+            off = 0
+            for ci, y in enumerate(ys):
+                n = y.size(0)
+                out = self.moe_apply(y, all_slots[off:off + n], wts[ci], w, arena)
+                off += n
+                resid, ffn_post, ffn_comb = post[ci]
+                H[ci] = R.hc_post(out, resid, ffn_post, ffn_comb)
+
+        # `c.len` is written once, at the end. Verified rather than assumed: nothing on the encoder
+        # path reads it -- `_compressed` derives its indices from S, T and `pending[L]` alone, and
+        # `pending` is per-layer, so walking chunks inside a layer advances exactly the state that
+        # layer owns. The only readers are `forward`'s assert and `Caches.rollback`, neither of
+        # which runs during this pass.
+        self.c.len = S0 + P
+        self.stats["tokens"] += P
+        for ci, (lo, hi) in enumerate(bounds):
+            sh = Shared()
+            sh.topk, sh.candidates = tails[ci]
+            n = tails[ci][0].size(0)
+            self._rep_keep(H[ci][-n:], PM[ci][-n:], sh, S0 + hi - n, n)
+        return None, None
 
     # ------------------------------------------------------------------ SWA bounded replay
     def begin_prompt(self):

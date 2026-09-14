@@ -47,6 +47,10 @@ LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
 # Extend-only prompt cache. Off by default until it is measured: it changes what a request
 # computes, and every number in notes/ was taken without it.
 PROMPT_CACHE = os.environ.get("DSV41_PROMPT_CACHE", "0") == "1"
+# Layer-major encoder prefill: visit layers outermost so each layer's experts are read once for the
+# whole prompt instead of once per chunk. Measured ceiling 3.88x at 11.3k tokens and 9.38x at 27.2k
+# (notes/layer-major-prefill.md). Off by default until it is measured on the engine.
+LAYER_MAJOR = os.environ.get("DSV41_LAYER_MAJOR", "0") == "1"
 
 
 class StepPhases:
@@ -809,9 +813,19 @@ class V41Engine:
             # CED + Decoder SWA Bounded Replay: the prompt runs through the encoder half only
             # (layers 0..20, which is everything that writes global KV), and the decoder half is
             # replayed once over the last `window_size` prompt tokens.
-            for s in range(self._resumed_from, P, MAX_CHUNK):
-                m.c.checkpoint(s)
-                m.forward(ids[s:s + MAX_CHUNK], s, prefill=True, need_logits=False, encoder_only=True)
+            if LAYER_MAJOR:
+                # one checkpoint at the resume point only: the layer-major pass walks every chunk
+                # inside every layer, so there is no single moment at which "the cache is valid up
+                # to chunk k and no further" -- the compressor state of layer L is ahead of layer
+                # L+1 for most of the pass. Resuming mid-prompt therefore needs the chunk-major
+                # path, which is what the prompt cache uses.
+                m.c.checkpoint(self._resumed_from)
+                m.encoder_prefill_layer_major(ids[self._resumed_from:], self._resumed_from,
+                                              self.store, self.store.arena, self.args.n_routed_experts)
+            else:
+                for s in range(self._resumed_from, P, MAX_CHUNK):
+                    m.c.checkpoint(s)
+                    m.forward(ids[s:s + MAX_CHUNK], s, prefill=True, need_logits=False, encoder_only=True)
             logits, mh, s_rep = m.decoder_replay(need_logits=True)
             if self.spec:
                 m.dspark_seed(mh, s_rep)
