@@ -35,6 +35,11 @@ import torch
 
 ALIGN = 4096
 # every counter reset between requests (engine/v41_engine.py::_reset) lives here
+# Prefill I/O oracle recorder. Writes one JSON line per resolve() call so the re-read structure of
+# a prompt can be replayed offline without the GPU. Never on by default.
+_RL = os.environ.get("DSV41_ROUTE_LOG")
+ROUTE_LOG = open(_RL, "w", buffering=1 << 16) if _RL else None
+
 ZERO_STATS = {"hits": 0, "misses": 0, "prefill_misses": 0, "bytes_read": 0, "read_s": 0.0,
               "resolve_s": 0.0, "route_s": 0.0, "load_s": 0.0, "lease_s": 0.0, "h2d_s": 0.0,
               "loads": 0, "promoted": 0}
@@ -453,6 +458,17 @@ class ExpertStore:
             used.add(s)
             to_load.append((key, s))
         assert len(set(slot_of.values())) == len(slot_of), "slot collision in resolve()"
+        if ROUTE_LOG is not None:
+            # One line per resolve() call: which experts this (layer, chunk) wanted, and which of
+            # them were not resident. That is everything the prefill I/O oracles need -- the
+            # re-read is `uniq` seen again in a later chunk of the SAME layer, and the floor is
+            # the union of `miss` over a layer. Off unless DSV41_ROUTE_LOG is set; the cost is a
+            # few hundred short lines for a whole prompt.
+            self._route_i = getattr(self, "_route_i", 0) + 1
+            ROUTE_LOG.write(json.dumps({"i": self._route_i, "L": layer, "pf": int(prefill),
+                                        "uniq": uniq.tolist(),
+                                        "miss": sorted(e for e, _ in ((k[1], v) for k, v in to_load))})
+                            + "\n")
         lut = np.full(self.n_experts, -1, dtype=np.int32)
         for e, s in slot_of.items():
             lut[e] = s
