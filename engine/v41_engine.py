@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 
 from engine import experts as EX  # noqa: E402
 from engine.engram import EngramTable, make_hash_state  # noqa: E402
+from engine import model as M  # noqa: E402
 from engine.model import MAX_CHUNK, Caches, Model, Weights  # noqa: E402
 import v41_ref as R  # noqa: E402
 
@@ -43,6 +44,9 @@ STEP_TIMING = os.environ.get("DSV41_STEP_TIMING", "0") == "1"
 # Sampling semantics are untouched: the temperature > 0 path is the ORIGINAL code, RNG draw for RNG
 # draw, and the greedy path computes argmax of the same logits in the same order.
 LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
+# Extend-only prompt cache. Off by default until it is measured: it changes what a request
+# computes, and every number in notes/ was taken without it.
+PROMPT_CACHE = os.environ.get("DSV41_PROMPT_CACHE", "0") == "1"
 
 
 class StepPhases:
@@ -575,12 +579,64 @@ class V41Engine:
         c = self.caches
         c.len = 0
         c._chunk_inputs.clear()
+        c._ckpt.clear()
         for L in c.pending:
             c.pending[L] = None
+        self._ctx_ids = None
+        self._reset_stats()
+
+    def _reset_stats(self):
+        """Zero the per-request counters WITHOUT touching the caches.
+
+        Split out of `_reset` for the prompt cache: a resumed request keeps every cache but must
+        still report its own I/O, or `x_engine_stats` would accumulate across a conversation.
+        """
         self.model.stats = {"attn_s": 0.0, "moe_s": 0.0, "engram_s": 0.0, "tokens": 0}
         for t in self.tables.values():
             t.stats = {"rows": 0, "seconds": 0.0, "calls": 0}
         self.store.stats.update(EX.ZERO_STATS)
+
+    def _resume_point(self, prompt):
+        """Where this prompt can pick up from the cache left by the previous request, or 0.
+
+        The agent case is always `turn N+1's prompt == turn N's prompt + reply + new user text`, so
+        the whole win is in NOT resetting. Returns the position to start the encoder pass at; the
+        caller prefills `prompt[n:]` and everything below n is reused.
+
+        Three things bound how far back the answer can be:
+          * the longest common prefix with what is actually in the cache -- compared on token ids,
+            never on lengths, because a chat template can rewrite earlier turns;
+          * the SWA replay tail: `decoder_replay` runs the decoder half over the last
+            `window_size` prompt positions and takes its inputs from `_rep`, which only the encoder
+            pass fills, so at least `window_size` positions must be re-encoded;
+          * the window ring: SWA at the resume point reads back `window_size` positions, and the
+            ring only holds the last RING writes of the PREVIOUS request. A prefix that diverges
+            far behind the end of a long context is therefore not resumable even though its ids
+            match -- those ring rows are long gone.
+        Resuming is also not bit-identical to a full prefill: the reused positions were computed
+        under a different chunk alignment, so their GEMM shapes differed. Same class of drift as
+        any other reshaping, but it is drift, not reuse of identical arithmetic.
+        """
+        ctx = getattr(self, "_ctx_ids", None)
+        if not PROMPT_CACHE or not ctx:
+            return 0
+        n = 0
+        for a, b in zip(ctx, prompt):
+            if a != b:
+                break
+            n += 1
+        if n >= len(prompt):
+            n = len(prompt) - 1   # never reuse the whole prompt: the last position needs logits
+        w = self.args.window_size
+        cand = [k for k in self.caches._ckpt if k <= n - w]
+        if not cand:
+            return 0
+        start = max(cand)
+        if len(ctx) - (start - w) > M.RING:      # the ring has wrapped past what SWA still needs
+            return 0
+        if start < MAX_CHUNK:                    # not worth the bookkeeping for one chunk
+            return 0
+        return start
 
     def generate(self, prompt_ids, *, max_tokens=4096, temperature=1.0, top_p=0.95, stop_token_ids=None, seed=None,
                  penalties=None,
@@ -605,7 +661,15 @@ class V41Engine:
         if seed is not None:
             torch.manual_seed(seed)
         stop_ids = set() if ignore_eos else (set(stop_ids) | {self.eos_token_id})
-        self._reset()
+        # The resume point has to be decided BEFORE the caches are cleared, since it is a question
+        # about what they currently hold.
+        resume = self._resume_point(prompt)
+        if resume:
+            self.caches.resume_at(resume)     # also drops the checkpoints past it
+            self._reset_stats()
+        else:
+            self._reset()
+        self._resumed_from = resume
         m = self.model
         P = len(prompt)
         assert P + max_tokens + 8 <= self.max_context, f"prompt {P} + max_tokens {max_tokens} > context {self.max_context}"
@@ -642,9 +706,24 @@ class V41Engine:
                       f"(DSV41_STEP_TIMING=1)\n{_ph.table(_notes)}", flush=True)
             st = self.store.stats
             m = self.model
+            # What is in the cache now, for the NEXT request to match against. The invariant is
+            # `ctx_ids == (prompt + out)[:caches.len]`: the last emitted token is always one the
+            # decode loop has not forwarded yet, so the cache is exactly one token short of what
+            # was produced. If that does not hold -- an abort at an unexpected point, a path that
+            # left `len` somewhere else -- drop the cache rather than resume onto a wrong prefix.
+            if PROMPT_CACHE:
+                _toks = prompt + _st.get("out", [])
+                _n = self.caches.len
+                self._ctx_ids = _toks[:_n] if 0 < _n <= len(_toks) else None
+            _pre = P - self._resumed_from
             self.last_stats = {
                 "prompt_tokens": P, "completion_tokens": n_out, "prefill_s": round(t_prefill, 3),
-                "prefill_tok_s": round(P / t_prefill, 2) if t_prefill > 0 else None,
+                # tok/s over what was ACTUALLY prefilled: with the prompt cache on, dividing the
+                # full prompt by the time to prefill a suffix would report a speedup that is
+                # really just work not done.
+                "prefill_tok_s": round(_pre / t_prefill, 2) if t_prefill > 0 else None,
+                **({"prompt_cache_reused": self._resumed_from,
+                    "prompt_tokens_prefilled": _pre} if PROMPT_CACHE else {}),
                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
                 "steps": steps,
                 "accept_len_mean": round(float(np.mean(accepted_hist)) + 1, 2) if accepted_hist else None,
@@ -709,13 +788,15 @@ class V41Engine:
             # CED + Decoder SWA Bounded Replay: the prompt runs through the encoder half only
             # (layers 0..20, which is everything that writes global KV), and the decoder half is
             # replayed once over the last `window_size` prompt tokens.
-            for s in range(0, P, MAX_CHUNK):
+            for s in range(self._resumed_from, P, MAX_CHUNK):
+                m.c.checkpoint(s)
                 m.forward(ids[s:s + MAX_CHUNK], s, prefill=True, need_logits=False, encoder_only=True)
             logits, mh, s_rep = m.decoder_replay(need_logits=True)
             if self.spec:
                 m.dspark_seed(mh, s_rep)
         else:
-            for s in range(0, P, MAX_CHUNK):
+            for s in range(self._resumed_from, P, MAX_CHUNK):
+                m.c.checkpoint(s)
                 chunk = ids[s:s + MAX_CHUNK]
                 last = s + len(chunk) >= P
                 logits, mh = m.forward(chunk, s, prefill=True, need_logits=last)
@@ -727,6 +808,7 @@ class V41Engine:
         p = sample_probs(logits[-1], temperature, top_p)
         tok = int(torch.multinomial(p, 1)) if temperature > 0 else int(p.argmax())
         out = [tok]
+        out_st["out"] = out          # the same list object, so the epilogue sees every token
         n_out = 1
         pos = P  # position of `tok` (not yet forwarded)
         accepted_hist = []

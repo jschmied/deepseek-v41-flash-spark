@@ -197,6 +197,12 @@ class Caches:
         self.len = 0  # number of valid positions
         # per-chunk memory for rollback of the compressor state
         self._chunk_inputs = {}  # L -> (S, kv [T,512] fp32, score [T,512] fp32, pending_before)
+        # Prefill-chunk-boundary checkpoints of the compressor state, for the prompt cache.
+        # `rollback()` can only reach back into the LAST chunk, because that is all
+        # `_chunk_inputs` keeps -- enough for speculative rejection, useless for resuming a
+        # conversation. The only state that does not survive a jump backwards is `pending`, and it
+        # is four layers x two [512] fp32 rows = 16 KB per boundary, so every boundary is kept.
+        self._ckpt = {}  # position -> {L: pending_L or None}
 
     def rollback(self, n: int):
         """Discard everything at positions >= n.
@@ -221,6 +227,30 @@ class Caches:
             else:
                 raise ValueError(f"rollback({n}) reaches before the last chunk (start {S}); the "
                                  f"compressor input for position {p} is no longer kept")
+        self.len = n
+
+    # ------------------------------------------------------ prompt-cache checkpoints
+    def checkpoint(self, n: int):
+        """Remember the compressor state as of position `n` (a prefill chunk boundary)."""
+        self._ckpt[n] = {L: (None if v is None else (v[0].clone(), v[1].clone()))
+                         for L, v in self.pending.items()}
+
+    def resume_at(self, n: int):
+        """Jump back to checkpoint `n` and continue appending there.
+
+        Unlike `rollback`, this reaches arbitrarily far back -- but only to a position that was
+        checkpointed, because nothing else can restore `pending`. Everything else in the cache is
+        either append-only (`ckv`, `ik`) or a ring whose entries at or after `n` are rewritten
+        before anything reads them (`win`), so positions < n stay valid exactly as they are.
+        """
+        self.pending = {L: (None if v is None else (v[0].clone(), v[1].clone()))
+                        for L, v in self._ckpt[n].items()}
+        self._chunk_inputs.clear()   # rewritten by the first chunk of the resumed prefill
+        # Checkpoints past the resume point describe positions this prefill is about to rewrite
+        # with different tokens. Keeping them would let a LATER request resume onto a prefix that
+        # was never written.
+        for k in [k for k in self._ckpt if k > n]:
+            del self._ckpt[k]
         self.len = n
 
 
