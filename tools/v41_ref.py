@@ -652,7 +652,13 @@ class ExpertLoader:
         for n in ("w1", "w2", "w3"):
             w, s = self.get(p + n + ".weight").to(d), self.get(p + n + ".scale").to(d)
             if self.sim is not None:
-                w = self.sim.requant_packed(w, s)
+                # requant_packed wants RAW BYTES: uint8 nibble pairs and uint8 UE8M0 exponent codes,
+                # which it turns into 2^(s-127). The checkpoint stores the scale as F8_E8M0, and
+                # .float() on that DECODES it to the represented value, so passing it straight in
+                # computes 2^(value-127) instead of 2^(exponent-127). The arena path avoids this by
+                # viewing both as uint8 first (cb3_moe.py:424-425); this did not, and the routing
+                # collapsed from 383 experts touched at layer 0 to 29 by layer 4.
+                w = self.sim.requant_packed(w.view(torch.uint8), s.view(torch.uint8)).view(w.dtype)
             out.append(dequant_fp4_packed(w, s))
         return tuple(out)
 
