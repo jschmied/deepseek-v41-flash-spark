@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -636,6 +637,11 @@ class ExpertLoader:
         b = os.environ.get("DSV41_REF_CB")
         self.sim = None
         if b:
+            # expert_trace.py puts only tools/ on sys.path, so `engine` is not importable here
+            # unless the repo root is added. Without this the tracer dies on layer 0.
+            _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if _root not in sys.path:
+                sys.path.insert(0, _root)
             from engine.codebook_sim import CodebookSim
             self.sim = CodebookSim(int(b), device)
 
