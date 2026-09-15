@@ -95,7 +95,8 @@ class Engine:
         """
         # Graph A. The expert ids come OUT of it -- they are not handed to the driver. This is the
         # line that makes this an engine and not a replay of someone else's route.
-        uniq = self._compute(lambda: self.leaves.layer_a(layer))
+        route = self._compute(lambda: self.leaves.layer_a(layer))
+        uniq = route.uniq
 
         # What did speculation actually buy, and what did it cost? Settled BEFORE reserve(), while
         # the previous prediction for this layer is still distinguishable from a real residency.
@@ -107,6 +108,9 @@ class Engine:
         # A prefetch that has not landed yet is waited on exactly like a demand read. It is not
         # counted as a fetch -- it was already counted when it was issued.
         to_load = to_load + to_wait
+        # Host bookkeeping, so it belongs BEFORE the wait: the real provider copies an index tensor
+        # to the device here, which does not need the expert bytes to have arrived.
+        self.leaves.bind_slots(route, slot_of)
 
         # Speculation is queued AFTER this layer's demand reads, at lower priority, so a demand
         # miss never sits behind a prefetch for a layer we have not reached.
@@ -127,9 +131,13 @@ class Engine:
         if not self.policy.resolve_blocks:
             self._wait(to_load)
 
-        # Graph B: routed MoE + HC residual (+ the shared expert, unless it ran above).
+        # Graph B. `route` carries the FUNCTIONAL input -- the provider's route-aligned slot tensor,
+        # built by bind_slots above. `reads` is safety bookkeeping only: which arena slots this
+        # compute reads, so the loader can order a later write against it. The two are not the same
+        # thing and collapsing them (passing sorted(set(...)) as the input) loses the per-expert
+        # ordering and multiplicity that moe_fn needs.
         reads = sorted(set(slot_of.values()))
-        self._compute(lambda: self.leaves.layer_b(layer, reads), slots=reads)
+        self._compute(lambda: self.leaves.layer_b(layer, route), slots=reads)
 
     # ------------------------------------------------------------------ prefetch bookkeeping
     def _settle_speculation(self, layer: int, uniq) -> None:
@@ -170,6 +178,9 @@ class Engine:
         for _ in range(steps):
             for layer in range(N_LAYERS):
                 self.decode_layer(layer)
+            # Per-step GPU work outside the layer loop (head, draft). Zero unless the provider was
+            # told that part of the unattributed 78.5 % lives here rather than in a layer.
+            self._compute(self.leaves.step_other)
             self.c.steps += 1
         self.c.wall_s = time.perf_counter() - t0
         bw = self.loader.bw

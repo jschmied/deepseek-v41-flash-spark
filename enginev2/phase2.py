@@ -190,10 +190,6 @@ def main(argv) -> int:
         eff, sig, fl = mark(r, base)
         print(f"  {LABEL[f]:38s} {r[0]:9.2f} {r[1]:6.2f}-{r[2]:<6.2f} {eff} {sig:>5s} "
               f"{fl:6.1f} % {100 * r[3]:8.1f} %")
-    r = res["A:shared_first"]
-    eff, sig, fl = mark(r, base)
-    print(f"  {SHARED_FIRST_LABEL:38s} {r[0]:9.2f} {r[1]:6.2f}-{r[2]:<6.2f} {eff} {sig:>5s} "
-          f"{fl:6.1f} % {100 * r[3]:8.1f} %")
     print()
 
     print("  TABLE B -- leave-one-in from v2 (turn ONE dependency back on)")
@@ -215,6 +211,19 @@ def main(argv) -> int:
     s_rb = a_rows["resolve_blocks"][0] / base[0] - 1
     s_gb = a_rows["global_barrier"][0] / base[0] - 1
     s_both = rp[0] / base[0] - 1
+    # Its own section: shared-first is NOT a leave-one-in dependency. It is a capture-time change
+    # (graph B split in two) and it applies to either policy, so it is reported against both
+    # baselines rather than mixed into a table of scheduling toggles.
+    print("  CAPTURE-TIME -- shared expert split out of graph B (costs a second capture)")
+    print(hdr)
+    for arm, ref, label in (("A:shared_first", base, "v1 + shared-first"),
+                            ("B:shared_first", v2, "v2 + shared-first")):
+        r = res[arm]
+        eff, sig, fl = mark(r, ref)
+        print(f"  {label:38s} {r[0]:9.2f} {r[1]:6.2f}-{r[2]:<6.2f} {eff} {sig:>5s} "
+              f"{fl:6.1f} % {100 * r[3]:8.1f} %")
+    print()
+
     print("  PAIRWISE -- resolve_blocks x global_barrier (do they compose, or overlap?)")
     print(f"    resolve_blocks off alone   {100 * s_rb:+6.1f} %")
     print(f"    global_barrier off alone   {100 * s_gb:+6.1f} %")

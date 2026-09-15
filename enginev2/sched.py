@@ -199,14 +199,18 @@ class LoaderService:
             self.slots.forget(key, slot)
             self.slots.clear_pending(slot, gen)
             return
-        sid = self.stage.acquire()
+        # The PROVIDER acquires the staging buffer, inside read(), and hands back a StagedExpert
+        # that owns the lease -- because the bytes and the lease cannot be separated: a real reader
+        # returns views ALIASING that pinned buffer. The loader decides only WHEN to release it,
+        # which is after h2d has completed, never before.
+        staged = None
         permit_held = False
         try:
             if key in self.fail:
                 raise IOError(f"injected NVMe failure {key}")
             self.nvme_qd.acquire()                 # admission to the device
             permit_held = True
-            payload = self.leaves.read(key, sid)
+            staged = self.leaves.read(key, self.stage)
             if not self.policy.lease_until_completion:
                 # D2 OFF: give the ADMISSION back now. Another read may enter the device while this
                 # expert's buffer waits on its copy. The buffer itself stays ours until H2D done.
@@ -219,7 +223,7 @@ class LoaderService:
             with self.h2d_sem:
                 with self.arena.writing(slot, key):
                     t0 = time.perf_counter()
-                    self.leaves.h2d(slot, key, payload)
+                    self.leaves.h2d(slot, key, staged)
                     dt = time.perf_counter() - t0
             with self._lk:
                 self.h2d_calls += 1
@@ -236,7 +240,8 @@ class LoaderService:
                 self.nvme_qd.release()
             # The write is over (done or failed): the slot may be evicted again.
             self.slots.clear_pending(slot, gen)
-            self.stage.release(sid)
+            if staged is not None:
+                staged.release()          # after the copy, always, and exactly once
 
     def _worker(self) -> None:
         while True:

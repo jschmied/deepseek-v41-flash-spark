@@ -25,11 +25,23 @@ MEASURED CONSTANTS -- provenance for every one:
 
 WHAT THE PHASE SPLIT DOES NOT COVER, stated because it is large. The three attributed phases are
 0.0105 + 0.185 + 0.020 = 21.5 % of decode GPU busy. The other 78.5 % is real measured GPU time that
-job 175's attribution did not assign to these three kernels. It is modelled as `C_other`, a
-per-layer phase with no dependency on any expert, placed AFTER the MoE. That placement is a CHOICE,
-not a measurement: putting it before the router would hand the model an overlap window 78x the
-shared expert's, which nothing measured justifies. Placing it last is the conservative option --
-it can overlap nothing.
+job 175's attribution did not assign to these three kernels, and it is modelled as `C_other`.
+
+ITS PLACEMENT IS UNKNOWN, NOT SETTLED. An earlier revision argued that because fastdecode captures
+two graphs per layer, C_other must sit inside graph B. That does not follow and the claim is
+withdrawn. Job 175 sums CUPTI_ACTIVITY_KIND_KERNEL over the WHOLE decode span and buckets by kernel
+NAME; it never correlates a kernel to a graph replay range. So C_other is "everything in a decode
+step that matched none of three name patterns", which includes the final head graph and the
+draft/MTP graphs -- not only per-layer work inside B.
+
+Because 78.5 % dwarfs every attributed component, where it sits is not a detail: charging all of it
+to a per-layer leaf inflates the compute a prefetch can hide behind, which flatters precisely the
+prefetch arms. So it is a DECLARED PARAMETER (`c_other_in_layer`, default 1.0 = the old behaviour),
+not a silent choice, and both ends of the range should be run until it is measured.
+
+WHAT WOULD CLOSE IT: correlate kernels to graph executions in the sqlite export job 175 already
+produces -- CUPTI records a graph node / graphExec id per launch, so a join against the per-layer
+graph B exec gives the split directly. That is a query, not a new study.
 
 HOST TIMER RESOLUTION, and the bias it introduces. C_ind is 4.4 us and C_dep is 77 us per layer.
 `time.sleep` on this box does not resolve either; a 4.4 us sleep takes ~60 us and would inflate the
@@ -42,6 +54,7 @@ H2D are above the floor and use time.sleep, which releases the GIL.
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 
@@ -186,6 +199,47 @@ class Bandwidth:
 # between them) is RESIDENT-MODE ONLY. We stream, so the per-layer A/B seam is the real one.
 
 
+@dataclasses.dataclass
+class RouteResult:
+    """What graph A produced. `uniq` is all the cache needs; `opaque` is the provider's own state.
+
+    The driver must never unpack `opaque`. A real provider keeps route_idx and route_w in it --
+    fastdecode's `_layer_b` consumes a slot tensor SHAPED LIKE route_idx (`moe_fn(y, self.slots,
+    self.route_w, ...)`), so the per-expert ordering and multiplicity are functional inputs, not
+    bookkeeping. Handing layer_b `sorted(set(slot_of.values()))` throws exactly that away and no
+    real provider could rebuild `self.slots` from it.
+    """
+
+    uniq: tuple
+    opaque: object = None
+
+
+class StagedExpert:
+    """One expert's bytes in a pinned staging buffer, OWNING the lease on that buffer.
+
+    This exists because the lease and the data cannot be separated. v1's `_read_leased` hands the
+    sink views that ALIAS the pinned buffer and requires the sink to finish before it returns; the
+    real CB3 path is lease -> read_into(pinned) -> load_slot(pinned) -> synchronize -> release. If
+    the payload does not carry the lease, a provider has only bad options: clone 13.8 MB per expert
+    (wrong performance model), release before the copy completes (corruption), or hide the H2D
+    inside read() (destroys the seam). So `read()` returns this, and the loader releases it only
+    after `h2d` has completed.
+    """
+
+    __slots__ = ("sid", "payload", "_pool", "_released")
+
+    def __init__(self, sid: int, payload: object, pool):
+        self.sid = sid
+        self.payload = payload
+        self._pool = pool
+        self._released = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._pool.release(self.sid)
+
+
 class Leaves:
     """What a decode layer is made of. Implement all four to run the engine on real components.
 
@@ -206,20 +260,33 @@ class Leaves:
     # exactly why it is declared here and not toggled per call.
     shared_first = False
 
-    def layer_a(self, layer: int) -> tuple:
+    def layer_a(self, layer: int) -> "RouteResult":
         raise NotImplementedError
+
+    def bind_slots(self, route: "RouteResult", slot_of: dict) -> None:
+        """Give graph B its route-aligned slot mapping. `slot_of` is expert id -> arena slot; a real
+        provider builds the tensor shaped like route_idx here and copies it to the device, which is
+        what `_resolve` does today (`self.slots.copy_(slots)`). Host work, so it runs before the
+        wait, not after."""
 
     def shared(self, layer: int) -> None:
         """The shared expert alone. Only called when `shared_first`; otherwise it is inside layer_b."""
         raise NotImplementedError
 
-    def layer_b(self, layer: int, slots) -> None:
+    def layer_b(self, layer: int, route: "RouteResult") -> None:
         raise NotImplementedError
 
-    def read(self, key: tuple, staging_id: int) -> object:
+    def step_other(self) -> None:
+        """Per-step GPU work outside the layer loop. Default: none."""
+
+    def read(self, key: tuple, pool) -> "StagedExpert":
+        """Acquire a staging buffer from `pool`, read the expert into it, and return a handle that
+        OWNS that lease. The loader releases it after h2d completes, never before."""
         raise NotImplementedError
 
-    def h2d(self, slot: int, key: tuple, payload: object) -> None:
+    def h2d(self, slot: int, key: tuple, staged: "StagedExpert") -> None:
+        """Copy staged bytes into the arena slot. Must not return until the copy has completed --
+        the buffer is released immediately afterwards."""
         raise NotImplementedError
 
     # --- prefill. Its real seam is NOT designed yet: v1's prefill runs a different MoE kernel
@@ -242,31 +309,49 @@ class ModelLeaves(Leaves):
     """
 
     def __init__(self, calls, bw: "Bandwidth", scale: float = 1.0, shared_first: bool = False,
-                 start: int = 0):
+                 start: int = 0, c_other_in_layer: float = 1.0):
         self.calls = calls
         self.bw = bw
         self.scale = scale
         self.shared_first = shared_first
         self.i = start
+        # Fraction of the unattributed 78.5 % charged to the per-layer leaf; the remainder becomes
+        # per-step work outside the layer loop. 1.0 reproduces the old model. See the header: this
+        # is unmeasured, so anything sensitive to it must be reported at both ends.
+        if not 0.0 <= c_other_in_layer <= 1.0:
+            raise ValueError("c_other_in_layer must be in [0, 1]")
+        self.c_other_in_layer = c_other_in_layer
 
-    def layer_a(self, layer: int) -> tuple:
+    def layer_a(self, layer: int) -> RouteResult:
         delay(C_PRE / self.scale)
         L, uniq = self.calls[self.i]
         if L != layer:
             raise AssertionError(f"trace desync: driver at layer {layer}, trace at {L}")
         self.i += 1
-        return uniq
+        return RouteResult(uniq=uniq)
+
+    def bind_slots(self, route: RouteResult, slot_of: dict) -> None:
+        # The model has no tensors, but it keeps the mapping so the shape of the contract is
+        # exercised: a provider that ignored this would fail against the real one, not here.
+        route.opaque = tuple(slot_of[e] for e in route.uniq)
 
     def shared(self, layer: int) -> None:
         delay(C_IND / self.scale)
 
-    def layer_b(self, layer: int, slots) -> None:
+    def layer_b(self, layer: int, route: RouteResult) -> None:
         # One leaf, because graph B is ONE replay. The modelled shares are summed rather than run
         # as separate sleeps: splitting them would invent overlap windows the real engine does not
         # have, and each sub-500us sleep would be spun on the GIL for nothing. The shared expert is
         # in here unless this provider split it out (`shared_first`).
-        d = C_DEP + C_OTHER + (0.0 if self.shared_first else C_IND)
+        d = C_DEP + C_OTHER * self.c_other_in_layer + (0.0 if self.shared_first else C_IND)
         delay(d / self.scale)
+
+    def step_other(self) -> None:
+        """Per-STEP work outside the layer loop (head, draft graphs) -- the part of C_other not
+        charged to a layer. Zero under the default, which is why the default changes nothing."""
+        d = C_OTHER * N_LAYERS * (1.0 - self.c_other_in_layer)
+        if d > 0:
+            delay(d / self.scale)
 
     def prefill_attn(self, layer: int) -> None:
         delay(C_PRE / self.scale)
@@ -274,9 +359,14 @@ class ModelLeaves(Leaves):
     def prefill_moe(self, layer: int, slots, chunks: int = 1) -> None:
         delay(C_DEP * chunks / self.scale)
 
-    def read(self, key: tuple, staging_id: int) -> object:
-        self.bw.read(EXPERT_BYTES)
-        return None
+    def read(self, key: tuple, pool) -> StagedExpert:
+        sid = pool.acquire()
+        try:
+            self.bw.read(EXPERT_BYTES)
+        except BaseException:
+            pool.release(sid)
+            raise
+        return StagedExpert(sid, None, pool)
 
-    def h2d(self, slot: int, key: tuple, payload: object) -> None:
+    def h2d(self, slot: int, key: tuple, staged: StagedExpert) -> None:
         delay(H2D_S / self.scale)
