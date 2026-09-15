@@ -18,6 +18,21 @@ else, so the experts live in three places:
 Prefill chunks touch almost every expert of a layer; letting them stream through the LRU would
 evict the hot set each prompt. So misses during prefill go through a small TRANSIENT ring of
 slots instead, and only decode misses enter the LRU.
+
+WHICH resident the LRU gives up is a second, separate lever (DSV41_EVICT_POLICY). An offline
+replay of a real decode route trace (~/ds41-queue/eviction_oracle.py) puts numbers on it, at the
+shipped 5,328 LRU slots:
+
+    lru            (default)  92.67 % hit   64.6 fetches/token   849 MiB/token
+    age_over_freq             94.07 %       52.3                 687 MiB/token   (-19 % NVMe)
+    Belady (not implementable) 97.17 %       25.0                 328
+
+`age_over_freq` evicts the MAXIMUM of age / (1 + use count) -- recency discounted by how often the
+expert has been wanted. It recovers 31.1 % of the LRU-to-Belady gap, is stable at 3,000 slots
+(29.3 %) and across 10/25/50 % train splits, and is exact rather than sampled: see `_afq_victim`.
+Plain LFU is NOT a substitute -- it also wins at small candidate sets but INVERTS to -10 % when
+allowed to rank the whole cache, because an unweighted count protects stale hot entries forever.
+The age numerator is what carries the policy.
 """
 
 from __future__ import annotations
@@ -54,10 +69,21 @@ ROUTE_SYNC = os.environ.get("DSV41_ROUTE_SYNC", "0") == "1"
 # is that barrier rather than real contention. It can corrupt an in-flight slot. Never for serving.
 UNSAFE_NO_COMPUTE_WAIT = os.environ.get("DSV41_UNSAFE_NO_COMPUTE_WAIT", "0") == "1"
 
+# DSV41_EVICT_POLICY: which LRU resident is given up when the LRU is full (see the module docstring
+# for the replayed numbers). "lru" is the default and is the code path this file has always run --
+# not a re-derivation of it, the same branches. "age_over_freq" is the only alternative. Read per
+# store so a test can hold both policies in one process; the constructor argument wins.
+EVICT_POLICIES = ("lru", "age_over_freq")
+
 ZERO_STATS = {"hits": 0, "misses": 0, "prefill_misses": 0, "bytes_read": 0, "read_s": 0.0,
               "resolve_s": 0.0, "route_s": 0.0, "load_s": 0.0, "lease_s": 0.0, "h2d_s": 0.0,
               "sync_s": 0.0, "load_submit_s": 0.0, "load_wait_s": 0.0,
-              "loads": 0, "promoted": 0}
+              "loads": 0, "promoted": 0,
+              # evict_cmps / evictions = candidates examined per eviction. The whole point of the
+              # bucket structure is that this stays ~O(distinct use counts) and not O(lru_slots);
+              # if it ever approaches lru_slots the shortcut has degenerated. Both stay 0 under
+              # the default policy, which never scores anything.
+              "evictions": 0, "evict_cmps": 0}
 W13_SHAPE = (2304, 2560)
 S13_SHAPE = (2304, 160)
 W2_SHAPE = (5120, 1152)
@@ -133,7 +159,7 @@ def _pread_chunk(fd: int, view: memoryview, off: int, need: int) -> None:
 class ExpertStore:
     def __init__(self, model_dir: str, index: dict, arena, n_layers: int, transient_slots: int = 400,
                  io_threads: int = 12, mtp_prefix: str | None = None, read_threads: int | None = None,
-                 read_chunk_mb: float | None = None):
+                 read_chunk_mb: float | None = None, evict_policy: str | None = None):
         self.model_dir = model_dir
         self.arena = arena  # tools.fp4_moe.ExpertArena or a compatible object with .slots and load_slot_bytes
         self.n_slots = arena.slots
@@ -155,6 +181,23 @@ class ExpertStore:
         self._pending: list = []          # futures from resolve(defer=True)
         self._pending_slots: set[int] = set()   # slots those futures are still writing
         self._pending_layer: int | None = None
+        # --- eviction policy (see the module docstring). Everything below is dead weight under
+        # "lru": _afq is False, nothing is ticked, counted or bucketed, and _lru_slot_for takes the
+        # branch it has always taken.
+        self.evict_policy = (evict_policy or os.environ.get("DSV41_EVICT_POLICY", "lru")).strip()
+        if self.evict_policy not in EVICT_POLICIES:
+            raise ValueError(f"DSV41_EVICT_POLICY={self.evict_policy!r} not in {EVICT_POLICIES}")
+        self._afq = self.evict_policy == "age_over_freq"
+        self._clock = 0                          # one tick per DECODE access, hit or miss
+        # Both survive eviction on purpose, exactly as the offline replay's per-key stats do: an
+        # expert that comes back from NVMe comes back with its history, and that is the only way a
+        # use count means anything when 5,328 slots have to cover 15,360 pairs. Bounded by the pair
+        # count, so ~15k small ints at worst.
+        self._use_count: dict[tuple, int] = {}
+        self._last_acc: dict[tuple, int] = {}
+        # count -> {key: slot} in LRU order, RESIDENTS ONLY, empty buckets deleted. The victim
+        # search reads only the head of each bucket; see _afq_victim.
+        self._buckets: dict[int, OrderedDict] = {}
         io_threads = int(os.environ.get("DSV41_IO_THREADS", io_threads))
         # Optional native CB3 cache (engine/cb3_cache.py). When present a miss is one aligned
         # 13,774,848 B read whose bytes are already the arena's layout, instead of 18,800,640 B of
@@ -352,12 +395,105 @@ class ExpertStore:
             self._release(sid)
 
     # ------------------------------------------------------------------ cache policy
+    # The three helpers below are the whole of DSV41_EVICT_POLICY=age_over_freq. They are called
+    # only when self._afq; under the default policy none of this state is ever written.
+
+    def _afq_tick(self) -> int:
+        """One clock tick per decode access, hit or miss, BEFORE the victim is scored.
+
+        Age is measured in accesses, not tokens or wall time -- the same monotone counter the
+        offline replay increments once per (layer, expert) access, so a resident's rank here is the
+        rank the replay gave it. The tick has to happen before the scan because the score is
+        (now - last_acc) / (1 + count) and a +1 on `now` is NOT uniform across buckets: it moves a
+        count-1 entry by 1 and a count-9 entry by 0.1.
+        """
+        self._clock += 1
+        return self._clock
+
+    def _afq_touch(self, key: tuple, slot: int) -> None:
+        """Record an access to `key`, now resident in `slot`: count +1, age 0, MRU of its bucket.
+
+        EVERY key that enters self.lru must pass through here (both _lru_slot_for and
+        _promote_transient do). A resident missing from the buckets would be invisible to the victim
+        search and could never be evicted -- a slow leak of the arena, not an exception.
+        """
+        c = self._use_count.get(key, 0)
+        if c:                                  # was it resident under its old count? (not after an
+            b = self._buckets.get(c)           # eviction: the count survives, the bucket entry does not)
+            if b is not None and b.pop(key, None) is not None and not b:
+                del self._buckets[c]
+        c += 1
+        self._use_count[key] = c
+        self._last_acc[key] = self._clock
+        self._buckets.setdefault(c, OrderedDict())[key] = slot
+
+    def _afq_drop(self, key: tuple) -> None:
+        """`key` has left the LRU. Its count and last use stay; only the bucket entry goes."""
+        c = self._use_count.get(key)
+        if not c:
+            return
+        b = self._buckets.get(c)
+        if b is not None and b.pop(key, None) is not None and not b:
+            del self._buckets[c]
+
+    def _afq_victim(self, used: set | frozenset, avoid: int = -1):
+        """The resident maximising age / (1 + use count) -- EXACT, without scanning the LRU.
+
+        Residents are bucketed by use count and each bucket is kept in LRU order. Inside a bucket
+        the count is constant, so the score is monotone in age and the bucket's oldest entry IS that
+        bucket's maximum; the global maximum is therefore the best of the bucket heads. Replaying
+        the real decode trace through this store at the shipped 5,328 slots: 227.8 comparisons per
+        eviction over 28,502 evictions, because the cache only ever holds ~400 distinct use counts.
+        A brute-force argmax would be 5,328, and the offline replay checked the two against each
+        other: hits 299,853 fetches 63,449, identical. It matters that this is exact and not a
+        sample of the cold end -- the same score recovers only ~3-5 % of the Belady gap when it may
+        rank the 32 or 64 coldest and 31 % when it ranks all of them.
+
+        `used` (and `avoid`) are slots promised to another expert of the SAME resolve() call. They
+        cannot be evicted, so an ineligible head is stepped over WITHIN its bucket rather than
+        skipping the bucket: the next eligible entry is still that bucket's maximum among the
+        entries we are allowed to take, which keeps the argmax exact under the constraint. It is
+        also free in practice -- 0 skips in those 28,502 evictions, because `used` is ~14 slots that
+        were all touched in this very call and are therefore the youngest things in the cache.
+
+        Returns None when every resident is protected -- the caller decides what that means.
+        """
+        now = self._clock
+        best = None
+        best_score = 0.0
+        best_acc = 0
+        cmps = 0
+        for c, b in self._buckets.items():
+            for k, sl in b.items():             # LRU order: first ELIGIBLE entry is this bucket's max
+                cmps += 1
+                if sl in used or sl == avoid:
+                    continue
+                acc = self._last_acc[k]
+                score = (now - acc) / (1.0 + c)
+                # Tie-break on the older entry, the replay's (score, -last_acc) sort key. last_acc is
+                # unique per resident (one tick per access), so the argmax never depends on dict order.
+                if best is None or score > best_score or (score == best_score and acc < best_acc):
+                    best, best_score, best_acc = k, score, acc
+                break
+        self.stats["evictions"] += 1
+        self.stats["evict_cmps"] += cmps
+        return best
+
     def _lru_slot_for(self, key: tuple, used: set | frozenset = frozenset()) -> int:
         """Reserve an LRU slot for `key` (evicting if needed). Caller loads it.
         `used` holds the slots already promised to other experts of the SAME resolve() call; they
         must never be evicted, or two experts would end up sharing one slot."""
+        if self._afq:
+            self._afq_tick()
         if self.free_lru:
             slot = self.free_lru.pop()
+        elif self._afq:
+            victim = self._afq_victim(used)
+            if victim is None:                 # every resident is promised to this same call
+                raise RuntimeError("LRU exhausted: more experts in one call than lru_slots")
+            slot = self.lru.pop(victim)
+            self._afq_drop(victim)
+            self.slot_key.pop(slot, None)
         else:
             parked = []
             while True:
@@ -373,6 +509,8 @@ class ExpertStore:
                 self.lru.move_to_end(k, last=False)
         self.lru[key] = slot
         self.slot_key[slot] = key
+        if self._afq:
+            self._afq_touch(key, slot)
         return slot
 
     def _transient_slot_for(self, key: tuple, used: set | frozenset = frozenset()) -> int:
@@ -418,8 +556,20 @@ class ExpertStore:
         i = self.transient_index.get(slot)
         if i is None:
             return False
+        if self._afq:
+            # A promotion is a decode access to a resident expert (a hit, in the replay's terms) AND
+            # an eviction, because the donor slot the ring gets back has to come from the LRU. Tick
+            # first, like the miss path: the donor is scored against this access.
+            self._afq_tick()
         if self.free_lru:
             donor = self.free_lru.pop()
+        elif self._afq:
+            victim = self._afq_victim(used, avoid=slot)
+            if victim is None:
+                return False                   # no donor -> stay in the ring, exactly as before
+            donor = self.lru.pop(victim)
+            self._afq_drop(victim)
+            self.slot_key.pop(donor, None)
         else:
             donor, parked = None, []
             while self.lru:
@@ -440,6 +590,10 @@ class ExpertStore:
         self.transient_map.pop(key, None)
         self.lru[key] = slot
         self.slot_key[slot] = key
+        if self._afq:
+            # The pointer swap moves SLOTS between the two pools, never keys, so the buckets only
+            # ever hear about `key` joining the LRU in `slot`. The donor left the LRU above.
+            self._afq_touch(key, slot)
         self.stats["promoted"] += 1
         return True
 
@@ -484,6 +638,14 @@ class ExpertStore:
                     self._promote_transient(key, s, used)
             else:
                 self.lru.move_to_end(key)
+                if self._afq and not prefill:
+                    # DECODE hits only. A prefill chunk touches almost every expert of a layer, so
+                    # letting it write the use counter would push nearly every resident up by one
+                    # per chunk and drown the decode signal the policy was fitted on -- the same
+                    # reason prefill misses go to the transient ring instead of the LRU. The
+                    # move_to_end above is unchanged either way; it is the key->slot map's order.
+                    self._afq_tick()
+                    self._afq_touch(key, s)
             if s is not None:
                 slot_of[e] = s
                 used.add(s)
