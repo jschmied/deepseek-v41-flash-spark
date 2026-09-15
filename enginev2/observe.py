@@ -237,14 +237,27 @@ class TraceObserver(Observer):
     share one fallback ring under a lock. Those threads pay for contention, which is the correct
     trade -- an unbounded allocator is a worse failure than a slow rare path, and instrumenting the
     engram pool or the inner read_pool later would otherwise silently raise the footprint.
+
+    `capacity` IS THE TOTAL, literally. The shared fallback counts as one of the rings, and when
+    per_ring_min would push the total over the budget the RING COUNT is reduced rather than the
+    budget exceeded -- so more threads then share the fallback, which is the degradation the caller
+    asked for by setting a small capacity. `effective_capacity` is what was actually allocated,
+    and it never exceeds `capacity` unless a single ring cannot meet per_ring_min, which is
+    reported rather than silently absorbed.
     """
 
     def __init__(self, capacity: int = 1 << 17, max_rings: int = 64, per_ring_min: int = 256):
         self.capacity = capacity
-        self.max_rings = max(1, max_rings)
-        self.per_ring = max(per_ring_min, capacity // self.max_rings)
-        # A hard ceiling on what can ever be allocated, independent of how many threads appear.
-        self.max_bytes = (self.max_rings + 1) * self.per_ring * 8
+        want = max(1, max_rings) + 1                      # +1: the shared fallback is a ring too
+        per = capacity // want
+        if per < per_ring_min:
+            # honour the budget, not the ring count: fewer private rings, more sharing
+            want = max(2, capacity // per_ring_min)
+            per = max(per_ring_min, capacity // want)
+        self.per_ring = per
+        self.max_rings = max(1, want - 1)                 # the last one is the shared ring
+        self.effective_capacity = (self.max_rings + 1) * self.per_ring
+        self.max_bytes = self.effective_capacity * 8
         self._local = threading.local()
         self._rings: list = []
         self._lk = threading.Lock()

@@ -967,3 +967,57 @@ def test_a_cancelled_queued_prefetch_frees_its_slot_before_the_next_reserve():
         e.close()
     print("  queued cancel: slot recovered by the driver before the next reserve, no worker "
           "touched the cache  OK")
+
+
+# ================================================================ 21. an undone eviction leaves no trace
+def test_rollback_restores_the_exact_eviction_state_under_both_policies():
+    """Snapshot the next victim, speculate + roll back, and demand the SAME victim afterwards.
+
+    Restoring is only sound if it is invisible. Two places it was not:
+      * the global LRU: `lru[k] = v` appends, promoting the evicted tenant to most-recently-used;
+      * age_over_freq: victim() only ever considers each bucket's HEAD, so bucket order IS recency,
+        and re-registering at the tail changes who is evicted next.
+    Neither shows up in a "the slot is reusable" test, which is all test 20 checked.
+    """
+    for policy in ("lru", "age_over_freq"):
+        sl = ExpertSlots(16, 8, policy=policy)
+        # The victim's BUCKET must hold several keys or head-vs-tail is moot -- the first version of
+        # this fixture left it with one member, and the test then passed against the bug it was
+        # written for. Touch each key once, in its own call, so they share a use count but differ
+        # in age: bucket 1 is then populated and ordered by recency.
+        for e in range(16):
+            sl.reserve(0, (e,), prefill=False)
+        if policy == "age_over_freq":
+            v0 = sl.evict.victim(sl.lru, frozenset(), sl._clock)
+            c0 = sl.evict._use_count.get(v0, 0)
+            assert len(sl.evict._buckets[c0]) > 1, (
+                f"fixture is degenerate: victim {v0} is alone in bucket {c0}")
+        before_order = list(sl.lru)
+        before_victim = sl.evict.victim(sl.lru, frozenset(), sl._clock)
+        assert before_victim is not None, policy
+
+        spec, refused = sl.reserve_speculative([(9, 900)])
+        assert spec and not refused, f"{policy}: speculation was refused"
+        k, slot, gen = spec[0]
+        assert before_victim not in sl.lru, f"{policy}: speculation did not evict the victim"
+
+        assert sl.rollback_speculative(k, slot, gen), f"{policy}: rollback refused"
+        assert list(sl.lru) == before_order, (
+            f"{policy}: rollback changed LRU order\n  before {before_order[:5]}\n  "
+            f"after  {list(sl.lru)[:5]}")
+        after_victim = sl.evict.victim(sl.lru, frozenset(), sl._clock)
+        assert after_victim == before_victim, (
+            f"{policy}: the next victim changed across an undone eviction: "
+            f"{before_victim} -> {after_victim}")
+        assert k not in sl.lru, f"{policy}: the speculative key survived rollback"
+
+    # and the displaced record is bounded by slots, not by speculation count
+    sl = ExpertSlots(16, 8, policy="lru")
+    sl.reserve(0, tuple(range(16)), prefill=False)
+    for i in range(200):
+        spec, _ = sl.reserve_speculative([(9, 900 + i)])
+        if spec:
+            sl.clear_pending(spec[0][1], spec[0][2])
+    assert len(sl._displaced) <= 16, (
+        f"displaced records grew with speculation count: {len(sl._displaced)} for 16 slots")
+    print("  rollback: same victim, same order, both policies; displaced bounded by slots  OK")

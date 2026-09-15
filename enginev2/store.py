@@ -147,9 +147,17 @@ class AgeOverFreqPolicy(EvictionPolicy):
                 del self._buckets[c]
 
     def on_restore(self, key: tuple, slot: int) -> None:
-        # Re-register at the count AND the age it already had; an undone eviction leaves no trace.
+        """Re-register at the count and age it already had, AT THE HEAD of its bucket.
+
+        victim() only ever considers each bucket's HEAD, so bucket order is recency and appending
+        at the tail changes which key is evicted next -- the same class of mistake as restoring at
+        the MRU end of the global LRU, and it also contradicted "an undone eviction leaves no
+        trace". The key was its bucket's head when it was chosen; that is where it goes back.
+        """
         c = self._use_count.get(key, 0)
-        self._buckets.setdefault(c, collections.OrderedDict())[key] = slot
+        b = self._buckets.setdefault(c, collections.OrderedDict())
+        b[key] = slot
+        b.move_to_end(key, last=False)
 
     def victim(self, residents, protected, clock):
         best = best_key = None
@@ -456,7 +464,11 @@ class ExpertSlots:
         # anything never overwrote the slot, so the old tenant's bytes are still there and the
         # eviction can be undone at zero cost -- see rollback_speculative(). Without this a wrong
         # prediction still raised later demand misses even when its read was cancelled.
-        self._displaced: dict[tuple, tuple] = {}           # (slot, gen) -> displaced key
+        # slot -> (generation, displaced key). Keyed by SLOT, not (slot, gen): there is only ever
+        # one rollback candidate per slot, and a new generation overwrites the old record, so this
+        # is bounded by lru_slots instead of growing with every speculative fetch for the life of
+        # the process. rollback_speculative() checks the generation matches.
+        self._displaced: dict[int, tuple] = {}
         self._pending_lk = threading.Lock()
 
         # age/(1+count). Both dicts survive eviction ON PURPOSE, exactly as the offline replay's
@@ -616,7 +628,9 @@ class ExpertSlots:
             used.add(s)
             g = self.gen[s] = self.gen.get(s, 0) + 1
             if self._last_victim is not None:
-                self._displaced[(s, g)] = self._last_victim
+                self._displaced[s] = (g, self._last_victim)
+            else:
+                self._displaced.pop(s, None)      # this generation displaced nobody
             to_load.append((key, s, g))
         return to_load, refused
 
@@ -627,8 +641,11 @@ class ExpertSlots:
         its mapping restores real data. Returns True if a tenant was put back.
         """
         self.forget(key, slot)
-        victim = self._displaced.pop((slot, gen), None)
-        if victim is None or self.lru.get(victim) is not None:
+        rec = self._displaced.pop(slot, None)
+        if rec is None or rec[0] != gen:          # a newer generation owns this slot now
+            return False
+        victim = rec[1]
+        if self.lru.get(victim) is not None:
             return False
         try:
             self.free_lru.remove(slot)

@@ -193,6 +193,10 @@ class LoaderService:
         # stays correct through failures and any future scheduling change.
         self.started_demand = 0
         self.started_spec = 0
+        # Total outstanding work, for quiesce(). A helper thread wrapped around q.join() leaked one
+        # blocked thread per timeout; a counter with its own condition times out cleanly.
+        self._inflight = 0
+        self._inflight_cv = threading.Condition(threading.Lock())
         # D3's barrier is over DEMAND reads only. v1's join_pending() has no speculation to wait
         # for, so folding prefetches into it would make the v1 arm wait on work v1 never issues --
         # a confound, not a finding. Speculation is deprioritised and uncounted here by design.
@@ -229,11 +233,6 @@ class LoaderService:
             # drop the stale entry. Touching ExpertSlots from a worker is what this whole deferral
             # exists to avoid.
             return
-        with self._lk:
-            if spec:
-                self.started_spec += 1
-            else:
-                self.started_demand += 1
         # The PROVIDER acquires the staging buffer, inside read(), and hands back a StagedExpert
         # that owns the lease -- because the bytes and the lease cannot be separated: a real reader
         # returns views ALIASING that pinned buffer. The loader decides only WHEN to release it,
@@ -258,6 +257,14 @@ class LoaderService:
             # put when the provider is swapped.
             if self.obs.enabled:
                 self.obs.safe_emit(Event(now_ns(), "nvme_start", ctx=ctx, cause_id=cause_id, key=key, slot=slot, gen=gen))
+            # Counted HERE, not at dequeue: a worker blocked on admission has not started a read,
+            # and an injected failure never reaches the device at all. The counter is the
+            # denominator of fetch precision, so "committed to read" is not good enough.
+            with self._lk:
+                if spec:
+                    self.started_spec += 1
+                else:
+                    self.started_demand += 1
             staged = self.leaves.read(key, self.stage, ctx)
             if self.obs.enabled:
                 self.obs.safe_emit(Event(now_ns(), "nvme_end", ctx=ctx, cause_id=cause_id, key=key, slot=slot, gen=gen))
@@ -348,6 +355,9 @@ class LoaderService:
                         with self._demand_cv:
                             self._demand -= 1
                             self._demand_cv.notify_all()
+                with self._inflight_cv:
+                    self._inflight -= 1
+                    self._inflight_cv.notify_all()
             finally:
                 self.q.task_done()
 
@@ -363,6 +373,8 @@ class LoaderService:
                                          gen=gen, cause_id=cause_id,
                                          aux="spec" if speculative else "demand"))
         prio = 1 if speculative else 0
+        with self._inflight_cv:
+            self._inflight += len(to_load)
         if not speculative:
             with self._demand_cv:
                 self._demand += len(to_load)
@@ -420,11 +432,10 @@ class LoaderService:
         timeout is honoured: an earlier version accepted one and then called an unbounded join(),
         which is worse than not offering it.
         """
-        done = threading.Event()
-        w = threading.Thread(target=lambda: (self.q.join(), done.set()), daemon=True)
-        w.start()
-        if not done.wait(timeout):
-            raise TimeoutError(f"loader did not quiesce within {timeout}s")
+        with self._inflight_cv:
+            if not self._inflight_cv.wait_for(lambda: self._inflight == 0, timeout):
+                raise TimeoutError(
+                    f"loader did not quiesce within {timeout}s ({self._inflight} outstanding)")
 
     def drain_forgets(self) -> int:
         """Apply pending un-maps. MUST be called from the driver thread, before reserve()."""
@@ -482,10 +493,11 @@ class LoaderService:
         still allowed to finish, and only then do the workers stop.
         """
         if drain:
-            try:
-                self.quiesce(timeout)
-            except TimeoutError:
-                pass                      # fall through to stopping; the caller sees the workers
+            # PROPAGATES. Falling through to the sentinels on timeout reverted to exactly the unsafe
+            # behaviour this method exists to remove -- priority -1 outranks the unfinished queue --
+            # and with real pinned buffers and in-flight CUDA copies, returning from a failed drain
+            # is not a good failure mode. Use drain=False to abort deliberately.
+            self.quiesce(timeout)
             self.drain_forgets()
         else:
             with self._lk:
