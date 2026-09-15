@@ -31,6 +31,7 @@ import time
 from .leaves import (C_DEP, C_IND, C_LAYER, C_OTHER, C_PRE, EXPERT_BYTES, GPU_BUSY_S, H2D_S,
                      SPAN_S, STEPS_PER_S)
 from .drivers import Engine
+from .leaves import Bandwidth, ModelLeaves
 from .sched import V1, V2, Policy
 from .trace import N_LAYERS, load_decode, warmup_cut
 
@@ -40,18 +41,24 @@ LABEL = {
     "compute_barrier_global": "D1     H2D waits for ALL compute",
     "lease_until_completion": "D2     lease held submit->completion",
     "global_barrier": "D3     wait over ALL pending reads",
-    "moe_before_shared": "D4     routed MoE before shared expert",
 }
+# Not a Policy field: the shared-expert ordering is a property of the LEAF PROVIDER, because
+# engine/fastdecode.py captures the shared expert and the routed MoE into one graph. Running it
+# early costs a second capture, so it is swept as its own arm rather than as a free toggle.
+SHARED_FIRST_LABEL = "cap    shared expert outside graph B"
 
 # Measured, for the gap report. Decode profile, 2026-09-15.
 MEAS_BLOCK_S, MEAS_READ_S, MEAS_UNTRACKED_S = 78.1, 47.4, 26.2
 
 
-def run(policy: Policy, calls, cut: int, steps: int, evict: str, **kw) -> tuple:
-    e = Engine(policy, evict=evict, **kw)
+def run(policy: Policy, calls, cut: int, steps: int, evict: str,
+        shared_first: bool = False, scale: float = 1.0, **kw) -> tuple:
+    leaves = ModelLeaves(calls, Bandwidth(scale=scale), scale=scale,
+                         shared_first=shared_first, start=cut)
+    e = Engine(policy, evict=evict, leaves=leaves, scale=scale, **kw)
     try:
         e.warm(calls, cut)
-        c = e.decode(calls, steps, start=cut)
+        c = e.decode(steps)
         return (c.steps_per_s, c.blocked_s / c.wall_s, c.compute_s / c.wall_s,
                 c.fetches / c.steps, len(e.arena.violations), c.mean_inflight, c.achieved_gbs,
                 c.device_busy_s / c.wall_s)
@@ -78,12 +85,13 @@ def sweep(arms, calls, cut, steps, reps, evict, seed=1234, **kw):
     spreads any drift across all arms instead of loading it onto the ones measured last.
     """
     rng = random.Random(seed)
-    acc = {name: [] for name, _ in arms}
+    acc = {name: [] for name, _, _ in arms}
     for _ in range(reps):
         order = list(arms)
         rng.shuffle(order)
-        for name, policy in order:
-            acc[name].append(run(policy, calls, cut, steps, evict, **kw))
+        for name, policy, shared_first in order:
+            acc[name].append(run(policy, calls, cut, steps, evict,
+                                 shared_first=shared_first, **kw))
     return {name: summarise(v) for name, v in acc.items()}
 
 
@@ -99,11 +107,14 @@ def main(argv) -> int:
     print(f"phase 2 -- decode, {a.steps} steps x {a.reps} reps per arm, evict={a.evict}, "
           f"warm to call {cut:,}\n")
 
-    arms = [("v1", V1), ("v2", V2),
-            ("pair", dataclasses.replace(V1, resolve_blocks=False, global_barrier=False))]
+    arms = [("v1", V1, False), ("v2", V2, False),
+            ("pair", dataclasses.replace(V1, resolve_blocks=False, global_barrier=False), False)]
     for f in FIELDS:
-        arms.append((f"A:{f}", dataclasses.replace(V1, **{f: False})))
-        arms.append((f"B:{f}", dataclasses.replace(V2, **{f: True})))
+        arms.append((f"A:{f}", dataclasses.replace(V1, **{f: False}), False))
+        arms.append((f"B:{f}", dataclasses.replace(V2, **{f: True}), False))
+    # The capture-time arm, swept in the same interleave so it is comparable to the rest.
+    arms.append(("A:shared_first", V1, True))
+    arms.append(("B:shared_first", V2, True))
     res = sweep(arms, calls, cut, a.steps, a.reps, a.evict)
     base, v2 = res["v1"], res["v2"]
 
@@ -170,7 +181,7 @@ def main(argv) -> int:
 
     print("  TABLE A -- leave-one-out from v1 (turn ONE dependency off)")
     print(hdr)
-    print(f"  {'v1 (all five on)':38s} {base[0]:9.2f} {base[1]:6.2f}-{base[2]:<6.2f} "
+    print(f"  {'v1 (all four on)':38s} {base[0]:9.2f} {base[1]:6.2f}-{base[2]:<6.2f} "
           f"{'--':>9s} {'':>5s} {'':>7s} {100 * base[3]:8.1f} %")
     a_rows = {}
     for f in FIELDS:
@@ -179,12 +190,16 @@ def main(argv) -> int:
         eff, sig, fl = mark(r, base)
         print(f"  {LABEL[f]:38s} {r[0]:9.2f} {r[1]:6.2f}-{r[2]:<6.2f} {eff} {sig:>5s} "
               f"{fl:6.1f} % {100 * r[3]:8.1f} %")
+    r = res["A:shared_first"]
+    eff, sig, fl = mark(r, base)
+    print(f"  {SHARED_FIRST_LABEL:38s} {r[0]:9.2f} {r[1]:6.2f}-{r[2]:<6.2f} {eff} {sig:>5s} "
+          f"{fl:6.1f} % {100 * r[3]:8.1f} %")
     print()
 
     print("  TABLE B -- leave-one-in from v2 (turn ONE dependency back on)")
     print(hdr)
     eff, sig, fl = mark(v2, base)
-    print(f"  {'v2 (all five off)':38s} {v2[0]:9.2f} {v2[1]:6.2f}-{v2[2]:<6.2f} {eff} {sig:>5s} "
+    print(f"  {'v2 (all four off)':38s} {v2[0]:9.2f} {v2[1]:6.2f}-{v2[2]:<6.2f} {eff} {sig:>5s} "
           f"{fl:6.1f} % {100 * v2[3]:8.1f} %   <- vs v1")
     for f in FIELDS:
         r = res[f"B:{f}"]

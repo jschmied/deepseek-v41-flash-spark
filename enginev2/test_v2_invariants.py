@@ -37,6 +37,7 @@ import time
 
 from .drivers import Engine
 from .sched import V1, V2, ComputeStream, LoaderService, Policy
+from .leaves import Bandwidth, ModelLeaves
 from .store import ExpertSlots, SlotArena
 from .trace import load_decode, warmup_cut
 
@@ -149,7 +150,7 @@ def test_lease_released_at_handoff_is_still_conserved():
     """v2-only: D2 off releases the lease after the READ, not after the H2D. It must still balance,
     and it must not be released twice -- a double release would inflate the semaphore above n and
     let two loads share one staging buffer, which is the torn-slot bug with extra steps."""
-    e = mk(Policy(False, False, False, False, False), staging=4, n_workers=4, lru_slots=32)
+    e = mk(Policy(False, False, False, False), staging=4, n_workers=4, lru_slots=32)
     try:
         _, to_load = e.slots.reserve(0, tuple(range(16)), prefill=False)
         e.loader.submit(to_load)
@@ -179,7 +180,7 @@ def test_driver_must_not_wait_for_a_slot_inside_a_compute_region():
     neither can proceed. This pins the requirement AND demonstrates the hang, so the constraint is
     a checked claim and not folklore.
     """
-    e = mk(Policy(False, True, False, False, False), n_workers=2, staging=2)
+    e = mk(Policy(False, True, False, False), n_workers=2, staging=2)
     try:
         _, to_load = e.slots.reserve(0, (1, 2), prefill=False)
         e.loader.submit(to_load)
@@ -292,8 +293,8 @@ def test_barrier_sits_between_the_read_and_the_arena_write():
     THEN the arena write. What v2 changes is only WHICH barrier -- per-slot rather than
     wait-for-all-compute. Both orders are asserted.
     """
-    for pol, want in ((Policy(False, True, False, False, False), "wait_idle"),
-                      (Policy(False, False, False, False, False), "wait_slot")):
+    for pol, want in ((Policy(False, True, False, False), "wait_idle"),
+                      (Policy(False, False, False, False), "wait_slot")):
         e = mk(pol, n_workers=1, staging=1)
         order: list = []
         try:
@@ -361,10 +362,10 @@ def test_per_slot_barrier_removes_v1s_cross_layer_overlap():
         finally:
             e.close()
 
-    kinds, _ = attempt(Policy(False, False, False, False, False), False)
+    kinds, _ = attempt(Policy(False, False, False, False), False)
     assert "write-during-read" not in kinds, (
         f"v2's per-slot barrier did not order layer 1's H2D against layer 0's reader: {kinds}")
-    kinds_mut, _ = attempt(Policy(False, False, False, False, False), True)
+    kinds_mut, _ = attempt(Policy(False, False, False, False), True)
     assert "write-during-read" in kinds_mut, (
         "with the per-slot barrier removed the overlap did NOT come back, so this test was not "
         "measuring the barrier. v1's hazard must reappear or the assertion above proves nothing.")
@@ -380,10 +381,11 @@ def test_decode_shaped_concurrency_both_arms():
     cut = warmup_cut(calls)
     got = {}
     for name, pol in (("v1", V1), ("v2", V2)):
-        e = Engine(pol, lru_slots=5328, transient_slots=400, scale=SCALE)
+        e = Engine(pol, lru_slots=5328, transient_slots=400, scale=SCALE,
+                   leaves=ModelLeaves(calls, Bandwidth(scale=SCALE), scale=SCALE, start=cut))
         try:
             e.warm(calls, cut)
-            c = e.decode(calls, 3, start=cut)
+            c = e.decode(3)
             assert e.arena.violations == [], (name, e.arena.violations[:4])
             assert e.loader.stage.at_rest(), name
             got[name] = c.fetches

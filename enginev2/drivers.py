@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import time
 
-from .leaves import C_DEP, C_IND, C_OTHER, C_PRE, delay
+from .leaves import Bandwidth, ModelLeaves
 from .sched import ComputeStream, LoaderService, Policy
 from .store import ExpertSlots, SlotArena
 from .trace import N_LAYERS
@@ -35,13 +35,18 @@ class Counters:
 class Engine:
     def __init__(self, policy: Policy, evict: str = "lru", lru_slots: int = 5328,
                  transient_slots: int = 400, n_workers: int = 48, staging: int = 48,
-                 device_queue_depth: int = 8, scale: float = 1.0):
+                 device_queue_depth: int = 8, scale: float = 1.0, leaves=None, calls=()):
         self.policy = policy
         self.slots = ExpertSlots(lru_slots, transient_slots, policy=evict)
         self.arena = SlotArena(self.slots.n_slots)
         self.compute = ComputeStream()
+        # THE SEAM. Everything the engine actually does -- router, MoE, NVMe read, H2D -- is behind
+        # this one object. The default is the modelled provider; a real one implements the same four
+        # methods against engine/fastdecode.py's two graphs and engine/experts.py's `_read_leased`.
+        self.leaves = leaves if leaves is not None else ModelLeaves(
+            calls, Bandwidth(scale=scale), scale=scale)
         self.loader = LoaderService(self.arena, self.slots, self.compute, policy,
-                                    n_workers=n_workers, staging=staging,
+                                    leaves=self.leaves, n_workers=n_workers, staging=staging,
                                     device_queue_depth=device_queue_depth, scale=scale)
         self.scale = scale
         self.c = Counters()
@@ -50,11 +55,14 @@ class Engine:
         self.loader.shutdown()
 
     # ------------------------------------------------------------------ compute helpers
-    def _compute(self, seconds: float, slots=()):
+    def _compute(self, fn, slots=()):
+        """Run one compute leaf inside the compute stream. `slots` are the arena slots it READS --
+        that is what lets the loader honour a per-slot ordering instead of a global barrier."""
         t0 = time.perf_counter()
         with self.compute.run(slots):
-            delay(seconds / self.scale)
+            r = fn()
         self.c.compute_s += time.perf_counter() - t0
+        return r
 
     def _wait(self, to_load):
         t0 = time.perf_counter()
@@ -66,7 +74,7 @@ class Engine:
             self.c.blocked_s += time.perf_counter() - t0
 
     # ------------------------------------------------------------------ decode
-    def decode_layer(self, layer: int, uniq) -> None:
+    def decode_layer(self, layer: int) -> None:
         """One layer of one decode step.
 
         NOTE ON D3, recorded because it changes what the table can say. At decode the driver cannot
@@ -76,7 +84,9 @@ class Engine:
         than measured-small. It is exercised in prefill_chunked(), where several chunks of one layer
         are in flight together.
         """
-        self._compute(C_PRE)                                    # attention + HC, pre-router
+        # Graph A. The expert ids come OUT of it -- they are not handed to the driver. This is the
+        # line that makes this an engine and not a replay of someone else's route.
+        uniq = self._compute(lambda: self.leaves.layer_a(layer))
         slot_of, to_load = self.slots.reserve(layer, uniq, prefill=False)
         self.c.fetches += len(to_load)
         self.loader.submit(to_load)
@@ -87,32 +97,32 @@ class Engine:
             # count. Everything after this point runs with the loader already drained.
             self._wait(to_load)
 
-        if not self.policy.moe_before_shared:
-            self._compute(C_IND)                                # D4 OFF: shared expert first
+        # The shared expert is expert-INdependent, so a provider that captured it outside graph B
+        # can run it here, while the reads fly. One that did not has it inside layer_b, where it
+        # cannot overlap anything -- see leaves.Leaves.shared_first.
+        if self.leaves.shared_first:
+            self._compute(lambda: self.leaves.shared(layer))
 
         if not self.policy.resolve_blocks:
             self._wait(to_load)
 
-        self._compute(C_DEP, slots=sorted(set(slot_of.values())))   # routed MoE
+        # Graph B: routed MoE + HC residual (+ the shared expert, unless it ran above).
+        reads = sorted(set(slot_of.values()))
+        self._compute(lambda: self.leaves.layer_b(layer, reads), slots=reads)
 
-        if self.policy.moe_before_shared:
-            self._compute(C_IND)                                # D4 ON: too late to overlap
-
-        self._compute(C_OTHER)
-
-    def decode(self, calls, steps: int, start: int = 0) -> Counters:
-        """`calls` is the decode trace; one step is N_LAYERS consecutive calls."""
+    def decode(self, steps: int) -> Counters:
+        """Run `steps` decode steps. Where the expert ids come from is the provider's business."""
         t0 = time.perf_counter()
-        for s in range(steps):
-            base = start + s * N_LAYERS
-            for j in range(N_LAYERS):
-                layer, uniq = calls[base + j]
-                self.decode_layer(layer, uniq)
+        for _ in range(steps):
+            for layer in range(N_LAYERS):
+                self.decode_layer(layer)
             self.c.steps += 1
         self.c.wall_s = time.perf_counter() - t0
-        self.c.mean_inflight = self.loader.bw.mean_inflight
-        self.c.achieved_gbs = self.loader.bw.achieved_gbs
-        self.c.device_busy_s = self.loader.bw.busy_s
+        bw = self.loader.bw
+        if bw is not None:                      # a real provider models no device; leave at 0.0
+            self.c.mean_inflight = bw.mean_inflight
+            self.c.achieved_gbs = bw.achieved_gbs
+            self.c.device_busy_s = bw.busy_s
         return self.c
 
     def warm(self, calls, upto: int) -> None:
@@ -124,7 +134,7 @@ class Engine:
                 self.loader.ready.set(slot, gen)
 
     # ------------------------------------------------------------------ prefill
-    def prefill_chunked(self, layer: int, chunks, hold_per_chunk: float = C_PRE) -> None:
+    def prefill_chunked(self, layer: int, chunks) -> None:
         """Chunked prefill over one layer: the only shape where D3 is reachable.
 
         v1 defers each chunk's reads and does the chunk's attention while they fly, then joins at
@@ -137,10 +147,12 @@ class Engine:
             self.c.fetches += len(to_load)
             self.loader.submit(to_load)
             pending.extend(to_load)
-            self._compute(hold_per_chunk)
+            self._compute(lambda: self.leaves.prefill_attn(layer))
             if not self.policy.global_barrier:
                 self._wait(to_load)                             # only this chunk's experts
-                self._compute(C_DEP, slots=sorted(set(slot_of.values())))
+                reads = sorted(set(slot_of.values()))
+                self._compute(lambda: self.leaves.prefill_moe(layer, reads), slots=reads)
         if self.policy.global_barrier:
             self._wait(pending)                                 # the barrier over all chunks
-            self._compute(C_DEP * len(chunks))
+            n = len(chunks)
+            self._compute(lambda: self.leaves.prefill_moe(layer, (), n))

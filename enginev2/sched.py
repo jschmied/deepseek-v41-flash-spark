@@ -19,10 +19,15 @@ may be the same phenomenon in reality and a table with independent columns would
                                  miss can block on a BUFFER while the device is idle.
   D3     global_barrier          the wait is over every pending read rather than the slots this
                                  layer actually needs. v1's `join_pending()`.
-  D4     moe_before_shared       the routed MoE runs before the shared expert, so the one piece of
-                                 expert-independent post-router work cannot overlap the reads.
+WHAT IS NOT A TOGGLE HERE, and why. An earlier revision carried a fifth switch, `moe_before_shared`
+(D4): run the routed MoE before the shared expert, so the one piece of expert-independent
+post-router work cannot overlap the reads. It has been moved to the LEAF PROVIDER
+(`leaves.Leaves.shared_first`). engine/fastdecode.py captures the routed MoE and the shared expert
+into ONE graph (B), so reordering them is not a scheduling decision the driver can make -- it needs
+graph B captured in two pieces. Leaving it in Policy modelled a capture-time cost as free and would
+have over-credited v2.
 
-v1 = all five True. v2 = all five False.
+v1 = all four True. v2 = all four False.
 """
 
 from __future__ import annotations
@@ -32,9 +37,15 @@ import contextlib
 import dataclasses
 import queue
 import threading
+import time
 
-from .leaves import C_DEP, C_IND, C_OTHER, C_PRE, EXPERT_BYTES, H2D_S, Bandwidth, delay
+from .leaves import Bandwidth, ModelLeaves
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
+
+
+def _default_leaves(scale: float):
+    """A provider with no trace: read/h2d only. Used by tests that drive the loader directly."""
+    return ModelLeaves(calls=(), bw=Bandwidth(scale=scale), scale=scale)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -43,7 +54,6 @@ class Policy:
     compute_barrier_global: bool = True
     lease_until_completion: bool = True
     global_barrier: bool = True
-    moe_before_shared: bool = True
 
     @property
     def name(self) -> str:
@@ -52,7 +62,7 @@ class Policy:
 
 
 V1 = Policy()
-V2 = Policy(False, False, False, False, False)
+V2 = Policy(False, False, False, False)
 
 
 class ComputeStream:
@@ -108,13 +118,18 @@ class LoaderService:
     """
 
     def __init__(self, arena: SlotArena, slots: ExpertSlots, compute: ComputeStream,
-                 policy: Policy, n_workers: int = 48, staging: int = 48,
+                 policy: Policy, leaves=None, n_workers: int = 48, staging: int = 48,
                  device_queue_depth: int = 8, scale: float = 1.0, fail: set | None = None):
         self.arena = arena
         self.slots = slots
         self.compute = compute
         self.policy = policy
-        self.bw = Bandwidth(scale=scale)
+        # The I/O half of the seam. A provider supplies read() and h2d(); the modelled one sleeps,
+        # a real one does O_DIRECT into a pinned buffer and a device copy out of it. `bw` is the
+        # modelled device and exists only for statistics -- a real provider has none, so every
+        # reader of it must tolerate None.
+        self.leaves = leaves if leaves is not None else _default_leaves(scale)
+        self.bw = getattr(self.leaves, "bw", None)
         self.stage = StagingPool(staging)
         self.ready = SlotReady()
         self.scale = scale
@@ -145,7 +160,7 @@ class LoaderService:
         try:
             if key in self.fail:
                 raise IOError(f"injected NVMe failure {key}")
-            self.bw.read(EXPERT_BYTES)
+            payload = self.leaves.read(key, sid)
             if not self.policy.lease_until_completion:
                 # D2 OFF: the lease covers the READ only. Buffer count stops being coupled to read
                 # duration. NOTE the physical caveat, recorded because the skeleton cannot check
@@ -159,10 +174,12 @@ class LoaderService:
                 self.compute.wait_slot_free(slot)  # D1 OFF: only this slot's previous reader
             with self.dq:
                 with self.arena.writing(slot, key):
-                    delay(H2D_S / self.scale)
+                    t0 = time.perf_counter()
+                    self.leaves.h2d(slot, key, payload)
+                    dt = time.perf_counter() - t0
             with self._lk:
                 self.h2d_calls += 1
-                self.h2d_s += H2D_S / self.scale
+                self.h2d_s += dt
             self.ready.set(slot, gen)
         except BaseException as exc:              # noqa: BLE001
             # A failed expert must be UN-MAPPED: its slot holds a torn read, and leaving the key

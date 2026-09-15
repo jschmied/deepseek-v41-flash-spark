@@ -160,3 +160,118 @@ class Bandwidth:
     def peak_note(self) -> str:
         return (f"read model: {self.bw_one / 1e9:.2f} GB/s alone, {self.bw_two / 1e9:.2f} GB/s at "
                 f">=2 in flight, {EXPERT_BYTES / 2 ** 20:.2f} MiB per expert")
+
+
+# ---------------------------------------------------------------------------
+# The leaf provider -- the seam a real component is swapped in at.
+# ---------------------------------------------------------------------------
+#
+# GRANULARITY IS SET BY THE REAL ENGINE, NOT BY THE MODEL. engine/fastdecode.py captures TWO CUDA
+# graphs per backbone layer: A = attention + HC + router (ends with the expert ids), then the host
+# resolve, then B = routed MoE + shared expert + HC residual. So a layer has exactly two compute
+# leaves that anything real can implement, and `C_IND`/`C_DEP`/`C_OTHER` are all INSIDE B.
+#
+# That is why the shared-expert ordering (what the skeleton called D4, `moe_before_shared`) is a
+# property of THIS OBJECT and not of Policy. Reordering the shared expert against the routed MoE
+# means editing `_layer_b` and recapturing the graph -- it is a different kind of change from a
+# scheduling toggle, and modelling it as free would over-credit v2. A provider declares which
+# ordering it has; it cannot be flipped per call.
+#
+# Segmented capture (DSV41_GRAPH_SEGMENTS, several layers in one graph with no host resolve
+# between them) is RESIDENT-MODE ONLY. We stream, so the per-layer A/B seam is the real one.
+
+
+class Leaves:
+    """What a decode layer is made of. Implement all four to run the engine on real components.
+
+    layer_a  -> the expert ids this layer wants. In the model this reads them from the captured
+                route trace; on the real path it replays graph A and reads the router's output.
+                THIS is what makes the driver an engine rather than a replay: the ids come out of
+                compute, they are not handed to it.
+    layer_b  -> the routed MoE + shared expert + HC residual, over slots already resident.
+    read     -> one expert from NVMe into a leased staging buffer. One leaf from the caller's view;
+                v1's `_read_leased` chunks it internally onto its own `read_pool`, and a real
+                provider MUST keep that inner pool or it re-acquires v1's two-pool deadlock.
+    h2d      -> staging buffer into the arena slot.
+    """
+
+    # True = this provider has the shared expert SPLIT OUT of graph B, so the driver can run it
+    # while the reads fly. A real provider can only claim this if graph B was captured in two
+    # pieces (B1 = shared expert, B2 = routed MoE + the rest); it is a capture-time cost, which is
+    # exactly why it is declared here and not toggled per call.
+    shared_first = False
+
+    def layer_a(self, layer: int) -> tuple:
+        raise NotImplementedError
+
+    def shared(self, layer: int) -> None:
+        """The shared expert alone. Only called when `shared_first`; otherwise it is inside layer_b."""
+        raise NotImplementedError
+
+    def layer_b(self, layer: int, slots) -> None:
+        raise NotImplementedError
+
+    def read(self, key: tuple, staging_id: int) -> object:
+        raise NotImplementedError
+
+    def h2d(self, slot: int, key: tuple, payload: object) -> None:
+        raise NotImplementedError
+
+    # --- prefill. Its real seam is NOT designed yet: v1's prefill runs a different MoE kernel
+    # (tools/cb3_moe.py moe_forward_prefill) over a chunk of many tokens, not the decode path.
+    # These exist so the chunked driver -- the only shape that can reach D3 -- stays runnable on
+    # the modelled provider. A real provider must define them before prefill means anything.
+    def prefill_attn(self, layer: int) -> None:
+        raise NotImplementedError
+
+    def prefill_moe(self, layer: int, slots, chunks: int = 1) -> None:
+        raise NotImplementedError
+
+
+class ModelLeaves(Leaves):
+    """The modelled provider: calibrated sleeps, ids replayed from the captured route trace.
+
+    Every duration here comes from the MEASURED CONSTANTS at the top of this file. None is tuned to
+    make a total come out right -- when the model disagrees with the box, phase2 reports the gap as
+    `unmodelled`.
+    """
+
+    def __init__(self, calls, bw: "Bandwidth", scale: float = 1.0, shared_first: bool = False,
+                 start: int = 0):
+        self.calls = calls
+        self.bw = bw
+        self.scale = scale
+        self.shared_first = shared_first
+        self.i = start
+
+    def layer_a(self, layer: int) -> tuple:
+        delay(C_PRE / self.scale)
+        L, uniq = self.calls[self.i]
+        if L != layer:
+            raise AssertionError(f"trace desync: driver at layer {layer}, trace at {L}")
+        self.i += 1
+        return uniq
+
+    def shared(self, layer: int) -> None:
+        delay(C_IND / self.scale)
+
+    def layer_b(self, layer: int, slots) -> None:
+        # One leaf, because graph B is ONE replay. The modelled shares are summed rather than run
+        # as separate sleeps: splitting them would invent overlap windows the real engine does not
+        # have, and each sub-500us sleep would be spun on the GIL for nothing. The shared expert is
+        # in here unless this provider split it out (`shared_first`).
+        d = C_DEP + C_OTHER + (0.0 if self.shared_first else C_IND)
+        delay(d / self.scale)
+
+    def prefill_attn(self, layer: int) -> None:
+        delay(C_PRE / self.scale)
+
+    def prefill_moe(self, layer: int, slots, chunks: int = 1) -> None:
+        delay(C_DEP * chunks / self.scale)
+
+    def read(self, key: tuple, staging_id: int) -> object:
+        self.bw.read(EXPERT_BYTES)
+        return None
+
+    def h2d(self, slot: int, key: tuple, payload: object) -> None:
+        delay(H2D_S / self.scale)
