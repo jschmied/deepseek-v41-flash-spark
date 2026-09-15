@@ -43,8 +43,13 @@ import threading
 class Chain:
     """Named happens-before edges, keyed by (name, index). One-shot, monotonic within a step.
 
-    `index` is the layer for per-layer edges and -1 for step-level ones. A wait on an index below
-    zero is satisfied trivially -- that is layer 0 having no predecessor, not a special case.
+    `index` is the layer for per-layer edges and the STEP NUMBER for step-level ones. Step-level
+    events are keyed by step rather than reset, because `reset()` deleting the previous step's
+    "logits" before anything waited on it made edge 8 exist only in comments. Keying by step also
+    survives final/draft/verify overlapping a following step, which is the shape this is for.
+
+    A wait on a per-layer index below zero is satisfied trivially -- layer 0 has no predecessor,
+    which is not a special case worth branching on at the call site.
     """
 
     def __init__(self):
@@ -60,10 +65,12 @@ class Chain:
         self.checks = 0
         self.blocks = 0
 
-    def reset(self) -> None:
+    def reset(self, keep: tuple = ()) -> None:
+        """Clear per-layer edges for a new step. Step-level names in `keep` survive, because a
+        later step may still have to wait on them. Counters are cumulative on purpose."""
         with self._lk:
-            self._done.clear()
-            self._cv.notify_all()   # counters are cumulative across steps on purpose
+            self._done = {(n, i) for (n, i) in self._done if n in keep}
+            self._cv.notify_all()
 
     def set(self, name: str, index: int = -1) -> None:
         with self._lk:

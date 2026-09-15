@@ -46,16 +46,16 @@ SCALE = 20.0          # leaves run 20x faster; ratios are preserved, the tests a
 
 
 def mk(policy: Policy = V2, lru_slots: int = 16, transient_slots: int = 8, n_workers: int = 8,
-       staging: int = 8, nvme_qd: int | None = None, h2d_inflight: int | None = None,
+       staging: int = 8, expert_read_qd: int | None = None, h2d_inflight: int | None = None,
        fail=None) -> Engine:
-    # nvme_qd must stay BELOW the buffer count or releasing the permit at handoff buys nothing and
+    # expert_read_qd must stay BELOW the buffer count or releasing the permit at handoff buys nothing and
     # the loader refuses the configuration -- so derive it from staging unless a test pins it.
-    if nvme_qd is None:
-        nvme_qd = max(1, staging // 2)
+    if expert_read_qd is None:
+        expert_read_qd = max(1, staging // 2)
     if h2d_inflight is None:
         h2d_inflight = max(1, staging // 2)
     e = Engine(policy, lru_slots=lru_slots, transient_slots=transient_slots,
-               n_workers=n_workers, staging=staging, nvme_qd=nvme_qd,
+               n_workers=n_workers, staging=staging, expert_read_qd=expert_read_qd,
                h2d_inflight=h2d_inflight, scale=SCALE)
     if fail:
         e.loader.fail.update(fail)
@@ -325,7 +325,7 @@ def test_barrier_sits_between_the_read_and_the_arena_write():
     """
     for pol, want in ((Policy(False, True, False, False), "wait_idle"),
                       (Policy(False, False, False, False), "wait_slot")):
-        e = mk(pol, n_workers=1, staging=2, nvme_qd=1, h2d_inflight=1)
+        e = mk(pol, n_workers=1, staging=2, expert_read_qd=1, h2d_inflight=1)
         order: list = []
         try:
             real_read, real_idle, real_slot = e.loader.bw.read, e.compute.wait_idle, e.compute.wait_slot_free
@@ -568,7 +568,7 @@ def test_declared_edges_are_load_bearing_not_decorative():
         for L in range(N_LAYERS):
             for name in ("h", "y", "route", "engram", "kv"):
                 assert e.chain.is_set(name, L), f"{name}@{L} was never set"
-        assert e.chain.is_set("logits"), "the step-level edge was never set"
+        assert e.chain.is_set("logits", 0), "the step-level edge was never set"
         assert e.chain.checks >= N_LAYERS * 2, (
             f"the driver only reached {e.chain.checks} edges -- the chain is not in the path")
         assert e.chain.blocks == 0, (

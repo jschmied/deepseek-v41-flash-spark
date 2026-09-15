@@ -122,7 +122,7 @@ class LoaderService:
 
     def __init__(self, arena: SlotArena, slots: ExpertSlots, compute: ComputeStream,
                  policy: Policy, leaves=None, n_workers: int = 48, staging: int = 48,
-                 nvme_qd: int = 8, h2d_inflight: int = 8, scale: float = 1.0,
+                 expert_read_qd: int = 8, h2d_inflight: int = 8, scale: float = 1.0,
                  fail: set | None = None):
         self.arena = arena
         self.slots = slots
@@ -143,26 +143,38 @@ class LoaderService:
         # on its own -- and wrong the moment lookahead issues speculative reads, which is the one
         # feature v2 exists for. Caught in review 2026-09-15.
         #
-        #   n_workers      threads; they hide per-read latency, they do not add bandwidth
-        #   nvme_qd        how many reads may be IN THE DEVICE at once
-        #   staging        physical pinned buffers
-        #   h2d_inflight   how many device copies may run at once
-        self.nvme_qd = threading.Semaphore(nvme_qd)
+        #   n_workers          threads; they hide per-read latency, they do not add bandwidth
+        #   expert_read_qd     how many EXPERT READS may be admitted at once -- see below
+        #   staging            physical pinned buffers
+        #   h2d_inflight       how many device copies may run at once
+        #
+        # THIS IS NOT THE DEVICE'S REQUEST QUEUE DEPTH, and the distinction matters for calibrating
+        # a real provider. One expert read is fanned into several aligned O_DIRECT chunk reads on
+        # `_read_leased`'s inner read_pool, so N admitted expert reads put substantially more than N
+        # requests in the device. It was called nvme_qd, which invited exactly that misreading.
+        self.read_qd = threading.Semaphore(expert_read_qd)
         self.h2d_sem = threading.Semaphore(h2d_inflight)
-        self._nvme_qd_n, self._h2d_n = nvme_qd, h2d_inflight
+        self._read_qd_n, self._h2d_n = expert_read_qd, h2d_inflight
         # D2 off releases the NVMe permit at handoff so another read can start while this buffer
         # waits on its copy. That only buys anything if there are buffers spare to start into.
-        if not policy.lease_until_completion and staging <= nvme_qd:
+        if not policy.lease_until_completion and staging <= expert_read_qd:
             raise ValueError(
-                f"lease_until_completion=False needs staging ({staging}) > nvme_qd ({nvme_qd}): "
-                f"releasing the permit early cannot help if every buffer is already committed")
+                f"lease_until_completion=False needs staging ({staging}) > expert_read_qd "
+                f"({expert_read_qd}): releasing the permit early cannot help if every buffer is "
+                f"already committed")
         self.fail = fail if fail is not None else set()
         # PRIORITY QUEUE: demand reads (0) ahead of speculation (1). Speculation still takes the
-        # same nvme_qd permits once it starts -- it is deprioritised, never exempted, because a
+        # same expert-read admissions once it starts -- it is deprioritised, never exempted, because a
         # prefetch for layer L+1 and a demand miss on layer L really do contend for one device.
         self.q: queue.PriorityQueue = queue.PriorityQueue()
         self._seq = 0
         self._cancelled: set = set()
+        # What is still IN the queue. cancel() used to count every request as a cancellation even
+        # when the read was already running -- inflating the discard statistics -- and its marker
+        # then stayed in _cancelled forever, because only a worker checking BEFORE it starts
+        # consumes one. Membership here is the truth, and both sides take _lk, so there is no race
+        # between a worker dequeuing and a cancel arriving.
+        self._queued: set = set()
         # D3's barrier is over DEMAND reads only. v1's join_pending() has no speculation to wait
         # for, so folding prefetches into it would make the v1 arm wait on work v1 never issues --
         # a confound, not a finding. Speculation is deprioritised and uncounted here by design.
@@ -189,11 +201,9 @@ class LoaderService:
         # another reader early corrupts the transfer in flight. The previous revision released it
         # at handoff under D2, which made the v2 arm compare against something unbuildable.
         with self._lk:
-            if (slot, gen) in self._cancelled:
-                self._cancelled.discard((slot, gen))
-                cancelled = True
-            else:
-                cancelled = False
+            self._queued.discard((slot, gen))        # past the point of cancelling
+            cancelled = (slot, gen) in self._cancelled
+            self._cancelled.discard((slot, gen))     # consumed either way: no marker outlives its read
         if cancelled:
             # Never started, so nothing to undo but the reservation itself.
             self.slots.forget(key, slot)
@@ -208,13 +218,13 @@ class LoaderService:
         try:
             if key in self.fail:
                 raise IOError(f"injected NVMe failure {key}")
-            self.nvme_qd.acquire()                 # admission to the device
+            self.read_qd.acquire()                 # admission to the device
             permit_held = True
             staged = self.leaves.read(key, self.stage)
             if not self.policy.lease_until_completion:
                 # D2 OFF: give the ADMISSION back now. Another read may enter the device while this
                 # expert's buffer waits on its copy. The buffer itself stays ours until H2D done.
-                self.nvme_qd.release()
+                self.read_qd.release()
                 permit_held = False
             if self.policy.compute_barrier_global:
                 self.compute.wait_idle()          # D1 ON: wait for ALL compute
@@ -237,7 +247,7 @@ class LoaderService:
             self.ready.set(slot, gen, err=exc)
         finally:
             if permit_held:
-                self.nvme_qd.release()
+                self.read_qd.release()
             # The write is over (done or failed): the slot may be evicted again.
             self.slots.clear_pending(slot, gen)
             if staged is not None:
@@ -272,6 +282,7 @@ class LoaderService:
         with self._lk:
             for item in to_load:
                 self._seq += 1
+                self._queued.add((item[1], item[2]))
                 self.q.put((prio, self._seq, item, prio == 0))
 
     def cancel(self, items) -> int:
@@ -282,8 +293,11 @@ class LoaderService:
         n = 0
         with self._lk:
             for key, slot, gen in items:
-                self._cancelled.add((slot, gen))
-                n += 1
+                if (slot, gen) in self._queued:      # still queued: a real cancellation
+                    self._cancelled.add((slot, gen))
+                    n += 1
+                # already running or finished: not interruptible, and NOT counted as cancelled --
+                # it will complete and simply never be used, which is the cost of being wrong.
         return n
 
     def wait_slots(self, to_load) -> None:

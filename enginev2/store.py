@@ -214,11 +214,29 @@ class StagingPool:
         return memoryview(self._buf[sid])
 
     def same_buffer(self, sid: int, view) -> bool:
-        """True if `view` aliases this lease's buffer rather than being a copy of it."""
-        try:
-            return view.obj is self._buf[sid]
-        except AttributeError:
-            return False
+        """True if `view` ALIASES this lease's buffer rather than being a copy of it.
+
+        The invariant is storage identity plus containment, not any one language's buffer protocol.
+        `view.obj is buf` only answers it for memoryview(bytearray); a real provider hands back a
+        pinned torch.Tensor view, which shares storage with its base without exposing that
+        relationship the same way -- the check would then report non-aliasing on memory that is in
+        fact the same bytes. So the pool asks the BUFFER, and a provider that supplies real pinned
+        memory supplies the matching predicate with it.
+        """
+        buf = self._buf[sid]
+        probe = getattr(buf, "aliases", None)          # provider-supplied buffers answer for themselves
+        if callable(probe):
+            return bool(probe(view))
+        if hasattr(view, "data_ptr") and hasattr(buf, "data_ptr"):
+            # torch: same storage, and the view lies inside the leased range
+            try:
+                if view.untyped_storage().data_ptr() != buf.untyped_storage().data_ptr():
+                    return False
+                lo = buf.data_ptr()
+                return lo <= view.data_ptr() < lo + buf.numel() * buf.element_size()
+            except Exception:
+                return False
+        return getattr(view, "obj", None) is buf       # memoryview over the model's bytearray
 
     def in_use(self, sid: int) -> bool:
         with self._lk:

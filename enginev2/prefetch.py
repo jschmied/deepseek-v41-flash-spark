@@ -8,7 +8,7 @@ was worth 0.4 pp, so no head could be worth more.
 THREE THINGS THIS MUST MODEL, each of which was a real error in this project before:
 
   * SPECULATIVE READS CONTEND WITH DEMAND READS. A prefetch for layer L+1 and a demand miss on
-    layer L want the same device. They go down the same queue and take the same `nvme_qd` permits;
+    layer L want the same device. They go down the same queue and take the same expert-read admission permits;
     demand reads are only PRIORITISED, never exempted. An oracle that prefetched for free would
     report a ceiling the device cannot deliver.
 
@@ -35,7 +35,24 @@ from .trace import N_LAYERS
 
 @dataclasses.dataclass
 class PrefetchStats:
-    issued: int = 0          # speculative reads submitted
+    """TWO PRECISIONS, and the gap between them is a finding, not bookkeeping noise.
+
+    A predictor's precision over PREDICTIONS is not its precision over FETCHES, and the second is
+    the one that costs anything. Correct predictions are mostly already resident -- the cache runs
+    at ~92 % hit rate, so naming an expert that will be used usually asks for no I/O at all. Wrong
+    predictions are essentially never resident, so every one of them buys a slot, an eviction and a
+    device admission. The issued mix is therefore dominated by the errors.
+
+    Measured here: a synthetic predictor asked for precision 0.50 at horizon 1 realises 0.161 over
+    fetches, and 0.25 realises 0.092. That is not the knob misbehaving; it is the amplification
+    above. The consequence for "is a trained prediction head worth it" is direct -- a predictor has
+    to be far more precise than intuition suggests, because its hits are largely free and its
+    misses are always paid in full.
+    """
+
+    pred_hit: int = 0        # keys named that the layer really wanted (resident or fetched)
+    pred_miss: int = 0       # keys named that it did not
+    issued: int = 0          # of all named keys, the ones that actually needed a read
     used: int = 0            # prefetched keys that a later demand found resident
     wasted: int = 0          # prefetched keys evicted or cancelled without ever being demanded
     cancelled: int = 0       # still-pending speculation dropped by discard_wrong_asap
@@ -43,7 +60,14 @@ class PrefetchStats:
 
     @property
     def precision(self) -> float:
+        """Over FETCHES: of the reads speculation caused, how many were used."""
         return self.used / self.issued if self.issued else 0.0
+
+    @property
+    def precision_predicted(self) -> float:
+        """Over PREDICTIONS: what a predictor's own offline eval would report."""
+        n = self.pred_hit + self.pred_miss
+        return self.pred_hit / n if n else 0.0
 
 
 class Prefetcher:
@@ -117,7 +141,14 @@ class RecallOraclePrefetcher(OraclePrefetcher):
         self.n_experts = n_experts
 
     def predict(self, layer: int, uniq: tuple, step: int) -> tuple:
-        full = super().predict(layer, uniq, step)
+        truth = super().predict(layer, uniq, step)
+        # EXCLUDE THE WHOLE TRUTH, not the recall-retained part of it. Drawing "wrong" picks against
+        # the truncated set lets an expert that recall DROPPED come back as a supposed false
+        # positive -- and it is used when the layer arrives, so the arm's realised precision quietly
+        # exceeds the requested one. That biases exactly the recall/precision surface a decision
+        # about training a prediction head would be read off. Caught in review 2026-09-15.
+        all_true = set(truth)
+        full = truth
         if self.recall < 1.0:
             n = int(len(full) * self.recall)
             # deterministic, key-stable subset: rank by a cheap hash of the key
@@ -127,14 +158,14 @@ class RecallOraclePrefetcher(OraclePrefetcher):
         # keep |full| correct picks and pad with wrong ones until the ratio holds, so the arm's
         # ISSUE COUNT reflects what a predictor of this precision would really put on the device.
         n_wrong = int(len(full) * (1.0 - self.precision) / self.precision)
-        true_set = set(full)
+        drawn = set(all_true)
         wrong, e, guard = [], 0, 0
         while len(wrong) < n_wrong and guard < 10 * self.n_experts:
             guard += 1
             fl = full[e % len(full)][0]
             cand = (fl, (step * 7919 + layer * 104729 + guard * 31) % self.n_experts)
-            if cand not in true_set:
+            if cand not in drawn:
                 wrong.append(cand)
-                true_set.add(cand)
+                drawn.add(cand)
             e += 1
         return tuple(full) + tuple(wrong)

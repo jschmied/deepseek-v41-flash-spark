@@ -37,7 +37,7 @@ class Counters:
 class Engine:
     def __init__(self, policy: Policy, evict: str = "lru", lru_slots: int = 5328,
                  transient_slots: int = 400, n_workers: int = 48, staging: int = 48,
-                 nvme_qd: int = 8, h2d_inflight: int = 8, scale: float = 1.0,
+                 expert_read_qd: int = 8, h2d_inflight: int = 8, scale: float = 1.0,
                  leaves=None, calls=(), prefetch=None, discard_wrong_asap: bool = True,
                  engram=None):
         self.policy = policy
@@ -51,7 +51,7 @@ class Engine:
             calls, Bandwidth(scale=scale), scale=scale)
         self.loader = LoaderService(self.arena, self.slots, self.compute, policy,
                                     leaves=self.leaves, n_workers=n_workers, staging=staging,
-                                    nvme_qd=nvme_qd, h2d_inflight=h2d_inflight, scale=scale)
+                                    expert_read_qd=expert_read_qd, h2d_inflight=h2d_inflight, scale=scale)
         self.scale = scale
         # THE PREFETCH SEAM. The default predicts nothing, which is the honest baseline: both arms
         # run this identical driver and differ only in what predict() returns. Nothing is granted
@@ -65,6 +65,11 @@ class Engine:
         self.chain = Chain()
         self.engram = engram if engram is not None else EngramSource()
         self._spec: dict[tuple, tuple] = {}     # key -> (slot, gen) still speculative, not yet used
+        # Every key the predictor NAMED, including ones already resident. Needed because precision
+        # over predictions and precision over fetches are different numbers (see PrefetchStats):
+        # a correct prediction that was already cached never becomes a fetch, so scoring only the
+        # fetches would credit the predictor with none of its cheap hits.
+        self._pred: dict[int, set] = {}
         self.c = Counters()
 
     def close(self):
@@ -167,6 +172,10 @@ class Engine:
     def _settle_speculation(self, layer: int, uniq) -> None:
         """Score the predictions that were made for THIS layer, then drop the ones that missed."""
         want = {(layer, e) for e in uniq}
+        named = self._pred.pop(layer, None)
+        if named:
+            self.pf.pred_hit += len(named & want)
+            self.pf.pred_miss += len(named - want)
         wrong = []
         for key in [k for k in self._spec if k[0] == layer]:
             slot, gen = self._spec.pop(key)
@@ -187,6 +196,8 @@ class Engine:
         if not keys:
             return
         keys = [k for k in keys if k not in self._spec]
+        for k in keys:
+            self._pred.setdefault(k[0], set()).add(k)
         to_load, refused = self.slots.reserve_speculative(keys)
         self.pf.refused += refused
         if not to_load:
@@ -200,10 +211,13 @@ class Engine:
         """Run `steps` decode steps. Where the expert ids come from is the provider's business."""
         t0 = time.perf_counter()
         for step in range(steps):
-            # EDGE 8: this step's inputs depend on the previous step's logits, through draft and
-            # verify. Declared, and the reset makes a step's edges unsatisfied until re-set, so a
-            # component cannot accidentally consume last step's events.
-            self.chain.reset()
+            # EDGE 8: this step's inputs depend on the PREVIOUS step's logits, through draft and
+            # verify. Waited on before anything else runs, and the step-level event is keyed by step
+            # number so the reset below cannot delete it before it has been consumed -- which is
+            # what made this edge decorative until now.
+            if step:
+                self.chain.wait("logits", step - 1)
+            self.chain.reset(keep=("logits",))
             self.engram.issue(range(N_LAYERS), step, self.chain)
             for layer in range(N_LAYERS):
                 self.decode_layer(layer)
@@ -211,7 +225,7 @@ class Engine:
             # Per-step GPU work outside the layer loop (head, draft). Zero unless the provider was
             # told that part of the unattributed 78.5 % lives here rather than in a layer.
             self._compute(self.leaves.step_other)
-            self.chain.set("logits")
+            self.chain.set("logits", step)
             self.c.steps += 1
         self.c.wall_s = time.perf_counter() - t0
         bw = self.loader.bw
