@@ -427,7 +427,11 @@ class V41Engine:
         reserve = 8e9 + 0.25e9 * (max_seq / 8192)  # activations, indexer slices, page cache headroom
         auto = arena_gb is None
         if auto:
-            arena_gb = max(10.0, (budget - reserve) / 1e9 * 0.82)
+            # Subtract the unpack scratch AFTER the 0.82 safety factor, not before: folding it into
+            # `reserve` lets the factor shrink the reservation too, which under-reserves by ~1.3 GB
+            # of the 7.2 GB it is supposed to be holding back.
+            _ss = int(os.environ.get("DSV41_CB3_SCRATCH_SLOTS", 0)) if self.expert_format == "cb3" else 0
+            arena_gb = max(10.0, (budget - reserve) / 1e9 * 0.82 - _ss * 18_800_640 / 1e9)
         if host_avail is not None:
             cap = (host_avail - keep_free_gb * 1e9) / 1e9
             if cap < 10.0:
@@ -468,12 +472,25 @@ class V41Engine:
             # so that would buy safety we have not yet needed. Queued as an A/B.
             pack_scratch = 3e9 if self.expert_format != "fp4" else 1e9
             prefill_reserve = MAX_CHUNK * 5e6
+            # The CB3 layer unpack cache allocates its packed-FP4 scratch LAZILY, on the first
+            # prefill -- long after the arena has sized itself to fill what was free. So the arena
+            # takes the memory, the scratch asks for 7.2 GB that is no longer there, and the box
+            # goes to 4 GB MemAvailable on request one. That killed three jobs (the re-profile
+            # twice and the whole thread-count sweep) before it was diagnosed, and it failed
+            # INTERMITTENTLY -- it fits whenever the arena happens to land small enough, which is
+            # worse than failing cleanly. Reserve it here so the auto-sizer accounts for it.
+            unpack_scratch = 0.0
+            if self.expert_format == "cb3":
+                _ss = int(os.environ.get("DSV41_CB3_SCRATCH_SLOTS", 0))
+                if _ss > 0:
+                    unpack_scratch = _ss * 18_800_640
             floor = max(keep_free_gb * 1e9, prefill_reserve)
-            need = arena_gb * 1e9 + pack_scratch + floor
+            need = arena_gb * 1e9 + pack_scratch + unpack_scratch + floor
             if need > host_avail:
                 raise RuntimeError(
                     f"refusing to start: arena {arena_gb:.1f} GB + {pack_scratch / 1e9:.1f} GB "
-                    f"warm-start scratch + {floor / 1e9:.1f} GB floor "
+                    f"warm-start scratch + {unpack_scratch / 1e9:.1f} GB unpack scratch "
+                    f"(DSV41_CB3_SCRATCH_SLOTS) + {floor / 1e9:.1f} GB floor "
                     f"({'a prefill chunk' if prefill_reserve > keep_free_gb * 1e9 else 'keep_free'}) "
                     f"= {need / 1e9:.1f} GB, but MemAvailable is {host_avail / 1e9:.1f} GB. Lower "
                     f"--arena-gb by at least {(need - host_avail) / 1e9:.1f} GB, lower "
