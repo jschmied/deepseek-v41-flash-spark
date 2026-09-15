@@ -14,6 +14,7 @@ Any (S, T) with T <= 512 works, which is what chunked prefill and 6-token verify
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import sys
@@ -55,6 +56,25 @@ if EARLY_SUBMIT in ("1", "true", "yes"):
 elif EARLY_SUBMIT in ("0", "false", "no", ""):
     EARLY_SUBMIT = "off"
 assert EARLY_SUBMIT in ("off", "all", "chunk0", "synconly"), EARLY_SUBMIT
+
+# nsys attribution only: 44.7 % of 148,447 kernel launches on a real prefill are tiny
+# elementwise_kernel ops, and the profile alone cannot say which Python region emits them.
+# `nvtx_range` marks a phase for nsys to bucket launches by; `if not NVTX: yield; return` means the
+# default (off) path never touches torch.cuda.nvtx, so it is free everywhere it wraps.
+NVTX = os.environ.get("DSV41_NVTX", "0") == "1"
+
+
+@contextlib.contextmanager
+def nvtx_range(name: str):
+    if not NVTX:
+        yield
+        return
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
 
 # Chunk invariance requires every GEMM to give the same row whatever the batch length M. cuBLAS
 # picks split-K kernels for small M and, with this flag on, reduces the K-splits in bf16, so
@@ -329,11 +349,13 @@ class Model:
         self._tap("attn_x", L, x)
         qr = R.rmsnorm(R.qlinear(x, w.wq_a), w.q_norm, a.norm_eps)
         q = R.qlinear(qr, w.wq_b).view(T, a.n_heads, a.head_dim)
-        q = torch.cat([q[..., :-rd], R.apply_rotary(q[..., -rd:], fq)], dim=-1)
+        with nvtx_range("attn.rope"):
+            q = torch.cat([q[..., :-rd], R.apply_rotary(q[..., -rd:], fq)], dim=-1)
         self._tap("q", L, q)
 
         kv = R.rmsnorm(R.qlinear(x, w.wkv), w.kv_norm, a.norm_eps)
-        kv = torch.cat([kv[:, :-rd], R.apply_rotary(kv[:, -rd:], fq)], dim=-1)
+        with nvtx_range("attn.rope"):
+            kv = torch.cat([kv[:, :-rd], R.apply_rotary(kv[:, -rd:], fq)], dim=-1)
         self._tap("kv_new", L, kv)
         if mtp_extra is None:
             # gather the window BEFORE writing (a chunk may overwrite slots older queries still need)
@@ -363,7 +385,8 @@ class Model:
         # cliff that turns 1e-7 fp32 GEMM jitter into 1e-4 output jitter, which is enough to flip
         # a borderline router top-k and make the MoE output depend on the chunk length.
         o = self._softmax_attn(q, kv_all, mask, w.attn_sink)
-        o = torch.cat([o[..., :-rd], R.apply_rotary(o[..., -rd:], fq, inverse=True)], dim=-1)
+        with nvtx_range("attn.rope"):
+            o = torch.cat([o[..., :-rd], R.apply_rotary(o[..., -rd:], fq, inverse=True)], dim=-1)
         o = o.reshape(T, a.o_groups, -1)
         # grouped output projection: "sgd,grd->sgr" is a GEMM with M = number of tokens, so it too
         # has to run on fixed-size token tiles (it differs most visibly at a 1-token chunk).
@@ -378,87 +401,89 @@ class Model:
         Padding rows are all-masked: their scores are -inf, so m clamps to -1e30, p is 0 and the
         sink term makes the denominator +inf -- 0/inf = 0, no NaN.
         """
-        T = q.size(0)
-        scale = self.args.head_dim ** -0.5
-        B = ATTN_TILE if ATTN_TILE > 0 else T
+        with nvtx_range("attn.softmax"):
+            T = q.size(0)
+            scale = self.args.head_dim ** -0.5
+            B = ATTN_TILE if ATTN_TILE > 0 else T
 
-        def tile(qt, kvt, mt):
-            scores = torch.einsum("thd,tnd->thn", qt, kvt) * scale
-            scores = scores.masked_fill(~mt[:, None, :], float("-inf"))
-            mx = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
-            p = torch.exp(scores - mx)
-            denom = p.sum(-1, keepdim=True) + torch.exp(sink[None, :, None] - mx)
-            return torch.einsum("thn,tnd->thd", p / denom, kvt)
+            def tile(qt, kvt, mt):
+                scores = torch.einsum("thd,tnd->thn", qt, kvt) * scale
+                scores = scores.masked_fill(~mt[:, None, :], float("-inf"))
+                mx = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
+                p = torch.exp(scores - mx)
+                denom = p.sum(-1, keepdim=True) + torch.exp(sink[None, :, None] - mx)
+                return torch.einsum("thn,tnd->thd", p / denom, kvt)
 
-        outs = []
-        for i in range(0, T, B):
-            j = min(i + B, T)
-            qt, kvt, mt = q[i:j].float(), kv_all[i:j].float(), mask[i:j]
-            n = j - i
-            if n < B:  # pad the last tile so every call sees exactly B query rows
-                qt = torch.cat([qt, qt.new_zeros(B - n, *qt.shape[1:])])
-                kvt = torch.cat([kvt, kvt.new_zeros(B - n, *kvt.shape[1:])])
-                mt = torch.cat([mt, mt.new_zeros(B - n, mt.size(1))])
-            outs.append(tile(qt, kvt, mt)[:n])
-        return torch.cat(outs).to(torch.bfloat16)
+            outs = []
+            for i in range(0, T, B):
+                j = min(i + B, T)
+                qt, kvt, mt = q[i:j].float(), kv_all[i:j].float(), mask[i:j]
+                n = j - i
+                if n < B:  # pad the last tile so every call sees exactly B query rows
+                    qt = torch.cat([qt, qt.new_zeros(B - n, *qt.shape[1:])])
+                    kvt = torch.cat([kvt, kvt.new_zeros(B - n, *kvt.shape[1:])])
+                    mt = torch.cat([mt, mt.new_zeros(B - n, mt.size(1))])
+                outs.append(tile(qt, kvt, mt)[:n])
+            return torch.cat(outs).to(torch.bfloat16)
 
     def _compressed(self, x, qr, w, L, S, T, pos, sh: Shared):
         """Produce/read the shared compressed KV for this chunk; run/reuse the indexer; return the
         gathered rows [T, k, d] and their mask [T, k]."""
-        a = self.args
-        r = w.ratio
-        c = self.c
-        rd = a.rope_head_dim
-        if w.is_kv_source:
-            # latent for every position of the chunk (plus the pending unpaired one)
-            if r > 1:
-                xf = x.float()
-                kvl, sc = R.mm(xf, w.comp_wkv), R.mm(xf, w.comp_wgate)
-                before = c.pending[L]
-                c._chunk_inputs[L] = (S, kvl, sc, before)
-                if before is not None:
-                    kvl = torch.cat([before[0][None], kvl]); sc = torch.cat([before[1][None], sc])
-                    first = S - 1
+        with nvtx_range("attn.compressed"):
+            a = self.args
+            r = w.ratio
+            c = self.c
+            rd = a.rope_head_dim
+            if w.is_kv_source:
+                # latent for every position of the chunk (plus the pending unpaired one)
+                if r > 1:
+                    xf = x.float()
+                    kvl, sc = R.mm(xf, w.comp_wkv), R.mm(xf, w.comp_wgate)
+                    before = c.pending[L]
+                    c._chunk_inputs[L] = (S, kvl, sc, before)
+                    if before is not None:
+                        kvl = torch.cat([before[0][None], kvl]); sc = torch.cat([before[1][None], sc])
+                        first = S - 1
+                    else:
+                        first = S
+                    n_tok = kvl.size(0)
+                    cut = n_tok - n_tok % r
+                    if n_tok % r:
+                        c.pending[L] = (kvl[-1], sc[-1])
+                    else:
+                        c.pending[L] = None
+                    if cut > 0:
+                        g_kv = kvl[:cut].unflatten(0, (-1, r)); g_sc = sc[:cut].unflatten(0, (-1, r))
+                        latent = (g_kv * g_sc.softmax(dim=1)).sum(dim=1)
+                        latent = R.rmsnorm(latent.to(torch.bfloat16), w.comp_norm, a.norm_eps)
+                        j0 = first // r
+                    else:
+                        latent, j0 = None, first // r
                 else:
-                    first = S
-                n_tok = kvl.size(0)
-                cut = n_tok - n_tok % r
-                if n_tok % r:
-                    c.pending[L] = (kvl[-1], sc[-1])
-                else:
-                    c.pending[L] = None
-                if cut > 0:
-                    g_kv = kvl[:cut].unflatten(0, (-1, r)); g_sc = sc[:cut].unflatten(0, (-1, r))
-                    latent = (g_kv * g_sc.softmax(dim=1)).sum(dim=1)
-                    latent = R.rmsnorm(latent.to(torch.bfloat16), w.comp_norm, a.norm_eps)
-                    j0 = first // r
-                else:
-                    latent, j0 = None, first // r
-            else:
-                latent = R.rmsnorm(R.mm(x, w.comp_wkv), w.comp_norm, a.norm_eps)
-                j0 = S
-            if latent is not None:
-                nj = latent.size(0)
-                jpos = (j0 + torch.arange(nj, device=self.dev)) * r
-                fj = self.freqs_c[jpos]
-                if L in self.W.indexers:  # index key from the pre-RoPE latent
-                    iw = self.W.indexers[L]
-                    k = R.rmsnorm(R.mm(latent, iw.wk), iw.k_norm, a.norm_eps)
-                    k = torch.cat([k[:, :-rd], R.apply_rotary(k[:, -rd:], fj)], dim=-1)
-                    c.ik[L][j0:j0 + nj] = k
-                lat = torch.cat([latent[:, :-rd], R.apply_rotary(latent[:, -rd:], fj)], dim=-1)
-                c.ckv[L][j0:j0 + nj] = lat
-                self._tap("latent", L, (j0, lat))
-            sh.ckv, sh.ik, sh.ratio = c.ckv[L], c.ik[L], r
-        assert sh.ratio == r, (L, sh.ratio, r)
-        compress_lens = (pos + 1) // r  # visible compressed positions per query
-        n_c = int((S + T) // r)
-        if L in self.W.indexers:
-            sh.topk = self._indexer(x, qr, L, pos, compress_lens, n_c, sh)
-        idx = sh.topk  # [T, k] absolute compressed positions, -1 = none
-        self._tap("topk", L, idx); self._tap("n_c", L, n_c)
-        rows = sh.ckv[idx.clamp_min(0)]
-        return rows, idx >= 0
+                    latent = R.rmsnorm(R.mm(x, w.comp_wkv), w.comp_norm, a.norm_eps)
+                    j0 = S
+                if latent is not None:
+                    nj = latent.size(0)
+                    jpos = (j0 + torch.arange(nj, device=self.dev)) * r
+                    fj = self.freqs_c[jpos]
+                    if L in self.W.indexers:  # index key from the pre-RoPE latent
+                        iw = self.W.indexers[L]
+                        k = R.rmsnorm(R.mm(latent, iw.wk), iw.k_norm, a.norm_eps)
+                        k = torch.cat([k[:, :-rd], R.apply_rotary(k[:, -rd:], fj)], dim=-1)
+                        c.ik[L][j0:j0 + nj] = k
+                    lat = torch.cat([latent[:, :-rd], R.apply_rotary(latent[:, -rd:], fj)], dim=-1)
+                    c.ckv[L][j0:j0 + nj] = lat
+                    self._tap("latent", L, (j0, lat))
+                sh.ckv, sh.ik, sh.ratio = c.ckv[L], c.ik[L], r
+            assert sh.ratio == r, (L, sh.ratio, r)
+            compress_lens = (pos + 1) // r  # visible compressed positions per query
+            n_c = int((S + T) // r)
+            if L in self.W.indexers:
+                sh.topk = self._indexer(x, qr, L, pos, compress_lens, n_c, sh)
+            idx = sh.topk  # [T, k] absolute compressed positions, -1 = none
+            self._tap("topk", L, idx); self._tap("n_c", L, n_c)
+            rows = sh.ckv[idx.clamp_min(0)]
+            return rows, idx >= 0
 
     def _indexer(self, x, qr, L, pos, compress_lens, n_c, sh: Shared):
         a = self.args
@@ -531,29 +556,31 @@ class Model:
         """Routing only: (indices [T, k], weights [T, k]). Split out of `moe` so a layer-major
         prefill can route every chunk, resolve the layer's whole expert set in ONE call, and then
         apply the kernel per chunk. Byte for byte the code `moe` used to run."""
-        a = self.args
-        self._tap("moe_in", L, y)
-        scores = F.softplus(R.mm(y.float(), w.gate_w)).sqrt()
-        k = 3 if n_experts == 128 else a.n_activated_experts
-        logits = scores + w.gate_bias
-        pm = getattr(self, "prune_mask", None)
-        if pm is not None and n_experts != 128 and L in pm:
-            logits = logits.masked_fill(~pm[L], float("-inf"))
-        indices = logits.topk(k, dim=-1)[1]
-        weights = scores.gather(1, indices)
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
-        self._tap("route_idx", L, indices); self._tap("route_w", L, weights)
-        return indices, weights
+        with nvtx_range("moe.route"):
+            a = self.args
+            self._tap("moe_in", L, y)
+            scores = F.softplus(R.mm(y.float(), w.gate_w)).sqrt()
+            k = 3 if n_experts == 128 else a.n_activated_experts
+            logits = scores + w.gate_bias
+            pm = getattr(self, "prune_mask", None)
+            if pm is not None and n_experts != 128 and L in pm:
+                logits = logits.masked_fill(~pm[L], float("-inf"))
+            indices = logits.topk(k, dim=-1)[1]
+            weights = scores.gather(1, indices)
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+            self._tap("route_idx", L, indices); self._tap("route_w", L, weights)
+            return indices, weights
 
     def moe_apply(self, y: torch.Tensor, slots, weights, w, arena):
         """The kernel half: routed experts through their slots, plus the shared expert."""
-        a = self.args
-        t0 = time.perf_counter()
-        routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
-        shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
-        out = routed + shared
-        self.stats["moe_s"] += time.perf_counter() - t0
-        return out.to(y.dtype)
+        with nvtx_range("moe.apply"):
+            a = self.args
+            t0 = time.perf_counter()
+            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
+            shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+            out = routed + shared
+            self.stats["moe_s"] += time.perf_counter() - t0
+            return out.to(y.dtype)
 
     def moe(self, y: torch.Tensor, w, L: int, prefill: bool, store, arena, n_experts: int):
         a = self.args
@@ -591,22 +618,24 @@ class Model:
     def block_attn(self, h, pre_mix, w, L, S, sh, ring, freqs, mtp_extra=None, win_lo: int = 0):
         """The attention half of a block: everything up to and including its residual mix.
         Returns (h, attn_pre); `attn_pre` is what the FFN half needs as its own pre-mix."""
-        a = self.args
-        residual = h
-        attn_pre, attn_post, attn_comb = R.hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, a)
-        y = R.hc_pre(h, pre_mix)
-        y = R.rmsnorm(y, w.attn_norm, a.norm_eps)
-        t0 = time.perf_counter()
-        y = self.attention(y, w, L, S, sh, ring, freqs, mtp_extra, win_lo=win_lo)
-        self.stats["attn_s"] += time.perf_counter() - t0
-        return R.hc_post(y, residual, attn_post, attn_comb), attn_pre
+        with nvtx_range("attn"):
+            a = self.args
+            residual = h
+            attn_pre, attn_post, attn_comb = R.hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, a)
+            y = R.hc_pre(h, pre_mix)
+            y = R.rmsnorm(y, w.attn_norm, a.norm_eps)
+            t0 = time.perf_counter()
+            y = self.attention(y, w, L, S, sh, ring, freqs, mtp_extra, win_lo=win_lo)
+            self.stats["attn_s"] += time.perf_counter() - t0
+            return R.hc_post(y, residual, attn_post, attn_comb), attn_pre
 
     def block_ffn_in(self, h, attn_pre, w):
         """The FFN half's input and the mixes its output needs. Returns (y, ffn_pre, post, comb)."""
-        a = self.args
-        ffn_pre, ffn_post, ffn_comb = R.hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, a)
-        y = R.hc_pre(h, attn_pre)
-        return R.rmsnorm(y, w.ffn_norm, a.norm_eps), ffn_pre, ffn_post, ffn_comb
+        with nvtx_range("ffn"):
+            a = self.args
+            ffn_pre, ffn_post, ffn_comb = R.hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, a)
+            y = R.hc_pre(h, attn_pre)
+            return R.rmsnorm(y, w.ffn_norm, a.norm_eps), ffn_pre, ffn_post, ffn_comb
 
     def block(self, h, pre_mix, w, L, S, sh, ring, freqs, prefill, store, arena, n_experts, mtp_extra=None,
               win_lo: int = 0):
@@ -686,11 +715,12 @@ class Model:
             for ci, (lo, hi) in enumerate(bounds):
                 h = H[ci]
                 if L in self.W.engram:
-                    te = time.perf_counter()
-                    li = list(a.engram_layer_ids).index(L)
-                    rows = self.engram_rows(L, hashes[ci][:, li, :])
-                    h = R.engram_forward(h, rows, self.W.engram[L], a)
-                    self.stats["engram_s"] += time.perf_counter() - te
+                    with nvtx_range("engram"):
+                        te = time.perf_counter()
+                        li = list(a.engram_layer_ids).index(L)
+                        rows = self.engram_rows(L, hashes[ci][:, li, :])
+                        h = R.engram_forward(h, rows, self.W.engram[L], a)
+                        self.stats["engram_s"] += time.perf_counter() - te
                 pv = self.c.pending.get(L)
                 pend[S0 + lo][L] = None if pv is None else (pv[0].clone(), pv[1].clone())
                 sh = SH[ci]
@@ -880,13 +910,14 @@ class Model:
         for L in range(last + 1):
             w = self.W.layers[L]
             if L in self.W.engram:
-                t0 = time.perf_counter()
-                li = list(a.engram_layer_ids).index(L)
-                rows = self.engram_rows(L, hashes[:, li, :])
-                self._tap("engram_rows", L, rows)
-                h = R.engram_forward(h, rows, self.W.engram[L], a)
-                self._tap("engram_out", L, h)
-                self.stats["engram_s"] += time.perf_counter() - t0
+                with nvtx_range("engram"):
+                    t0 = time.perf_counter()
+                    li = list(a.engram_layer_ids).index(L)
+                    rows = self.engram_rows(L, hashes[:, li, :])
+                    self._tap("engram_rows", L, rows)
+                    h = R.engram_forward(h, rows, self.W.engram[L], a)
+                    self._tap("engram_out", L, h)
+                    self.stats["engram_s"] += time.perf_counter() - t0
             if L in a.dspark_target_layer_ids:
                 main_hiddens.append(h.float().mean(dim=1))
             freqs = self.freqs_c if w.ratio else self.freqs_w

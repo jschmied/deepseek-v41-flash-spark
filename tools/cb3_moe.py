@@ -12,6 +12,7 @@ Per slot: w1/w3 lo [2304, 1280] + hi [2304, 640] + cb [2304, 8] + s [2304, 160];
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import torch
@@ -21,6 +22,23 @@ import triton.language as tl
 import fp4_moe as F4
 from fp4_moe import DIM, INTER, _chunk_dot, _split4, _ue8m0, build_routing, build_routing_small, _pick_bm  # noqa: F401
 from cb3 import dequant_cb2, dequant_cb3, fp4_to_cb2, fp4_to_cb3
+
+# nsys attribution only, same gate/helper as engine/model.py (kept local: tools/ has no import of
+# engine/). Off by default; `if not NVTX: yield; return` means the disabled path never touches
+# torch.cuda.nvtx.
+NVTX = os.environ.get("DSV41_NVTX", "0") == "1"
+
+
+@contextlib.contextmanager
+def nvtx_range(name: str):
+    if not NVTX:
+        yield
+        return
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 SG1, SG2 = DIM // 32, INTER // 32
 # lo + hi + 8 codebook bytes per row, plus the unchanged UE8M0 scales: 14,454,784 B vs FP4's
@@ -840,19 +858,20 @@ def _unpack_into(arena, src_slots: torch.Tensor, scratch, dst_slots: torch.Tenso
     explicit `dst_slots` is what lets the layer-scoped cache leave already-unpacked experts alone
     and drop the new ones into whatever slots are free.
     """
-    B = src_slots.numel()
-    if dst_slots is None:
-        dst_slots = torch.arange(B, dtype=torch.int32, device=src_slots.device)
-    BN = 64
-    for (lo, hi, cb, N, K, out, s_src, s_dst) in (
-            (arena.w1_lo, arena.w1_hi, arena.w1_cb, INTER, DIM, scratch.w1, arena.s1, scratch.s1),
-            (arena.w3_lo, arena.w3_hi, arena.w3_cb, INTER, DIM, scratch.w3, arena.s3, scratch.s3),
-            (arena.w2_lo, arena.w2_hi, arena.w2_cb, DIM, INTER, scratch.w2, arena.s2, scratch.s2)):
-        n512, n256 = CB3.block_plan(K)
-        _cb3_unpack_kernel[(B, triton.cdiv(N, BN))](
-            lo, hi, cb, out, src_slots, dst_slots, N, KL=K // 4, KH=K // 8, KB=K // 2,
-            BN=BN, NB512=n512, NB256=n256, num_warps=4, num_stages=2)
-        s_dst[dst_slots.long()] = s_src[src_slots.long()]
+    with nvtx_range("moe.unpack"):
+        B = src_slots.numel()
+        if dst_slots is None:
+            dst_slots = torch.arange(B, dtype=torch.int32, device=src_slots.device)
+        BN = 64
+        for (lo, hi, cb, N, K, out, s_src, s_dst) in (
+                (arena.w1_lo, arena.w1_hi, arena.w1_cb, INTER, DIM, scratch.w1, arena.s1, scratch.s1),
+                (arena.w3_lo, arena.w3_hi, arena.w3_cb, INTER, DIM, scratch.w3, arena.s3, scratch.s3),
+                (arena.w2_lo, arena.w2_hi, arena.w2_cb, DIM, INTER, scratch.w2, arena.s2, scratch.s2)):
+            n512, n256 = CB3.block_plan(K)
+            _cb3_unpack_kernel[(B, triton.cdiv(N, BN))](
+                lo, hi, cb, out, src_slots, dst_slots, N, KL=K // 4, KH=K // 8, KB=K // 2,
+                BN=BN, NB512=n512, NB256=n256, num_warps=4, num_stages=2)
+            s_dst[dst_slots.long()] = s_src[src_slots.long()]
 
 
 def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor,
@@ -903,13 +922,14 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
                                   dtype=torch.int32, device=dev)
         s2 = torch.where(slots >= 0, inv[slots.long().clamp_min(0)], slots.to(torch.int32))
         block_slot, block_pair, NB = build_routing(s2, scratch.slots, BM)
-        F4._moe_up_kernel[(NB, INTER // bn1)](
-            x, scratch.w1, scratch.s1, scratch.w3, scratch.s3, h, wgt, block_slot, block_pair,
-            x.stride(0), h.stride(0), float(swiglu_limit),
-            TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, num_warps=nw1, num_stages=ns1)
-        F4._moe_down_kernel[(NB, DIM // bn2)](
-            h, scratch.w2, scratch.s2, parts, block_slot, block_pair, h.stride(0), parts.stride(0),
-            TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, num_warps=nw2, num_stages=ns2)
+        with nvtx_range("moe.kernels"):
+            F4._moe_up_kernel[(NB, INTER // bn1)](
+                x, scratch.w1, scratch.s1, scratch.w3, scratch.s3, h, wgt, block_slot, block_pair,
+                x.stride(0), h.stride(0), float(swiglu_limit),
+                TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, num_warps=nw1, num_stages=ns1)
+            F4._moe_down_kernel[(NB, DIM // bn2)](
+                h, scratch.w2, scratch.s2, parts, block_slot, block_pair, h.stride(0), parts.stride(0),
+                TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, num_warps=nw2, num_stages=ns2)
         return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
 
     for i in range(0, n, batch):
@@ -920,13 +940,14 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
         inv[sel.long()] = ar[:b]
         s2 = torch.where(slots >= 0, inv[slots.long().clamp_min(0)], slots.to(torch.int32))
         block_slot, block_pair, NB = build_routing(s2, b, BM)
-        F4._moe_up_kernel[(NB, INTER // bn1)](
-            x, scratch.w1, scratch.s1, scratch.w3, scratch.s3, h, wgt, block_slot, block_pair,
-            x.stride(0), h.stride(0), float(swiglu_limit),
-            TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, num_warps=nw1, num_stages=ns1)
-        F4._moe_down_kernel[(NB, DIM // bn2)](
-            h, scratch.w2, scratch.s2, parts, block_slot, block_pair, h.stride(0), parts.stride(0),
-            TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, num_warps=nw2, num_stages=ns2)
+        with nvtx_range("moe.kernels"):
+            F4._moe_up_kernel[(NB, INTER // bn1)](
+                x, scratch.w1, scratch.s1, scratch.w3, scratch.s3, h, wgt, block_slot, block_pair,
+                x.stride(0), h.stride(0), float(swiglu_limit),
+                TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, num_warps=nw1, num_stages=ns1)
+            F4._moe_down_kernel[(NB, DIM // bn2)](
+                h, scratch.w2, scratch.s2, parts, block_slot, block_pair, h.stride(0), parts.stride(0),
+                TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, num_warps=nw2, num_stages=ns2)
     return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
 
 
