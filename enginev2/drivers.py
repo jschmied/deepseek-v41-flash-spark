@@ -35,7 +35,8 @@ class Counters:
 class Engine:
     def __init__(self, policy: Policy, evict: str = "lru", lru_slots: int = 5328,
                  transient_slots: int = 400, n_workers: int = 48, staging: int = 48,
-                 device_queue_depth: int = 8, scale: float = 1.0, leaves=None, calls=()):
+                 nvme_qd: int = 8, h2d_inflight: int = 8, scale: float = 1.0,
+                 leaves=None, calls=()):
         self.policy = policy
         self.slots = ExpertSlots(lru_slots, transient_slots, policy=evict)
         self.arena = SlotArena(self.slots.n_slots)
@@ -47,7 +48,7 @@ class Engine:
             calls, Bandwidth(scale=scale), scale=scale)
         self.loader = LoaderService(self.arena, self.slots, self.compute, policy,
                                     leaves=self.leaves, n_workers=n_workers, staging=staging,
-                                    device_queue_depth=device_queue_depth, scale=scale)
+                                    nvme_qd=nvme_qd, h2d_inflight=h2d_inflight, scale=scale)
         self.scale = scale
         self.c = Counters()
 
@@ -141,18 +142,23 @@ class Engine:
         the layer boundary -- `join_pending()` is a barrier over EVERY chunk's reads even though
         chunk k's MoE needs only chunk k's experts.
         """
+        # THE ISSUE SCHEDULE IS IDENTICAL IN BOTH ARMS. An earlier revision routed, submitted and
+        # ran chunk k's MoE before it reserved chunk k+1 in the D3-off arm, while the D3-on arm
+        # submitted every chunk first -- so the two arms differed in WHEN reads were issued as well
+        # as in what they waited for, and D3 was not an isolated toggle. Caught in review
+        # 2026-09-15. Both arms now route and submit every chunk up front; the only difference is
+        # the readiness condition before each chunk's FFN.
         pending = []
+        per_chunk = []
         for uniq in chunks:
             slot_of, to_load = self.slots.reserve(layer, uniq, prefill=True)
             self.c.fetches += len(to_load)
             self.loader.submit(to_load)
             pending.extend(to_load)
+            per_chunk.append((to_load, sorted(set(slot_of.values()))))
             self._compute(lambda: self.leaves.prefill_attn(layer))
-            if not self.policy.global_barrier:
-                self._wait(to_load)                             # only this chunk's experts
-                reads = sorted(set(slot_of.values()))
-                self._compute(lambda: self.leaves.prefill_moe(layer, reads), slots=reads)
-        if self.policy.global_barrier:
-            self._wait(pending)                                 # the barrier over all chunks
-            n = len(chunks)
-            self._compute(lambda: self.leaves.prefill_moe(layer, (), n))
+
+        for to_load, reads in per_chunk:
+            # D3 ON: this chunk's FFN waits for EVERY chunk's reads. OFF: only its own.
+            self._wait(pending if self.policy.global_barrier else to_load)
+            self._compute(lambda r=reads: self.leaves.prefill_moe(layer, r), slots=reads)

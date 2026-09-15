@@ -15,8 +15,11 @@ may be the same phenomenon in reality and a table with independent columns would
                                  call that immediately waits on it.
   D1     compute_barrier_global  the H2D waits for ALL compute to be idle, rather than for the one
                                  slot's previous reader. v1's `stream.wait_stream(compute)`.
-  D2     lease_until_completion  the pinned staging lease is held submit -> completion, so a demand
-                                 miss can block on a BUFFER while the device is idle.
+  D2     lease_until_completion  the NVMe ADMISSION PERMIT is held submit -> H2D completion, so a
+                                 demand miss can block on the right to start a read while the
+                                 device is idle. See the ownership note on LoaderService: this is
+                                 the permit, NOT the physical pinned buffer, which is always held
+                                 until the H2D completes because cudaMemcpyAsync reads out of it.
   D3     global_barrier          the wait is over every pending read rather than the slots this
                                  layer actually needs. v1's `join_pending()`.
 WHAT IS NOT A TOGGLE HERE, and why. An earlier revision carried a fifth switch, `moe_before_shared`
@@ -119,7 +122,8 @@ class LoaderService:
 
     def __init__(self, arena: SlotArena, slots: ExpertSlots, compute: ComputeStream,
                  policy: Policy, leaves=None, n_workers: int = 48, staging: int = 48,
-                 device_queue_depth: int = 8, scale: float = 1.0, fail: set | None = None):
+                 nvme_qd: int = 8, h2d_inflight: int = 8, scale: float = 1.0,
+                 fail: set | None = None):
         self.arena = arena
         self.slots = slots
         self.compute = compute
@@ -133,10 +137,25 @@ class LoaderService:
         self.stage = StagingPool(staging)
         self.ready = SlotReady()
         self.scale = scale
-        # Backpressure on DEVICE QUEUE DEPTH, not on thread count: the device saturates near 2
-        # concurrent reads, so threads exist to hide per-read latency, not to add bandwidth. Held
-        # equal across arms so it cannot confound the dependency table; sweep it separately.
-        self.dq = threading.Semaphore(device_queue_depth)
+        # FOUR SEPARATE RESOURCES. They were conflated: one semaphore named `device_queue_depth`
+        # sat around the H2D, so it bounded device copies while every worker could enter the NVMe
+        # model unthrottled. Harmless at decode, where the workload sits near 2.4 outstanding reads
+        # on its own -- and wrong the moment lookahead issues speculative reads, which is the one
+        # feature v2 exists for. Caught in review 2026-09-15.
+        #
+        #   n_workers      threads; they hide per-read latency, they do not add bandwidth
+        #   nvme_qd        how many reads may be IN THE DEVICE at once
+        #   staging        physical pinned buffers
+        #   h2d_inflight   how many device copies may run at once
+        self.nvme_qd = threading.Semaphore(nvme_qd)
+        self.h2d_sem = threading.Semaphore(h2d_inflight)
+        self._nvme_qd_n, self._h2d_n = nvme_qd, h2d_inflight
+        # D2 off releases the NVMe permit at handoff so another read can start while this buffer
+        # waits on its copy. That only buys anything if there are buffers spare to start into.
+        if not policy.lease_until_completion and staging <= nvme_qd:
+            raise ValueError(
+                f"lease_until_completion=False needs staging ({staging}) > nvme_qd ({nvme_qd}): "
+                f"releasing the permit early cannot help if every buffer is already committed")
         self.fail = fail if fail is not None else set()
         self.q: queue.Queue = queue.Queue()
         self.h2d_calls = 0
@@ -155,24 +174,28 @@ class LoaderService:
         Every step between the lease and the release must be inside the try, or the lease leaks and
         there are only `staging` of them for the life of the process.
         """
+        # The PHYSICAL pinned buffer. Held until the H2D has completed, under every policy: a real
+        # cudaMemcpyAsync reads out of this buffer until its completion event, so handing it to
+        # another reader early corrupts the transfer in flight. The previous revision released it
+        # at handoff under D2, which made the v2 arm compare against something unbuildable.
         sid = self.stage.acquire()
-        released = False
+        permit_held = False
         try:
             if key in self.fail:
                 raise IOError(f"injected NVMe failure {key}")
+            self.nvme_qd.acquire()                 # admission to the device
+            permit_held = True
             payload = self.leaves.read(key, sid)
             if not self.policy.lease_until_completion:
-                # D2 OFF: the lease covers the READ only. Buffer count stops being coupled to read
-                # duration. NOTE the physical caveat, recorded because the skeleton cannot check
-                # it: releasing here assumes the H2D no longer reads that pinned buffer, which on
-                # the real path needs either a second buffer or a copy the device owns.
-                self.stage.release(sid)
-                released = True
+                # D2 OFF: give the ADMISSION back now. Another read may enter the device while this
+                # expert's buffer waits on its copy. The buffer itself stays ours until H2D done.
+                self.nvme_qd.release()
+                permit_held = False
             if self.policy.compute_barrier_global:
                 self.compute.wait_idle()          # D1 ON: wait for ALL compute
             else:
                 self.compute.wait_slot_free(slot)  # D1 OFF: only this slot's previous reader
-            with self.dq:
+            with self.h2d_sem:
                 with self.arena.writing(slot, key):
                     t0 = time.perf_counter()
                     self.leaves.h2d(slot, key, payload)
@@ -188,8 +211,11 @@ class LoaderService:
             self.slots.forget(key, slot)
             self.ready.set(slot, gen, err=exc)
         finally:
-            if not released:
-                self.stage.release(sid)
+            if permit_held:
+                self.nvme_qd.release()
+            # The write is over (done or failed): the slot may be evicted again.
+            self.slots.clear_pending(slot, gen)
+            self.stage.release(sid)
 
     def _worker(self) -> None:
         while True:
@@ -203,6 +229,8 @@ class LoaderService:
 
     # ------------------------------------------------------------------ service api
     def submit(self, to_load) -> None:
+        # Protect before queueing, never after: between the two a worker can already be writing.
+        self.slots.mark_pending(to_load)
         for key, slot, gen in to_load:
             self.ready.arm(slot, gen)
         for item in to_load:

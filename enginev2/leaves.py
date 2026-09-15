@@ -96,8 +96,13 @@ class Bandwidth:
     """
 
     def __init__(self, bw_one: float = BW_ONE, bw_two: float = BW_TWO, scale: float = 1.0):
-        self.bw_one = bw_one / scale
-        self.bw_two = bw_two / scale
+        # `scale` compresses the clock: every leaf must get SHORTER by that factor. Compute and H2D
+        # divide their durations, so bandwidth has to be MULTIPLIED -- dividing it made reads 20x
+        # slower while compute ran 20x faster, a 400x distortion of exactly the read-vs-compute
+        # ratio the ordering tests exercise. Caught in review 2026-09-15. (phase2 runs at scale 1.0
+        # and was never affected; the invariant tests were.)
+        self.bw_one = bw_one * scale
+        self.bw_two = bw_two * scale
         self._cv = threading.Condition()
         self._active: dict[int, float] = {}          # token -> remaining bytes
         self._last = 0.0

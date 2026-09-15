@@ -38,16 +38,24 @@ import time
 from .drivers import Engine
 from .sched import V1, V2, ComputeStream, LoaderService, Policy
 from .leaves import Bandwidth, ModelLeaves
-from .store import ExpertSlots, SlotArena
+from .store import ExpertSlots, SlotArena, SlotReady
 from .trace import load_decode, warmup_cut
 
 SCALE = 20.0          # leaves run 20x faster; ratios are preserved, the tests are about ordering
 
 
 def mk(policy: Policy = V2, lru_slots: int = 16, transient_slots: int = 8, n_workers: int = 8,
-       staging: int = 8, dq: int = 4, fail=None) -> Engine:
+       staging: int = 8, nvme_qd: int | None = None, h2d_inflight: int | None = None,
+       fail=None) -> Engine:
+    # nvme_qd must stay BELOW the buffer count or releasing the permit at handoff buys nothing and
+    # the loader refuses the configuration -- so derive it from staging unless a test pins it.
+    if nvme_qd is None:
+        nvme_qd = max(1, staging // 2)
+    if h2d_inflight is None:
+        h2d_inflight = max(1, staging // 2)
     e = Engine(policy, lru_slots=lru_slots, transient_slots=transient_slots,
-               n_workers=n_workers, staging=staging, device_queue_depth=dq, scale=SCALE)
+               n_workers=n_workers, staging=staging, nvme_qd=nvme_qd,
+               h2d_inflight=h2d_inflight, scale=SCALE)
     if fail:
         e.loader.fail.update(fail)
     return e
@@ -244,12 +252,14 @@ def test_cross_layer_pending_is_safe_by_generation():
     v1 forbids deferred resolves spanning layers. v2 permits it: a recycled slot gets a new
     generation, so a waiter for (slot, gen) cannot be satisfied by a later tenant's completion.
     """
-    e = mk(lru_slots=8, transient_slots=8)
+    e = mk(lru_slots=16, transient_slots=8)
     try:
         _, a = e.slots.reserve(0, tuple(range(6)), prefill=False)
         e.loader.submit(a)
         _, b = e.slots.reserve(1, tuple(range(6)), prefill=False)     # spans layers: legal in v2
         e.loader.submit(b)
+        assert not ({s for _, s, _ in a} & {s for _, s, _ in b}), (
+            "layer 1 was handed a slot layer 0 is still writing")
         e.loader.wait_slots(a + b)
         assert e.arena.violations == [], e.arena.violations[:4]
         gens = {}
@@ -259,7 +269,26 @@ def test_cross_layer_pending_is_safe_by_generation():
         assert e.loader.stage.at_rest()
     finally:
         e.close()
-    print("  cross-layer: two layers pending at once is safe, generations keep the waits distinct  OK")
+
+    # AND THE BOUND, which the earlier version of this test could not see. Slot capacity is what
+    # limits how far ahead the loader may run. With too few slots the second reserve must REFUSE --
+    # the old code silently reassigned a slot whose write was still in flight, and passed, because
+    # submitting the older batch first usually let worker FIFO serialise the two writes. Generations
+    # never protected this: they keep a consumer off a stale tenant, they do not serialise producers.
+    e = mk(lru_slots=8, transient_slots=8)
+    try:
+        _, a = e.slots.reserve(0, tuple(range(6)), prefill=False)
+        e.loader.submit(a)
+        try:
+            e.slots.reserve(1, tuple(range(6)), prefill=False)
+            raise AssertionError("reserve() handed out slots with writes in flight")
+        except RuntimeError as exc:
+            assert "in flight" in str(exc), exc
+        e.loader.wait_slots(a)
+    finally:
+        e.close()
+    print("  cross-layer: two layers pending is safe when slots allow, and REFUSED when they do "
+          "not  OK")
 
 
 def test_generation_is_what_makes_cross_layer_safe():
@@ -295,7 +324,7 @@ def test_barrier_sits_between_the_read_and_the_arena_write():
     """
     for pol, want in ((Policy(False, True, False, False), "wait_idle"),
                       (Policy(False, False, False, False), "wait_slot")):
-        e = mk(pol, n_workers=1, staging=1)
+        e = mk(pol, n_workers=1, staging=2, nvme_qd=1, h2d_inflight=1)
         order: list = []
         try:
             real_read, real_idle, real_slot = e.loader.bw.read, e.compute.wait_idle, e.compute.wait_slot_free
@@ -451,3 +480,49 @@ def main(argv) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
+
+
+# ================================================================ 13. readiness is exact
+def test_readiness_is_per_generation_and_cannot_regress():
+    """Out-of-order completions must not release the wrong waiter. Found in review, not by a test.
+
+    The old SlotReady kept `slot -> highest generation completed` and waited on `>=`. Three ways
+    that is wrong, all reproduced below against the current implementation:
+      1. gen 2 completing before gen 1 made readiness REGRESS from 2 to 1 on assignment.
+      2. `>=` released a gen-1 waiter on gen 2's completion -- the slot then holds gen 2's expert.
+      3. arm(gen 2) cleared the slot's entry and stranded a live gen-1 waiter.
+    """
+    r = SlotReady()
+
+    # (2) the dangerous one: gen 2 completes first; a gen-1 waiter must NOT be released.
+    r.arm(7, 1)
+    r.arm(7, 2)
+    r.set(7, 2)
+    try:
+        r.wait(7, 1, timeout=0.2)
+        raise AssertionError("a waiter for gen 1 was released by gen 2's completion")
+    except TimeoutError:
+        pass
+    r.set(7, 1)
+    r.wait(7, 1, timeout=0.2)          # its own completion does release it
+    r.wait(7, 2, timeout=0.2)          # (1) and gen 2 did not regress when gen 1 landed
+
+    # (3) arming a newer generation must not strand a waiter for an older one.
+    r2 = SlotReady()
+    r2.arm(3, 5)
+    r2.set(3, 5)
+    r2.arm(3, 6)
+    r2.wait(3, 5, timeout=0.2)
+
+    # errors stay bound to their own generation
+    r3 = SlotReady()
+    r3.arm(1, 1)
+    r3.set(1, 1, err=IOError("torn"))
+    r3.set(1, 2)
+    r3.wait(1, 2, timeout=0.2)
+    try:
+        r3.wait(1, 1, timeout=0.2)
+        raise AssertionError("gen 1's error was not raised")
+    except IOError:
+        pass
+    print("  readiness: exact per (slot, generation), no regression, errors stay bound  OK")

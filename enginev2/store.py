@@ -113,28 +113,43 @@ class SlotReady:
     v1 has no such thing: its only readiness signal is join_pending(), a barrier over EVERY pending
     read. The generation tag is what makes a per-slot wait safe when a slot is recycled: waiting on
     (slot, gen) cannot be satisfied by a previous tenant's completion.
+
+    READINESS IS EXACT, NOT MONOTONIC. An earlier revision kept `slot -> highest generation
+    completed` and waited on `>=`, which is wrong in both directions and was caught in review:
+
+      * `set()` assigned unconditionally, so if gen 2 completed before gen 1 the recorded readiness
+        REGRESSED from 2 to 1.
+      * `>=` let a waiter for gen 1 be released by gen 2's completion -- at which point the slot
+        holds gen 2's expert, not the one that waiter was promised. Silent wrong data.
+      * `arm()` popped the slot's entry, so arming gen 2 stranded a live gen-1 waiter at -1.
+
+    A completion is therefore recorded against the exact (slot, generation) pair and a waiter is
+    released only by its own. Nothing is pruned: with pending-slot ownership in ExpertSlots there is
+    at most one write in flight per slot, so the set grows with fetches, not with time, and this is
+    a skeleton. The real engine needs none of it -- one CUDA event per slot, re-recorded per write,
+    is exact for the same reason and is naturally recycled.
     """
 
     def __init__(self):
         self._lk = threading.Lock()
         self._cv = threading.Condition(self._lk)
-        self._done: dict[int, int] = {}      # slot -> highest generation completed
+        self._done: set[tuple] = set()       # (slot, generation) pairs that have completed
         self._err: dict[tuple, BaseException] = {}
 
     def arm(self, slot: int, gen: int) -> None:
-        with self._lk:
-            self._done.pop(slot, None)
+        # Deliberately a no-op on state. Clearing anything here is what stranded waiters before.
+        pass
 
     def set(self, slot: int, gen: int, err: BaseException | None = None) -> None:
         with self._lk:
-            self._done[slot] = gen
+            self._done.add((slot, gen))
             if err is not None:
                 self._err[(slot, gen)] = err
             self._cv.notify_all()
 
     def wait(self, slot: int, gen: int, timeout: float | None = None) -> None:
         with self._lk:
-            if not self._cv.wait_for(lambda: self._done.get(slot, -1) >= gen, timeout):
+            if not self._cv.wait_for(lambda: (slot, gen) in self._done, timeout):
                 raise TimeoutError(f"slot {slot} gen {gen} never became ready")
             err = self._err.get((slot, gen))
         if err is not None:
@@ -168,6 +183,14 @@ class ExpertSlots:
         self.transient_pos = 0
         self.transient_map: dict[tuple, int] = {}
         self.gen: dict[int, int] = {}                      # slot -> generation, bumped on every write
+        # PENDING-WRITE OWNERSHIP. A slot whose write is still in flight must not be handed to a
+        # second writer, and generations do NOT provide this: a generation tag protects a CONSUMER
+        # from reading a stale tenant, it does not serialise two producers. v1 has `_pending_slots`
+        # for exactly this; the skeleton had no equivalent, so a later reserve() could pick a slot
+        # mid-write. Decode never exposed it -- one layer is in flight at a time -- but lookahead,
+        # the whole point of v2, breaks it immediately. Caught in review 2026-09-15.
+        self._pending: dict[int, int] = {}                 # slot -> generation of the in-flight write
+        self._pending_lk = threading.Lock()
 
         # age/(1+count). Both dicts survive eviction ON PURPOSE, exactly as the offline replay's
         # per-key stats do: an expert that comes back from NVMe comes back with its history, and
@@ -179,6 +202,24 @@ class ExpertSlots:
         self.hits = 0
         self.misses = 0
         self.prefill_misses = 0
+
+    # ---------------------------------------------------------------- pending writes
+    def mark_pending(self, to_load) -> None:
+        """Called by the loader at submit. A pending slot is non-evictable until `clear_pending`."""
+        with self._pending_lk:
+            for _key, slot, gen in to_load:
+                self._pending[slot] = gen
+
+    def clear_pending(self, slot: int, gen: int) -> None:
+        """Called when that write has completed (or failed). Only clears its OWN generation, so a
+        late completion cannot unprotect a newer write that has since been armed on the slot."""
+        with self._pending_lk:
+            if self._pending.get(slot) == gen:
+                del self._pending[slot]
+
+    def pending_slots(self) -> frozenset:
+        with self._pending_lk:
+            return frozenset(self._pending)
 
     # ---------------------------------------------------------------- age/(1+count)
     def _afq_touch(self, key: tuple, slot: int) -> None:
@@ -238,7 +279,9 @@ class ExpertSlots:
                         victim = k
                         break
             if victim is None:
-                raise RuntimeError("no evictable LRU slot: every resident is in use by this call")
+                raise RuntimeError(
+                    "no evictable LRU slot: every resident is in use by this call or has a write "
+                    "in flight -- raise lru_slots, or bound how far lookahead may run ahead")
             slot = self.lru.pop(victim)
             self.slot_key.pop(slot, None)
             if self._afq:
@@ -261,7 +304,7 @@ class ExpertSlots:
             self.transient_map[key] = slot
             self.slot_key[slot] = key
             return slot
-        raise RuntimeError("transient ring exhausted")
+        raise RuntimeError("transient ring exhausted: every slot is in use or mid-write")
 
     def reserve(self, layer: int, uniq, prefill: bool) -> tuple[dict, list]:
         """Host-only bookkeeping: assign every requested expert a slot, return the misses to load.
@@ -291,17 +334,21 @@ class ExpertSlots:
                 slot_of[e] = s
                 used.add(s)
                 self.hits += 1
+        # Slots with a write in flight from an EARLIER call are protected exactly as slots promised
+        # within this call are. Read once: a slot can only leave this set (a completion), and losing
+        # that race costs one extra protected slot for one call, never a mid-write reassignment.
+        inflight = self.pending_slots()
         for e in uniq:
             if e in slot_of:
                 continue
             key = (layer, e)
             if prefill:
                 self.prefill_misses += 1
-                s = self._transient_slot_for(key, frozenset(used))
+                s = self._transient_slot_for(key, frozenset(used) | inflight)
             else:
                 self.misses += 1
                 self._clock += 1
-                s = self._lru_slot_for(key, frozenset(used))
+                s = self._lru_slot_for(key, frozenset(used) | inflight)
             slot_of[e] = s
             used.add(s)
             g = self.gen[s] = self.gen.get(s, 0) + 1
