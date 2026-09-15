@@ -43,7 +43,7 @@ import threading
 import time
 
 from .leaves import Bandwidth, ModelLeaves
-from .observe import Event, NullObserver, WaitReason, now_ns
+from .observe import NO_CTX, Event, NullObserver, WaitReason, next_span, now_ns
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
 
 
@@ -192,7 +192,7 @@ class LoaderService:
             w.start()
 
     # ------------------------------------------------------------------ the leaf
-    def _load_one(self, key: tuple, slot: int, gen: int) -> None:
+    def _load_one(self, ctx, key: tuple, slot: int, gen: int) -> None:
         """read -> (handoff) -> compute-order barrier -> H2D -> per-slot event.
 
         Every step between the lease and the release must be inside the try, or the lease leaks and
@@ -220,23 +220,24 @@ class LoaderService:
         try:
             if key in self.fail:
                 raise IOError(f"injected NVMe failure {key}")
-            if self.obs.enabled and self.read_qd._value == 0:
-                self.obs.emit(Event(now_ns(), "wait_start", key=key, slot=slot, gen=gen,
-                                    aux=WaitReason.NVME_ADMISSION))
+            if self.obs.enabled and not self.read_qd.acquire(blocking=False):
+                sp = next_span()
+                self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, key=key, slot=slot, gen=gen, span=sp,
+                                         aux=WaitReason.NVME_ADMISSION))
                 self.read_qd.acquire()
-                self.obs.emit(Event(now_ns(), "wait_end", key=key, slot=slot, gen=gen,
-                                    aux=WaitReason.NVME_ADMISSION))
-            else:
-                self.read_qd.acquire()     # admission to the device
+                self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, key=key, slot=slot, gen=gen, span=sp,
+                                         aux=WaitReason.NVME_ADMISSION))
+            elif not self.obs.enabled:
+                self.read_qd.acquire()
             permit_held = True
             # The FRAMEWORK brackets the provider's call. A provider performs the operation; only
             # the caller knows when it was queued, began and ended, so measurement semantics stay
             # put when the provider is swapped.
             if self.obs.enabled:
-                self.obs.emit(Event(now_ns(), "nvme_start", key=key, slot=slot, gen=gen))
+                self.obs.safe_emit(Event(now_ns(), "nvme_start", ctx=ctx, key=key, slot=slot, gen=gen))
             staged = self.leaves.read(key, self.stage)
             if self.obs.enabled:
-                self.obs.emit(Event(now_ns(), "nvme_end", key=key, slot=slot, gen=gen))
+                self.obs.safe_emit(Event(now_ns(), "nvme_end", ctx=ctx, key=key, slot=slot, gen=gen))
             if not self.policy.lease_until_completion:
                 # D2 OFF: give the ADMISSION back now. Another read may enter the device while this
                 # expert's buffer waits on its copy. The buffer itself stays ours until H2D done.
@@ -247,8 +248,10 @@ class LoaderService:
             # ownership-point rule exists to prevent.
             reason = (WaitReason.COMPUTE_BARRIER if self.policy.compute_barrier_global
                       else WaitReason.SLOT_READER)
+            sp = next_span()
             if self.obs.enabled:
-                self.obs.emit(Event(now_ns(), "wait_start", key=key, slot=slot, gen=gen, aux=reason))
+                self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, key=key, slot=slot,
+                                         gen=gen, span=sp, aux=reason))
             try:
                 if self.policy.compute_barrier_global:
                     self.compute.wait_idle()          # D1 ON: wait for ALL compute
@@ -256,26 +259,28 @@ class LoaderService:
                     self.compute.wait_slot_free(slot)  # D1 OFF: only this slot's previous reader
             finally:
                 if self.obs.enabled:
-                    self.obs.emit(Event(now_ns(), "wait_end", key=key, slot=slot, gen=gen,
-                                        aux=reason))
-            if self.obs.enabled and self.h2d_sem._value == 0:
-                self.obs.emit(Event(now_ns(), "wait_start", key=key, slot=slot, gen=gen,
-                                    aux=WaitReason.H2D_CAPACITY))
+                    self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, key=key, slot=slot,
+                                             gen=gen, span=sp, aux=reason))
+            if self.obs.enabled and not self.h2d_sem.acquire(blocking=False):
+                sp = next_span()
+                self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, key=key, slot=slot, gen=gen, span=sp,
+                                         aux=WaitReason.H2D_CAPACITY))
                 self.h2d_sem.acquire()
-                self.obs.emit(Event(now_ns(), "wait_end", key=key, slot=slot, gen=gen,
-                                    aux=WaitReason.H2D_CAPACITY))
-            else:
+                self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, key=key, slot=slot, gen=gen, span=sp,
+                                         aux=WaitReason.H2D_CAPACITY))
+            elif not self.obs.enabled:
                 self.h2d_sem.acquire()
             try:
                 with self.arena.writing(slot, key):
                     if self.obs.enabled:
-                        self.obs.emit(Event(now_ns(), "h2d_start", key=key, slot=slot, gen=gen))
+                        self.obs.safe_emit(Event(now_ns(), "h2d_start", ctx=ctx, key=key,
+                                                 slot=slot, gen=gen))
                     t0 = time.perf_counter()
                     self.leaves.h2d(slot, key, staged)
                     dt = time.perf_counter() - t0
                     if self.obs.enabled:
-                        self.obs.emit(Event(now_ns(), "h2d_end", key=key, slot=slot, gen=gen,
-                                            value=dt))
+                        self.obs.safe_emit(Event(now_ns(), "h2d_end", ctx=ctx, key=key, slot=slot,
+                                                 gen=gen, value=dt))
             finally:
                 self.h2d_sem.release()
             with self._lk:
@@ -313,15 +318,15 @@ class LoaderService:
                 self.q.task_done()
 
     # ------------------------------------------------------------------ service api
-    def submit(self, to_load, speculative: bool = False) -> None:
+    def submit(self, to_load, speculative: bool = False, ctx=NO_CTX) -> None:
         # Protect before queueing, never after: between the two a worker can already be writing.
         self.slots.mark_pending(to_load)
         for key, slot, gen in to_load:
             self.ready.arm(slot, gen)
         if self.obs.enabled:
             for key, slot, gen in to_load:
-                self.obs.emit(Event(now_ns(), "load_queued", key=key, slot=slot, gen=gen,
-                                    aux="spec" if speculative else "demand"))
+                self.obs.safe_emit(Event(now_ns(), "load_queued", ctx=ctx, key=key, slot=slot,
+                                         gen=gen, aux="spec" if speculative else "demand"))
         prio = 1 if speculative else 0
         if not speculative:
             with self._demand_cv:
@@ -330,7 +335,9 @@ class LoaderService:
             for item in to_load:
                 self._seq += 1
                 self._queued.add((item[1], item[2]))
-                self.q.put((prio, self._seq, item, prio == 0))
+                # the context travels WITH the work: a completion on a worker thread must still
+                # know which request and step asked for it.
+                self.q.put((prio, self._seq, (ctx,) + tuple(item), prio == 0))
 
     def cancel(self, items) -> int:
         """Drop speculation that has not started. Nothing ever WAITS on a speculative read, so a
@@ -369,15 +376,17 @@ class LoaderService:
         with self._demand_cv:
             if self._demand == 0:
                 return
+            sp = next_span()
             if self.obs.enabled:
-                self.obs.emit(Event(now_ns(), "wait_start", value=self._demand,
-                                    aux=WaitReason.GLOBAL_BARRIER))
+                self.obs.safe_emit(Event(now_ns(), "wait_start", span=sp, value=self._demand,
+                                         aux=WaitReason.GLOBAL_BARRIER))
             try:
                 if not self._demand_cv.wait_for(lambda: self._demand == 0, timeout):
                     raise TimeoutError("global barrier never drained")
             finally:
                 if self.obs.enabled:
-                    self.obs.emit(Event(now_ns(), "wait_end", aux=WaitReason.GLOBAL_BARRIER))
+                    self.obs.safe_emit(Event(now_ns(), "wait_end", span=sp,
+                                             aux=WaitReason.GLOBAL_BARRIER))
 
     def shutdown(self) -> None:
         for _ in self.workers:

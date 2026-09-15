@@ -16,7 +16,7 @@ import collections
 import contextlib
 import threading
 
-from .observe import Event, NullObserver, WaitReason, now_ns
+from .observe import Event, NullObserver, WaitReason, next_span, now_ns
 
 N_EXPERTS = 384
 # ---------------------------------------------------------------------------
@@ -248,11 +248,15 @@ class StagingPool:
     def acquire(self) -> int:
         # The lease is the ownership point for STAGING_BUFFER waits: whoever blocks here is blocked
         # on a pinned buffer, whatever they meant to do with it.
-        if self.obs.enabled and self._sem._value == 0:
-            self.obs.emit(Event(now_ns(), "wait_start", aux=WaitReason.STAGING_BUFFER))
+        # Atomic probe: testing a private _value and then acquiring is racy in both directions --
+        # another worker can take or release a permit in between, so real waits are missed and
+        # false ones recorded. try-acquire answers exactly the question being asked.
+        if self.obs.enabled and not self._sem.acquire(blocking=False):
+            sp = next_span()
+            self.obs.safe_emit(Event(now_ns(), "wait_start", span=sp, aux=WaitReason.STAGING_BUFFER))
             self._sem.acquire()
-            self.obs.emit(Event(now_ns(), "wait_end", aux=WaitReason.STAGING_BUFFER))
-        else:
+            self.obs.safe_emit(Event(now_ns(), "wait_end", span=sp, aux=WaitReason.STAGING_BUFFER))
+        elif not self.obs.enabled:
             self._sem.acquire()
         with self._lk:
             sid = self.free.pop()
@@ -306,6 +310,7 @@ class SlotReady:
         self._lk = threading.Lock()
         self._cv = threading.Condition(self._lk)
         self._done: set[tuple] = set()       # (slot, generation) pairs that have completed
+        self._ts: dict[tuple, int] = {}      # when each became ready, for prefetch lead time
         self._err: dict[tuple, BaseException] = {}
 
     def arm(self, slot: int, gen: int) -> None:
@@ -314,26 +319,34 @@ class SlotReady:
 
     def set(self, slot: int, gen: int, err: BaseException | None = None) -> None:
         if self.obs.enabled:
-            self.obs.emit(Event(now_ns(), "slot_ready", slot=slot, gen=gen, aux=err))
+            self.obs.safe_emit(Event(now_ns(), "slot_ready", slot=slot, gen=gen, aux=err))
         with self._lk:
             self._done.add((slot, gen))
+            self._ts[(slot, gen)] = now_ns()
             if err is not None:
                 self._err[(slot, gen)] = err
             self._cv.notify_all()
 
+    def ready_ts(self, slot: int, gen: int):
+        """When (slot, gen) became ready, or None if it has not. Lets the driver tell a prefetch
+        that ARRIVED from one that was merely mapped and is still in flight."""
+        with self._lk:
+            return self._ts.get((slot, gen))
+
     def wait(self, slot: int, gen: int, timeout: float | None = None) -> None:
         with self._lk:
             blocked = (slot, gen) not in self._done
+            sp = next_span()
             if blocked and self.obs.enabled:
-                self.obs.emit(Event(now_ns(), "wait_start", slot=slot, gen=gen,
-                                    aux=WaitReason.EXPERT_DATA))
+                self.obs.safe_emit(Event(now_ns(), "wait_start", slot=slot, gen=gen, span=sp,
+                                         aux=WaitReason.EXPERT_DATA))
             try:
                 if not self._cv.wait_for(lambda: (slot, gen) in self._done, timeout):
                     raise TimeoutError(f"slot {slot} gen {gen} never became ready")
             finally:
                 if blocked and self.obs.enabled:
-                    self.obs.emit(Event(now_ns(), "wait_end", slot=slot, gen=gen,
-                                        aux=WaitReason.EXPERT_DATA))
+                    self.obs.safe_emit(Event(now_ns(), "wait_end", slot=slot, gen=gen, span=sp,
+                                             aux=WaitReason.EXPERT_DATA))
             err = self._err.get((slot, gen))
         if err is not None:
             raise err

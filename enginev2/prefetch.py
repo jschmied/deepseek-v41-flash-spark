@@ -53,7 +53,14 @@ class PrefetchStats:
     pred_hit: int = 0        # keys named that the layer really wanted (resident or fetched)
     pred_miss: int = 0       # keys named that it did not
     issued: int = 0          # of all named keys, the ones that actually needed a read
-    used: int = 0            # prefetched keys that a later demand found resident
+    used: int = 0            # ready_hit + late_hit
+    # A HIT THAT ARRIVED TOO LATE IS NOT A WIN, and precision alone cannot tell them apart. A
+    # predictor at 80 % precision whose hits are mostly `late` has not solved decode: the consumer
+    # still blocks, it has merely blocked on a read that was started earlier. This is the number a
+    # decision about training a head has to be made on.
+    ready_hit: int = 0       # wanted AND already resident when the layer arrived
+    late_hit: int = 0        # wanted, but its read was still in flight -- consumer blocked anyway
+    lead_ns: int = 0         # summed (demand_ts - ready_ts) over ready hits
     wasted: int = 0          # prefetched keys evicted or cancelled without ever being demanded
     cancelled: int = 0       # still-pending speculation dropped by discard_wrong_asap
     refused: int = 0         # predictions the store had no free slot for
@@ -62,6 +69,15 @@ class PrefetchStats:
     def precision(self) -> float:
         """Over FETCHES: of the reads speculation caused, how many were used."""
         return self.used / self.issued if self.issued else 0.0
+
+    @property
+    def timeliness(self) -> float:
+        """Of the hits, how many actually arrived in time to save the consumer a wait."""
+        return self.ready_hit / self.used if self.used else 0.0
+
+    @property
+    def mean_lead_ms(self) -> float:
+        return (self.lead_ns / self.ready_hit / 1e6) if self.ready_hit else 0.0
 
     @property
     def precision_predicted(self) -> float:

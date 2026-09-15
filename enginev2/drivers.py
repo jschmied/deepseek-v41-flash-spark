@@ -12,7 +12,7 @@ import time
 
 from .chain import Chain, EngramSource
 from .leaves import Bandwidth, ModelLeaves
-from .observe import Event, NullObserver, OpContext, now_ns
+from .observe import NO_CTX, Event, NullObserver, OpContext, next_span, now_ns
 from .prefetch import PrefetchStats, Prefetcher
 from .sched import ComputeStream, LoaderService, Policy
 from .store import ExpertSlots, SlotArena
@@ -124,15 +124,14 @@ class Engine:
         ctx = ctx if ctx is not None else OpContext(self.request_id, self.c.steps, layer)
         e = self.obs.enabled
         if e:
-            self.obs.emit(Event(now_ns(), "layer_a_start", step=ctx.step, layer=layer))
+            self.obs.safe_emit(Event(now_ns(), "layer_a_start", ctx=ctx))
         self.obs.gpu_begin("layer_a", ctx)
         route = self._compute(lambda: self.leaves.layer_a(layer))
         self.obs.gpu_end("layer_a", ctx)
         uniq = route.uniq
         if e:
-            self.obs.emit(Event(now_ns(), "layer_a_end", step=ctx.step, layer=layer))
-            self.obs.emit(Event(now_ns(), "route_ready", step=ctx.step, layer=layer,
-                                value=len(uniq), aux=uniq))
+            self.obs.safe_emit(Event(now_ns(), "layer_a_end", ctx=ctx))
+            self.obs.safe_emit(Event(now_ns(), "route_ready", ctx=ctx, value=len(uniq), aux=uniq))
         # EDGE 2 and 6: A wrote y / route_idx / route_w, and the KV buffers this layer's
         # bookkeeping will clone.
         self.chain.set("y", layer)
@@ -141,17 +140,21 @@ class Engine:
 
         # What did speculation actually buy, and what did it cost? Settled BEFORE reserve(), while
         # the previous prediction for this layer is still distinguishable from a real residency.
-        self._settle_speculation(layer, uniq)
+        self._settle_speculation(layer, uniq, ctx)
 
         slot_of, to_load, to_wait = self.slots.reserve(layer, uniq, prefill=False)
         if e:
             for k, sl, g in to_load:
-                self.obs.emit(Event(now_ns(), "cache_miss", step=ctx.step, layer=layer,
-                                    key=k, slot=sl, gen=g))
-            self.obs.emit(Event(now_ns(), "cache_hit", step=ctx.step, layer=layer,
-                                value=len(uniq) - len(to_load)))
+                self.obs.safe_emit(Event(now_ns(), "cache_miss", ctx=ctx, key=k, slot=sl, gen=g))
+            # A resident key whose write is still in flight is a MAPPING hit, not a ready one --
+            # reserve() puts it in to_wait and the consumer blocks. Reporting them together
+            # overstates the cache.
+            self.obs.safe_emit(Event(now_ns(), "cache_ready_hit", ctx=ctx,
+                                     value=len(uniq) - len(to_load) - len(to_wait)))
+            if to_wait:
+                self.obs.safe_emit(Event(now_ns(), "cache_pending_hit", ctx=ctx, value=len(to_wait)))
         self.c.fetches += len(to_load)
-        self.loader.submit(to_load)
+        self.loader.submit(to_load, ctx=ctx)
         # A prefetch that has not landed yet is waited on exactly like a demand read. It is not
         # counted as a fetch -- it was already counted when it was issued.
         to_load = to_load + to_wait
@@ -161,7 +164,7 @@ class Engine:
 
         # Speculation is queued AFTER this layer's demand reads, at lower priority, so a demand
         # miss never sits behind a prefetch for a layer we have not reached.
-        self._issue_speculation(layer, uniq)
+        self._issue_speculation(layer, uniq, ctx)
 
         if self.policy.resolve_blocks:
             # v1: resolve() ends in list(pool.map(...)). Nothing issues work except a call that
@@ -185,7 +188,7 @@ class Engine:
         # ordering and multiplicity that moe_fn needs.
         reads = sorted(set(slot_of.values()))
         if e:
-            self.obs.emit(Event(now_ns(), "layer_b_start", step=ctx.step, layer=layer))
+            self.obs.safe_emit(Event(now_ns(), "layer_b_start", ctx=ctx))
         self.obs.gpu_begin("layer_b", ctx)
         # EDGE 3 and 4 are already enforced above: the ids came out of A, and _wait covers both the
         # `slots` mapping and the expert bytes being resident.
@@ -193,11 +196,11 @@ class Engine:
         self._compute(lambda: self.leaves.layer_b(layer, route), slots=reads)
         self.obs.gpu_end("layer_b", ctx)
         if e:
-            self.obs.emit(Event(now_ns(), "layer_b_end", step=ctx.step, layer=layer))
+            self.obs.safe_emit(Event(now_ns(), "layer_b_end", ctx=ctx))
         self.chain.set("h", layer)            # B wrote h and pre_mix for the next layer
 
     # ------------------------------------------------------------------ prefetch bookkeeping
-    def _settle_speculation(self, layer: int, uniq) -> None:
+    def _settle_speculation(self, layer: int, uniq, ctx=None) -> None:
         """Score the predictions that were made for THIS layer, then drop the ones that missed."""
         want = {(layer, e) for e in uniq}
         named = self._pred.pop(layer, None)
@@ -208,37 +211,55 @@ class Engine:
         for key in [k for k in self._spec if k[0] == layer]:
             slot, gen = self._spec.pop(key)
             if key in want:
-                self.pf.used += 1               # resident when demanded: the prediction paid
-                if self.obs.enabled:
-                    self.obs.emit(Event(now_ns(), "prefetch_used", layer=layer, key=key,
-                                        slot=slot, gen=gen))
+                self.pf.used += 1
+                # READY or LATE? A prefetch whose read is still in flight is a mapping hit that the
+                # consumer still blocks on; counting it with the ready ones would report a win the
+                # engine never got.
+                ready_ts = self.loader.ready.ready_ts(slot, gen)
+                if ready_ts is not None:
+                    self.pf.ready_hit += 1
+                    lead = now_ns() - ready_ts
+                    self.pf.lead_ns += lead
+                    if self.obs.enabled:
+                        self.obs.safe_emit(Event(now_ns(), "prefetch_ready_hit", ctx=ctx or NO_CTX,
+                                                 key=key, slot=slot, gen=gen, value=lead))
+                else:
+                    self.pf.late_hit += 1
+                    if self.obs.enabled:
+                        self.obs.safe_emit(Event(now_ns(), "prefetch_late_hit", ctx=ctx or NO_CTX,
+                                                 key=key, slot=slot, gen=gen))
             else:
                 self.pf.wasted += 1
                 wrong.append((key, slot, gen))
                 if self.obs.enabled:
-                    self.obs.emit(Event(now_ns(), "prefetch_wasted", layer=layer, key=key,
-                                        slot=slot, gen=gen))
+                    self.obs.safe_emit(Event(now_ns(), "prefetch_wasted", ctx=ctx or NO_CTX,
+                                             key=key, slot=slot, gen=gen))
         if wrong and self.discard_wrong_asap:
             # A wrong prefetch holds a slot AND a pending write, so it blocks eviction as well as
             # occupying capacity. Cancelling recovers the slot for reads that are already known to
             # be needed. Reads already in flight are not interrupted -- that cost is real and stays.
             self.pf.cancelled += self.loader.cancel(wrong)
 
-    def _issue_speculation(self, layer: int, uniq) -> None:
+    def _issue_speculation(self, layer: int, uniq, ctx=None) -> None:
         self.prefetch.observe(layer, uniq, self.c.steps)
         keys = self.prefetch.predict(layer, uniq, self.c.steps)
         if not keys:
             return
         keys = [k for k in keys if k not in self._spec]
+        # One id per prediction batch, carried by every event that batch causes, so a prediction's
+        # whole life joins on a key instead of on timestamps. The commit text claimed this existed;
+        # the schema did not have it.
+        pred_id = next_span()
         for k in keys:
             self._pred.setdefault(k[0], set()).add(k)
         to_load, refused = self.slots.reserve_speculative(keys)
         self.pf.refused += refused
         if self.obs.enabled:
-            self.obs.emit(Event(now_ns(), "prediction", layer=layer, value=len(keys),
-                                aux=self.prefetch.name))
+            self.obs.safe_emit(Event(now_ns(), "prediction", ctx=ctx or NO_CTX, span=pred_id,
+                                     value=len(keys), aux=self.prefetch.name))
             if refused:
-                self.obs.emit(Event(now_ns(), "refused", layer=layer, value=refused))
+                self.obs.safe_emit(Event(now_ns(), "refused", ctx=ctx or NO_CTX, span=pred_id,
+                                         value=refused))
         if not to_load:
             return
         for key, slot, gen in to_load:
@@ -248,9 +269,10 @@ class Engine:
             for k, sl, g in to_load:
                 # source_layer / horizon travel with the event, so a prediction's whole life is
                 # readable without inferring it from timestamps.
-                self.obs.emit(Event(now_ns(), "prefetch_issued", layer=k[0], key=k, slot=sl, gen=g,
-                                    aux=(layer, self.prefetch.horizon, self.prefetch.name)))
-        self.loader.submit(to_load, speculative=True)
+                self.obs.safe_emit(Event(now_ns(), "prefetch_issued", ctx=ctx or NO_CTX, key=k,
+                                         slot=sl, gen=g, span=pred_id,
+                                         aux=(layer, self.prefetch.horizon, self.prefetch.name)))
+        self.loader.submit(to_load, speculative=True, ctx=ctx or NO_CTX)
 
     def decode(self, steps: int) -> Counters:
         """Run `steps` decode steps. Where the expert ids come from is the provider's business."""
@@ -271,10 +293,10 @@ class Engine:
             # Per-step GPU work outside the layer loop (head, draft). Zero unless the provider was
             # told that part of the unattributed 78.5 % lives here rather than in a layer.
             if self.obs.enabled:
-                self.obs.emit(Event(now_ns(), "final_start", step=step))
+                self.obs.safe_emit(Event(now_ns(), "final_start", ctx=OpContext(self.request_id, step, -1)))
             self._compute(self.leaves.step_other)
             if self.obs.enabled:
-                self.obs.emit(Event(now_ns(), "final_end", step=step))
+                self.obs.safe_emit(Event(now_ns(), "final_end", ctx=OpContext(self.request_id, step, -1)))
             self.chain.set("logits", step)
             self.c.steps += 1
         self.c.wall_s = time.perf_counter() - t0
@@ -305,7 +327,7 @@ class Engine:
             self.chain.obs = obs
 
     # ------------------------------------------------------------------ prefill
-    def prefill_chunked(self, layer: int, chunks) -> None:
+    def prefill_chunked(self, layer: int, chunks, ctx: OpContext | None = None) -> None:
         """Chunked prefill over one layer: the only shape where D3 is reachable.
 
         v1 defers each chunk's reads and does the chunk's attention while they fly, then joins at
@@ -318,15 +340,19 @@ class Engine:
         # as in what they waited for, and D3 was not an isolated toggle. Caught in review
         # 2026-09-15. Both arms now route and submit every chunk up front; the only difference is
         # the readiness condition before each chunk's FFN.
+        ctx = ctx if ctx is not None else OpContext(self.request_id, self.c.steps, layer)
         pending = []
         per_chunk = []
         for uniq in chunks:
             slot_of, to_load, to_wait = self.slots.reserve(layer, uniq, prefill=True)
-            to_load = to_load + to_wait
             self.c.fetches += len(to_load)
-            self.loader.submit(to_load)
-            pending.extend(to_load)
-            per_chunk.append((to_load, sorted(set(slot_of.values()))))
+            # SUBMIT ONLY THE NEW READS. `to_wait` is already in flight from an earlier chunk;
+            # extending before the submit queued those a second time, so one expert could be read
+            # twice into the same slot. Wait on the union, submit only the difference.
+            self.loader.submit(to_load, ctx=ctx)
+            waits = to_load + to_wait
+            pending.extend(waits)
+            per_chunk.append((waits, sorted(set(slot_of.values()))))
             self._compute(lambda: self.leaves.prefill_attn(layer))
 
         for to_load, reads in per_chunk:

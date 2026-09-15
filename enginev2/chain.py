@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import threading
 
-from .observe import Event, NullObserver, WaitReason, now_ns
+from .observe import Event, NullObserver, WaitReason, next_span, now_ns
 
 
 class Chain:
@@ -82,7 +82,7 @@ class Chain:
             self._done.add((name, index))
             self._cv.notify_all()
         if self.obs.enabled:
-            self.obs.emit(Event(now_ns(), "edge_set", layer=index, aux=name))
+            self.obs.safe_emit(Event(now_ns(), "edge_set", aux=(name, index)))
 
     def wait(self, name: str, index: int = -1, timeout: float = 60.0) -> None:
         if index < 0 and name in _PER_LAYER:
@@ -90,21 +90,23 @@ class Chain:
         with self._lk:
             self.checks += 1
             if self.obs.enabled:
-                self.obs.emit(Event(now_ns(), "edge_check", layer=index, aux=name))
+                self.obs.safe_emit(Event(now_ns(), "edge_check", aux=(name, index)))
             if (name, index) in self._done:
                 return
             self.blocks += 1
+            sp = next_span()
             if self.obs.enabled:
-                self.obs.emit(Event(now_ns(), "wait_start", layer=index,
-                                    aux=WaitReason.ENGRAM if name == "engram" else WaitReason.CHAIN))
+                self.obs.safe_emit(Event(now_ns(), "wait_start", span=sp,
+                                         aux=WaitReason.ENGRAM if name == "engram"
+                                         else WaitReason.CHAIN))
             try:
                 if not self._cv.wait_for(lambda: (name, index) in self._done, timeout):
                     raise TimeoutError(f"edge {name}@{index} never satisfied")
             finally:
                 if self.obs.enabled:
-                    self.obs.emit(Event(now_ns(), "wait_end", layer=index,
-                                        aux=WaitReason.ENGRAM if name == "engram"
-                                        else WaitReason.CHAIN))
+                    self.obs.safe_emit(Event(now_ns(), "wait_end", span=sp,
+                                             aux=WaitReason.ENGRAM if name == "engram"
+                                             else WaitReason.CHAIN))
 
     def is_set(self, name: str, index: int = -1) -> bool:
         with self._lk:
