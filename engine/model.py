@@ -27,6 +27,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 import v41_ref as R  # noqa: E402
 
+try:
+    from decode_attn import prefill_attention  # tools/decode_attn.py (Triton)
+except Exception:  # noqa: BLE001
+    prefill_attention = None
+
 # Window ring slots. Must exceed window_size + the longest chunk a single forward sees, because
 # `attention` gathers a query's window out of the ring AFTER writing the whole chunk into it
 # (128 + 2048 here). 4096 slots x 512 dims x bf16 x 40 layers = 167 MB.
@@ -55,6 +60,18 @@ if EARLY_SUBMIT in ("1", "true", "yes"):
 elif EARLY_SUBMIT in ("0", "false", "no", ""):
     EARLY_SUBMIT = "off"
 assert EARLY_SUBMIT in ("off", "all", "chunk0", "synconly"), EARLY_SUBMIT
+
+# One Triton kernel for the prefill softmax attention instead of the eager einsum -> masked_fill ->
+# amax -> exp -> sum -> einsum chain. Profiled at the real shape (T=192, H=64, D=512, N=640) the
+# eager path is 53 kernel launches per call and the kernel is 1; the eager count scales with
+# ceil(T/ATTN_TILE), so a T=2048 chunk is ~560 launches per layer per call. See
+# tools/decode_attn.prefill_attention for the trace numbers that motivate it.
+# Default OFF: the PV product inside the kernel runs through tl.dot, so the probabilities are
+# carried as a bf16 high/low pair rather than in fp32 and the result is close but not bit-identical
+# -- the same reason DSV41_FUSED_ATTN is off on the decode path. Measured divergence at the real
+# shape is max|d|/max|ref| 7.5e-4, ||d||/||ref|| 9.3e-5, 0.02 % of elements more than one bf16 step
+# apart; engine/test_fused_prefill_attn.py holds it there. DSV41_ATTN_FUSED_PREFILL=1 turns it on.
+ATTN_FUSED_PREFILL = os.environ.get("DSV41_ATTN_FUSED_PREFILL", "0") == "1"
 
 # Chunk invariance requires every GEMM to give the same row whatever the batch length M. cuBLAS
 # picks split-K kernels for small M and, with this flag on, reduces the K-splits in bf16, so
@@ -380,6 +397,12 @@ class Model:
         """
         T = q.size(0)
         scale = self.args.head_dim ** -0.5
+        if (ATTN_FUSED_PREFILL and prefill_attention is not None
+                and q.dtype == torch.bfloat16 and kv_all.dtype == torch.bfloat16 and q.is_cuda):
+            # No ATTN_TILE padding here: a kernel program reduces over the key axis of one token in
+            # a fixed order, so a row is already independent of how many rows are in the call --
+            # which is the invariance the query tiling was buying.
+            return prefill_attention(q, kv_all, mask, sink, scale)
         B = ATTN_TILE if ATTN_TILE > 0 else T
 
         def tile(qt, kvt, mt):
