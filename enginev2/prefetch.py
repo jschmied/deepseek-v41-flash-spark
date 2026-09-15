@@ -62,8 +62,17 @@ class PrefetchStats:
     late_hit: int = 0        # wanted, but its read was still in flight -- consumer blocked anyway
     lead_ns: int = 0         # summed (demand_ts - ready_ts) over ready hits
     wasted: int = 0          # prefetched keys evicted or cancelled without ever being demanded
-    cancelled: int = 0       # queued speculation dropped before it started
-    discarded_running: int = 0   # wrong speculation already in flight: read paid, residency refused
+    # THREE STATES, kept apart because they mean different things experimentally: queued cost
+    # nothing, running cost a read that was wasted, finished means the predictor was wrong AND
+    # early enough to have consumed residency. Folding finished into `cancelled` contradicted its
+    # own definition ("dropped before it started").
+    cancelled_queued: int = 0
+    discarded_running: int = 0
+    discarded_finished: int = 0
+
+    @property
+    def cancelled(self) -> int:
+        return self.cancelled_queued + self.discarded_finished
     refused: int = 0         # predictions the store had no free slot for
 
     @property

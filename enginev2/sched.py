@@ -217,9 +217,11 @@ class LoaderService:
             cancelled = (slot, gen) in self._cancelled
             self._cancelled.discard((slot, gen))     # consumed either way: no marker outlives its read
         if cancelled:
-            # Never started, so nothing to undo but the reservation itself.
-            self.slots.forget(key, slot)
-            self.slots.clear_pending(slot, gen)
+            # The DRIVER already un-mapped this and cleared its pending mark when it cancelled --
+            # synchronously, so the slot was available to the very next reserve() rather than to
+            # whenever a low-priority queue entry happened to be dequeued. Nothing to do here but
+            # drop the stale entry. Touching ExpertSlots from a worker is what this whole deferral
+            # exists to avoid.
             return
         # The PROVIDER acquires the staging buffer, inside read(), and hands back a StagedExpert
         # that owns the lease -- because the bytes and the lease cannot be separated: a real reader
@@ -305,14 +307,14 @@ class LoaderService:
                 self._discard.discard((slot, gen))
             if drop:
                 with self._lk:
-                    self._forget.append((key, slot))
+                    self._forget.append((key, slot, gen))
         except BaseException as exc:              # noqa: BLE001
             # A failed expert must be UN-MAPPED: its slot holds a torn read, and leaving the key
             # mapped would make the next reserve() count it as a HIT and compute with partial
             # bytes -- silent, and permanent for the life of the process. Deferred to the driver
             # for the same reason as above; drain_forgets() runs before the next reserve().
             with self._lk:
-                self._forget.append((key, slot))
+                self._forget.append((key, slot, gen))
             self.ready.set(slot, gen, err=exc)
         finally:
             if permit_held:
@@ -368,36 +370,48 @@ class LoaderService:
         stay mapped in the LRU -- which contradicts the policy it implements and quietly hands the
         predictor arms cache residency they did not earn. The three states:
 
-          queued    -> cancel; the worker drops it and frees the slot
-          running   -> cannot be un-read, so mark it: the loader forgets the key when the H2D ends
-          finished  -> forget immediately
+          queued    -> mark the stale entry AND queue the un-map now: the driver recovers the slot
+                       on its next drain, not whenever a low-priority entry is dequeued
+          running   -> cannot be un-read, so mark it: un-mapped when the H2D ends
+          finished  -> un-map now
+
+        WHY QUEUED IS NOT "THE WORKER WILL HANDLE IT". Speculation is deliberately lower priority,
+        so a cancelled wrong prediction could sit in the queue holding a mapped slot and a pending
+        mark for an unbounded time -- protected from eviction exactly while demand needed it. The
+        driver therefore recovers it immediately and the queue entry becomes inert.
 
         The read cost of a running one is still paid in full. Only the residency is refused.
-        -> (cancelled, marked_running, forgotten_now)
+        -> (cancelled_queued, discarded_running, discarded_finished)
         """
-        cancelled = running = 0
-        forget_now = []
+        queued = running = finished = 0
         with self._lk:
             for key, slot, gen in items:
                 if (slot, gen) in self._queued:
                     self._cancelled.add((slot, gen))
-                    cancelled += 1
+                    self._queued.discard((slot, gen))
+                    self._forget.append((key, slot, gen))
+                    queued += 1
                 elif self.ready.is_done(slot, gen):
-                    forget_now.append((key, slot))
+                    self._forget.append((key, slot, gen))
+                    finished += 1
                 else:
                     self._discard.add((slot, gen))   # in flight: collected at completion
                     running += 1
-        if forget_now:
-            with self._lk:
-                self._forget.extend(forget_now)
-        return cancelled, running, len(forget_now)
+        return queued, running, finished
+
+    def quiesce(self, timeout: float = 60.0) -> None:
+        """Wait until nothing is queued or in flight. Speculative reads are NOT counted by
+        wait_all() -- that is D3's demand barrier -- so anything inspecting the cache at rest needs
+        this instead, and so does an orderly shutdown."""
+        self.q.join()
 
     def drain_forgets(self) -> int:
         """Apply pending un-maps. MUST be called from the driver thread, before reserve()."""
         with self._lk:
             pending, self._forget = self._forget, []
-        for key, slot in pending:
+        for key, slot, gen in pending:
             self.slots.forget(key, slot)
+            self.slots.clear_pending(slot, gen)
         return len(pending)
 
     def wait_slots(self, to_load, ctx=NO_CTX) -> None:

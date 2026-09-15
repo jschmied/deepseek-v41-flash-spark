@@ -892,13 +892,73 @@ def test_speculation_neither_credits_frequency_nor_keeps_a_wrong_slot():
     try:
         e.warm(calls, cut)
         e.decode(3)
+        # Speculative reads still in flight at the end of the window are marked for discard and
+        # un-mapped when their H2D ends, so the cache is only inspectable AT REST.
+        e.loader.quiesce()
         e.loader.drain_forgets()
         assert e.pf.wasted > 0, "no wrong prefetch was produced, so this arm proves nothing"
         assert e.pf.discarded_running > 0, (
             "no wrong prefetch was caught mid-flight -- only queued ones were being discarded")
-        still = [k for k, v in e._spec.items()]
-        assert not still or all(k[0] >= 0 for k in still)
+        # The previous assertion here was tautological -- every (layer, expert) key has layer >= 0.
+        # What matters is that the wrong keys are GONE from the cache, so check the cache.
+        wrong = e.wrong_keys_for_test
+        assert wrong, "the arm recorded no wrong keys to check"
+        # A discarded (key, slot) must not still be mapped AT THAT SLOT. Checking the key alone is
+        # wrong: the same expert can be predicted again later and be legitimately resident
+        # elsewhere, which is a hit, not a leak.
+        still = [(k, sl, g) for k, sl, g in wrong
+                 if e.slots.lru.get(k) == sl and e.slots.gen.get(sl) == g]
+        assert not still, (
+            f"{len(still)} of {len(wrong)} discarded prefetches still hold their slot: "
+            f"{sorted(still)[:4]}")
     finally:
         e.close()
     print(f"  speculation: no phantom use-counts, {e.pf.discarded_running} running wrong prefetches "
           f"un-mapped, no policy ghosts  OK")
+
+
+# ================================================================ 20. queued cancellation
+def test_a_cancelled_queued_prefetch_frees_its_slot_before_the_next_reserve():
+    """The slot must come back to the DRIVER's next reserve, not to whenever a worker dequeues.
+
+    Speculation is deliberately lower priority, so a cancelled wrong prediction left for its worker
+    could hold a mapped slot and a pending mark for an unbounded time -- protected from eviction
+    exactly while demand needed it. And un-mapping it from the worker mutates ExpertSlots off the
+    driver thread, which is the race the deferral exists to avoid.
+
+    One worker, busy with a slow demand read, so the speculative entry provably cannot have run.
+    """
+    e = mk(V2, lru_slots=32, transient_slots=8, n_workers=1, staging=8)
+    try:
+        # occupy the single worker with a demand read
+        _, demand, _ = e.slots.reserve(0, (1, 2, 3, 4), prefill=False)
+        e.loader.submit(demand)
+
+        spec, refused = e.slots.reserve_speculative([(9, 700), (9, 701)])
+        assert spec and not refused, "speculation was refused; the arm proves nothing"
+        e.loader.submit(spec, speculative=True)
+        keys = [(k, sl, g) for k, sl, g in spec]
+        for k, sl, _g in keys:
+            assert e.slots.lru.get(k) == sl, "speculation did not become resident"
+
+        q, running, fin = e.loader.cancel(spec)
+        assert q == len(spec), (
+            f"only {q} of {len(spec)} were treated as queued -- with one busy worker they cannot "
+            f"have started (running={running}, finished={fin})")
+
+        # BEFORE the worker could possibly dequeue them
+        e.loader.drain_forgets()
+        for k, sl, g in keys:
+            assert e.slots.lru.get(k) != sl, f"{k} still holds slot {sl} after cancellation"
+            assert sl not in e.slots.pending_slots(), f"slot {sl} is still marked pending"
+        # and the slot is genuinely reusable by the next reserve
+        _, again, _ = e.slots.reserve(9, (800, 801), prefill=False)
+        assert len(again) == 2, "the freed slots were not reusable"
+
+        e.loader.quiesce()
+        assert e.loader.stage.at_rest(), "a cancelled entry leaked a staging lease"
+        assert e.arena.violations == [], e.arena.violations[:3]
+    finally:
+        e.close()
+    print("  queued cancel: slot recovered by the driver before the next reserve, no worker "
+          "touched the cache  OK")
