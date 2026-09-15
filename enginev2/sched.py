@@ -187,6 +187,12 @@ class LoaderService:
         # produced KeyError in the victim search. Workers therefore only RECORD what to un-map, and
         # the driver drains it between layers, where all other cache mutation already happens.
         self._forget: list = []
+        # Reads that actually STARTED, split by kind. `issued` counts submissions, and a queued
+        # cancellation means that submission never became a read -- so using it as the denominator
+        # of fetch precision understates the predictor. This is the honest denominator, and it
+        # stays correct through failures and any future scheduling change.
+        self.started_demand = 0
+        self.started_spec = 0
         # D3's barrier is over DEMAND reads only. v1's join_pending() has no speculation to wait
         # for, so folding prefetches into it would make the v1 arm wait on work v1 never issues --
         # a confound, not a finding. Speculation is deprioritised and uncounted here by design.
@@ -202,7 +208,7 @@ class LoaderService:
             w.start()
 
     # ------------------------------------------------------------------ the leaf
-    def _load_one(self, ctx, cause_id: int, key: tuple, slot: int, gen: int) -> None:
+    def _load_one(self, ctx, cause_id: int, spec: bool, key: tuple, slot: int, gen: int) -> None:
         """read -> (handoff) -> compute-order barrier -> H2D -> per-slot event.
 
         Every step between the lease and the release must be inside the try, or the lease leaks and
@@ -223,6 +229,11 @@ class LoaderService:
             # drop the stale entry. Touching ExpertSlots from a worker is what this whole deferral
             # exists to avoid.
             return
+        with self._lk:
+            if spec:
+                self.started_spec += 1
+            else:
+                self.started_demand += 1
         # The PROVIDER acquires the staging buffer, inside read(), and hands back a StagedExpert
         # that owns the lease -- because the bytes and the lease cannot be separated: a real reader
         # returns views ALIASING that pinned buffer. The loader decides only WHEN to release it,
@@ -307,14 +318,14 @@ class LoaderService:
                 self._discard.discard((slot, gen))
             if drop:
                 with self._lk:
-                    self._forget.append((key, slot, gen))
+                    self._forget.append((key, slot, gen, False))
         except BaseException as exc:              # noqa: BLE001
             # A failed expert must be UN-MAPPED: its slot holds a torn read, and leaving the key
             # mapped would make the next reserve() count it as a HIT and compute with partial
             # bytes -- silent, and permanent for the life of the process. Deferred to the driver
             # for the same reason as above; drain_forgets() runs before the next reserve().
             with self._lk:
-                self._forget.append((key, slot, gen))
+                self._forget.append((key, slot, gen, False))
             self.ready.set(slot, gen, err=exc)
         finally:
             if permit_held:
@@ -361,7 +372,8 @@ class LoaderService:
                 self._queued.add((item[1], item[2]))
                 # the context travels WITH the work: a completion on a worker thread must still
                 # know which request and step asked for it.
-                self.q.put((prio, self._seq, (ctx, cause_id) + tuple(item), prio == 0))
+                self.q.put((prio, self._seq, (ctx, cause_id, speculative) + tuple(item),
+                            prio == 0))
 
     def cancel(self, items) -> tuple:
         """Discard wrong speculation in whichever of its three states it is in.
@@ -389,10 +401,11 @@ class LoaderService:
                 if (slot, gen) in self._queued:
                     self._cancelled.add((slot, gen))
                     self._queued.discard((slot, gen))
-                    self._forget.append((key, slot, gen))
+                    # rollback: the read never started, so the displaced tenant's bytes are intact
+                    self._forget.append((key, slot, gen, True))
                     queued += 1
                 elif self.ready.is_done(slot, gen):
-                    self._forget.append((key, slot, gen))
+                    self._forget.append((key, slot, gen, False))   # the slot WAS overwritten
                     finished += 1
                 else:
                     self._discard.add((slot, gen))   # in flight: collected at completion
@@ -400,17 +413,28 @@ class LoaderService:
         return queued, running, finished
 
     def quiesce(self, timeout: float = 60.0) -> None:
-        """Wait until nothing is queued or in flight. Speculative reads are NOT counted by
-        wait_all() -- that is D3's demand barrier -- so anything inspecting the cache at rest needs
-        this instead, and so does an orderly shutdown."""
-        self.q.join()
+        """Wait until nothing is queued or in flight, or raise.
+
+        Speculative reads are NOT counted by wait_all() -- that is D3's demand barrier -- so
+        anything inspecting the cache at rest needs this, and so does an orderly shutdown. The
+        timeout is honoured: an earlier version accepted one and then called an unbounded join(),
+        which is worse than not offering it.
+        """
+        done = threading.Event()
+        w = threading.Thread(target=lambda: (self.q.join(), done.set()), daemon=True)
+        w.start()
+        if not done.wait(timeout):
+            raise TimeoutError(f"loader did not quiesce within {timeout}s")
 
     def drain_forgets(self) -> int:
         """Apply pending un-maps. MUST be called from the driver thread, before reserve()."""
         with self._lk:
             pending, self._forget = self._forget, []
-        for key, slot, gen in pending:
-            self.slots.forget(key, slot)
+        for key, slot, gen, rollback in pending:
+            if rollback:
+                self.slots.rollback_speculative(key, slot, gen)
+            else:
+                self.slots.forget(key, slot)
             self.slots.clear_pending(slot, gen)
         return len(pending)
 
@@ -448,7 +472,29 @@ class LoaderService:
                     self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, span=sp,
                                              aux=WaitReason.GLOBAL_BARRIER))
 
-    def shutdown(self) -> None:
+    def shutdown(self, drain: bool = True, timeout: float = 60.0) -> None:
+        """Orderly by default: finish what is queued, apply pending un-maps, THEN stop the workers.
+
+        The stop sentinels are priority -1, so they outrank demand (0) and speculation (1) -- a
+        shutdown that just posts them lets workers exit with work still queued. Harmless while the
+        leaves were sleeps; not harmless once a worker owns a pinned buffer and an in-flight CUDA
+        copy. Pass drain=False to abort instead: queued work is cancelled first, running work is
+        still allowed to finish, and only then do the workers stop.
+        """
+        if drain:
+            try:
+                self.quiesce(timeout)
+            except TimeoutError:
+                pass                      # fall through to stopping; the caller sees the workers
+            self.drain_forgets()
+        else:
+            with self._lk:
+                self._cancelled.update(self._queued)
+                self._queued.clear()
+            try:
+                self.quiesce(timeout)
+            except TimeoutError:
+                pass
         for _ in self.workers:
             self._seq += 1
             self.q.put((-1, self._seq, None, False))

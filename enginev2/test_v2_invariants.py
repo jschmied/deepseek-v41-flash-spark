@@ -886,7 +886,11 @@ def test_speculation_neither_credits_frequency_nor_keeps_a_wrong_slot():
     # (b) a wrong prefetch that already RAN must not stay resident
     calls = load_decode()
     cut = warmup_cut(calls)
-    e = Engine(V2, lru_slots=5328, transient_slots=400,
+    # The wrong keys come from the TRACE, not from test-only state on the engine: prefetch_wasted
+    # already carries key/slot/gen, so an unbounded list on Engine was redundant as well as
+    # test-shaped.
+    obs = TraceObserver(capacity=1 << 20)
+    e = Engine(V2, lru_slots=5328, transient_slots=400, observer=obs,
                leaves=ModelLeaves(calls, Bandwidth(), start=cut),
                prefetch=RecallOraclePrefetcher(calls, 2, recall=1.0, precision=0.5, start=cut))
     try:
@@ -901,8 +905,9 @@ def test_speculation_neither_credits_frequency_nor_keeps_a_wrong_slot():
             "no wrong prefetch was caught mid-flight -- only queued ones were being discarded")
         # The previous assertion here was tautological -- every (layer, expert) key has layer >= 0.
         # What matters is that the wrong keys are GONE from the cache, so check the cache.
-        wrong = e.wrong_keys_for_test
+        wrong = [(x.key, x.slot, x.gen) for x in obs.drain() if x.kind == "prefetch_wasted"]
         assert wrong, "the arm recorded no wrong keys to check"
+        assert obs.dropped == 0, "the trace wrapped; the wrong-key list is partial"
         # A discarded (key, slot) must not still be mapped AT THAT SLOT. Checking the key alone is
         # wrong: the same expert can be predicted again later and be legitimately resident
         # elsewhere, which is a hit, not a leak.

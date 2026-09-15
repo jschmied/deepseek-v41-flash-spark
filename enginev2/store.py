@@ -44,6 +44,14 @@ class EvictionPolicy:
     def on_insert(self, key: tuple, slot: int, clock: int) -> None:
         """A key became resident in `slot` because something DEMANDED it."""
 
+    def on_restore(self, key: tuple, slot: int) -> None:
+        """A key that was evicted is resident again and NOTHING about it changed.
+
+        Distinct from on_admit: a restore must not touch age or count at all, because the eviction
+        it undoes never physically happened.
+        """
+        self.on_admit(key, slot, 0)
+
     def on_admit(self, key: tuple, slot: int, clock: int) -> None:
         """A key became resident SPECULATIVELY -- nothing has used it.
 
@@ -137,6 +145,11 @@ class AgeOverFreqPolicy(EvictionPolicy):
             b.pop(key, None)
             if not b:
                 del self._buckets[c]
+
+    def on_restore(self, key: tuple, slot: int) -> None:
+        # Re-register at the count AND the age it already had; an undone eviction leaves no trace.
+        c = self._use_count.get(key, 0)
+        self._buckets.setdefault(c, collections.OrderedDict())[key] = slot
 
     def victim(self, residents, protected, clock):
         best = best_key = None
@@ -439,6 +452,11 @@ class ExpertSlots:
         # mid-write. Decode never exposed it -- one layer is in flight at a time -- but lookahead,
         # the whole point of v2, breaks it immediately. Caught in review 2026-09-15.
         self._pending: dict[int, int] = {}                 # slot -> generation of the in-flight write
+        # Which resident a SPECULATIVE reservation displaced. A speculation cancelled before it read
+        # anything never overwrote the slot, so the old tenant's bytes are still there and the
+        # eviction can be undone at zero cost -- see rollback_speculative(). Without this a wrong
+        # prediction still raised later demand misses even when its read was cancelled.
+        self._displaced: dict[tuple, tuple] = {}           # (slot, gen) -> displaced key
         self._pending_lk = threading.Lock()
 
         # age/(1+count). Both dicts survive eviction ON PURPOSE, exactly as the offline replay's
@@ -447,6 +465,8 @@ class ExpertSlots:
         self._clock = 0
         self.hits = 0
         self.misses = 0
+        self.restored = 0
+        self._last_victim = None
         self.prefill_misses = 0
 
     # ---------------------------------------------------------------- pending writes
@@ -473,10 +493,12 @@ class ExpertSlots:
 
     # ---------------------------------------------------------------- allocation
     def _lru_slot_for(self, key: tuple, used: frozenset, touch: bool = True) -> int:
+        self._last_victim = None
         if self.free_lru:
             slot = self.free_lru.pop()
         else:
             victim = self.evict.victim(self.lru, used, self._clock)
+            self._last_victim = victim
             if victim is None:
                 raise RuntimeError(
                     "no evictable LRU slot: every resident is in use by this call or has a write "
@@ -593,8 +615,35 @@ class ExpertSlots:
                 continue
             used.add(s)
             g = self.gen[s] = self.gen.get(s, 0) + 1
+            if self._last_victim is not None:
+                self._displaced[(s, g)] = self._last_victim
             to_load.append((key, s, g))
         return to_load, refused
+
+    def rollback_speculative(self, key: tuple, slot: int, gen: int) -> bool:
+        """Undo a speculative reservation whose read NEVER STARTED.
+
+        Only sound in that case: the arena still holds the displaced tenant's bytes, so restoring
+        its mapping restores real data. Returns True if a tenant was put back.
+        """
+        self.forget(key, slot)
+        victim = self._displaced.pop((slot, gen), None)
+        if victim is None or self.lru.get(victim) is not None:
+            return False
+        try:
+            self.free_lru.remove(slot)
+        except ValueError:
+            return False                      # the slot was taken again: too late, and that is fine
+        self.lru[victim] = slot
+        # ...at the LRU END, not the MRU end. `lru[k] = v` appends, which would promote the tenant
+        # we just evicted to most-recently-used -- an undone eviction that left a large trace, and
+        # it made the rollback arm measurably WORSE than no rollback. It was the least-recently-used
+        # entry when it was chosen as victim, so that is where it goes back.
+        self.lru.move_to_end(victim, last=False)
+        self.slot_key[slot] = victim
+        self.evict.on_restore(victim, slot)
+        self.restored += 1
+        return True
 
     def forget(self, key: tuple, slot: int) -> None:
         """Un-map a key whose load did not complete: the slot holds a torn read.

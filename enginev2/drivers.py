@@ -76,12 +76,6 @@ class Engine:
         # a correct prediction that was already cached never becomes a fetch, so scoring only the
         # fetches would credit the predictor with none of its cheap hits.
         self._pred: dict[int, dict] = {}       # target layer -> {key: cause_id}
-        # Every (key, slot) speculation got wrong, kept so a test can assert they really left the
-        # cache rather than assert that a counter moved. Identity is (key, slot, GENERATION): the
-        # same key can be predicted again later and be legitimately resident, even in the same
-        # slot, and the generation is what tells that apart from a leak. It is the same
-        # disambiguation the readiness events needed.
-        self.wrong_keys_for_test: list = []
         self.c = Counters()
 
     def close(self):
@@ -262,7 +256,6 @@ class Engine:
             # A wrong prefetch holds a slot AND a pending write, so it blocks eviction as well as
             # occupying capacity. Cancelling recovers the slot for reads that are already known to
             # be needed. Reads already in flight are not interrupted -- that cost is real and stays.
-            self.wrong_keys_for_test.extend(wrong)
             q, r, f = self.loader.cancel(wrong)
             self.pf.cancelled_queued += q
             self.pf.discarded_running += r
@@ -328,6 +321,7 @@ class Engine:
             self.chain.set("logits", step)
             self.c.steps += 1
         self.c.wall_s = time.perf_counter() - t0
+        self.pf.started = self.loader.started_spec
         bw = self.loader.bw
         if bw is not None:                      # a real provider models no device; leave at 0.0
             self.c.mean_inflight = bw.mean_inflight

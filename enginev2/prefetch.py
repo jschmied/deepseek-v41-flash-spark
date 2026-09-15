@@ -69,16 +69,30 @@ class PrefetchStats:
     cancelled_queued: int = 0
     discarded_running: int = 0
     discarded_finished: int = 0
-
-    @property
-    def cancelled(self) -> int:
-        return self.cancelled_queued + self.discarded_finished
+    started: int = 0         # speculative reads that actually BEGAN -- see precision
     refused: int = 0         # predictions the store had no free slot for
 
     @property
     def precision(self) -> float:
-        """Over FETCHES: of the reads speculation caused, how many were used."""
-        return self.used / self.issued if self.issued else 0.0
+        """Over FETCHES THAT HAPPENED: of the reads speculation actually caused, how many were used.
+
+        `issued` counts SUBMISSIONS, and a queued cancellation means the submission never became a
+        read -- which is the entire point of cancelling it. Dividing by `issued` therefore charged
+        the predictor for I/O it did not do and understated fetch precision, on exactly the surface
+        a training decision is read from. `started` is counted where the read begins.
+        """
+        n = self.started or self.issued
+        return self.used / n if n else 0.0
+
+    @property
+    def discarded_total(self) -> int:
+        """All wrong speculation, in any state. Named so it cannot be read as `reads_avoided`."""
+        return self.cancelled_queued + self.discarded_running + self.discarded_finished
+
+    @property
+    def reads_avoided(self) -> int:
+        """Wrong speculation cancelled BEFORE it read anything -- the only state that saves I/O."""
+        return self.cancelled_queued
 
     @property
     def timeliness(self) -> float:
