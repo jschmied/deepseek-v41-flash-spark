@@ -1,5 +1,8 @@
 """
-decode_attn.py -- one Triton kernel for the sinked softmax attention of the decode path.
+decode_attn.py -- one Triton kernel for the sinked softmax attention of the decode path, and
+(via `prefill_attention` at the bottom of this file) of the prefill path as well: both are T
+independent single-query attentions over each token's own gathered key set, so one kernel serves
+both and only the launch shape differs.
 
 Shape of the problem (engine/fastdecode.py `_attention`): T query tokens (6 in a verify block,
 5 in a DSpark draft), h = 64 query heads, and a per-token key set that every head of that token
@@ -195,9 +198,15 @@ NUM_STAGES = int(os.environ.get("DSV41_ATTN_STAGES", 2))
 def decode_attention(q: torch.Tensor, kv1: torch.Tensor, kv2: torch.Tensor | None,
                      mask: torch.Tensor, sink: torch.Tensor, scale: float,
                      split: int | None = None, pv_split: int | None = None,
-                     block_n: int | None = None) -> torch.Tensor:
+                     block_n: int | None = None, block_h: int | None = None,
+                     num_warps: int | None = None, num_stages: int | None = None) -> torch.Tensor:
     """q bf16 [T, H, D]; kv1 bf16 [T, N1, D] and optional kv2 bf16 [T, N2, D] (either may be a
-    stride-0 broadcast along T); mask bool [T, N1+N2]; sink fp32 [H] -> o bf16 [T, H, D]."""
+    stride-0 broadcast along T); mask bool [T, N1+N2]; sink fp32 [H] -> o bf16 [T, H, D].
+
+    block_h/num_warps/num_stages exist because prefill and decode want different shapes out of the
+    same kernel: at T = 6 the grid is starved and the launch wants to be small, at T = 2048 there
+    are 8192 programs and the per-token KV row set (640 x 512 bf16 = 640 kB) should be read by as
+    few programs as possible. Defaults are the decode ones, so no decode call changes."""
     T, H, D = q.shape
     N1 = kv1.shape[1]
     N2 = 0 if kv2 is None else kv2.shape[1]
@@ -210,6 +219,9 @@ def decode_attention(q: torch.Tensor, kv1: torch.Tensor, kv2: torch.Tensor | Non
     DA, DB = _split_d(D)   # head_dim 512 is a power of two -> DB = 0 and the second block vanishes
     DBP = max(DB, 16)
     bn = BLOCK_N if block_n is None else block_n
+    bh = BLOCK_H if block_h is None else block_h
+    nw = NUM_WARPS if num_warps is None else num_warps
+    ns = NUM_STAGES if num_stages is None else num_stages
     pv = PV_SPLIT if pv_split is None else pv_split
     sp = N_SPLIT if split is None else split
     sp = max(1, min(sp, triton.cdiv(N, bn)))
@@ -219,10 +231,10 @@ def decode_attention(q: torch.Tensor, kv1: torch.Tensor, kv2: torch.Tensor | Non
     k2 = kv1 if kv2 is None else kv2
     s2t, s2n = k2.stride(0), k2.stride(1)
     o = torch.empty(T, H, D, dtype=torch.bfloat16, device=q.device)
-    grid = (triton.cdiv(H, BLOCK_H), T, sp)
+    grid = (triton.cdiv(H, bh), T, sp)
     args = (q, kv1, k2, msk, sink)
-    common = dict(DA=DA, DB=DB, DBP=DBP, BLOCK_H=BLOCK_H, BLOCK_N=bn, PV_SPLIT=pv,
-                  TWO=1 if kv2 is not None else 0, num_warps=NUM_WARPS, num_stages=NUM_STAGES)
+    common = dict(DA=DA, DB=DB, DBP=DBP, BLOCK_H=bh, BLOCK_N=bn, PV_SPLIT=pv,
+                  TWO=1 if kv2 is not None else 0, num_warps=nw, num_stages=ns)
     if sp == 1:
         _dattn_kernel[grid](*args, o, o, o, T, H, N, N1,
                             q.stride(0), q.stride(1), kv1.stride(0), kv1.stride(1), s2t, s2n,
@@ -242,6 +254,67 @@ def decode_attention(q: torch.Tensor, kv1: torch.Tensor, kv2: torch.Tensor | Non
                              mp.stride(0), mp.stride(1),
                              SPLIT=sp, BD=BD, num_warps=4, num_stages=1)
     return o
+
+
+# ------------------------------------------------------------------- prefill entry point
+# Prefill (engine/model.py `_softmax_attn`) is the SAME problem as decode, only wider: every query
+# token still carries its own [N, D] key set (the gathered window plus the compressed rows), so it
+# is a batched attention with batch = T, not a shared-KV flash attention. That means this kernel
+# serves it unchanged; only the launch shape differs.
+#
+# Why it is worth a gate at all: the eager chain is einsum -> masked_fill -> amax -> clamp -> sub ->
+# exp -> sum -> exp(sink) -> add -> div -> einsum -> cast, per 64-row query tile. In the nsys trace
+# of a 79 s prefill, `elementwise_kernel` alone is 224,977 launches (44.7 % of every launch in the
+# run) carrying ~12 us of GPU work behind ~90 us of host launch cost; host launch time totals 13.4 s
+# of those 79 s. This collapses the whole chain to one launch per call.
+#
+# The one prefill-specific choice is SPLIT = 1. The key axis is split in decode only because T = 6
+# leaves 24 programs on 48 SMs; at T = 2048 the grid is already T * H/BLOCK_H = 8192 programs, so
+# splitting would buy nothing and cost the combine kernel plus a [T, H, SPLIT, D] fp32 scratch
+# buffer (1.6 GB at the real shape).
+#
+# The tile itself is swept, not inherited: at T=512, H=64, D=512, N=640 (median of 15, box shared)
+#   BLOCK_H 16 / BLOCK_N  32 / 4 warps  1.93 ms   <- default
+#   BLOCK_H 16 / BLOCK_N  32 / 8 warps  2.29 ms
+#   BLOCK_H 16 / BLOCK_N  64 / 8 warps  2.46 ms
+#   BLOCK_H 16 / BLOCK_N  64 / 4 warps  2.57 ms
+#   BLOCK_H 32 / BLOCK_N  32 / 4 warps  2.46 ms
+# and every (BLOCK_H, BLOCK_N) above 16x32 except 32x32 fails to compile at all: with D = 512 the
+# k1 tile alone is BLOCK_N x 512 bf16, so 32x64 already asks for 100 kB of shared memory. Bigger
+# head blocks would re-read each token's 640 kB key set fewer times, but they are not reachable;
+# what makes 16 acceptable anyway is the axis order (h, t, s), which launches the H/BLOCK_H
+# programs of one token adjacently so the re-reads hit in L2. The prefill arm carries its own
+# constants because the decode ones are tuned against a 24-program grid, not this one.
+#
+# The kernel is also chunk-invariant for free, which the torch path had to buy with ATTN_TILE: a
+# program reduces over the key axis of ONE token in a fixed order, so a token's output does not
+# depend on how many other tokens are in the call. No padding to a fixed tile is needed.
+PF_BLOCK_H = int(os.environ.get("DSV41_PREFILL_ATTN_BLOCK_H", 16))
+PF_BLOCK_N = int(os.environ.get("DSV41_PREFILL_ATTN_BLOCK_N", 32))
+PF_WARPS = int(os.environ.get("DSV41_PREFILL_ATTN_WARPS", 4))
+PF_STAGES = int(os.environ.get("DSV41_PREFILL_ATTN_STAGES", 2))
+
+
+def prefill_attention(q: torch.Tensor, kv_all: torch.Tensor, mask: torch.Tensor,
+                      sink: torch.Tensor, scale: float) -> torch.Tensor:
+    """The fused form of engine/model.py `_softmax_attn`.
+
+    q bf16 [T, H, D]; kv_all bf16 [T, N, D]; mask bool [T, N] (True = visible); sink fp32 [H]
+    -> o bf16 [T, H, D].  One kernel launch, no host synchronisation, nothing allocated but `o`.
+
+    An all-masked (padding) row keeps the torch path's behaviour exactly: its scores are -inf, m is
+    clamped to -1e30, l is 0, and exp(sink - (-1e30)) is +inf, so 0/inf = 0 and not NaN -- the same
+    clamp and the same sink term, in `_dattn_kernel`.
+    """
+    if q.stride(-1) != 1:
+        q = q.contiguous()
+    if kv_all.stride(-1) != 1:
+        kv_all = kv_all.contiguous()
+    if mask.stride(-1) != 1:
+        mask = mask.contiguous()
+    return decode_attention(q, kv_all, None, mask, sink, scale, split=1,
+                            block_n=PF_BLOCK_N, block_h=PF_BLOCK_H,
+                            num_warps=PF_WARPS, num_stages=PF_STAGES)
 
 
 def decode_attention_ref(q, kv, mask, sink, scale):
