@@ -12,6 +12,7 @@ import time
 
 from .chain import Chain, EngramSource
 from .leaves import Bandwidth, ModelLeaves
+from .observe import Event, NullObserver, OpContext, now_ns
 from .prefetch import PrefetchStats, Prefetcher
 from .sched import ComputeStream, LoaderService, Policy
 from .store import ExpertSlots, SlotArena
@@ -39,8 +40,12 @@ class Engine:
                  transient_slots: int = 400, n_workers: int = 48, staging: int = 48,
                  expert_read_qd: int = 8, h2d_inflight: int = 8, scale: float = 1.0,
                  leaves=None, calls=(), prefetch=None, discard_wrong_asap: bool = True,
-                 engram=None):
+                 engram=None, observer=None, request_id: int = 0):
         self.policy = policy
+        # ONE observer, threaded to every component. Each emits facts about its OWN transitions;
+        # the observer decides what to record and never influences scheduling.
+        self.obs = observer if observer is not None else NullObserver()
+        self.request_id = request_id
         self.slots = ExpertSlots(lru_slots, transient_slots, policy=evict)
         self.arena = SlotArena(self.slots.n_slots)
         self.compute = ComputeStream()
@@ -51,7 +56,8 @@ class Engine:
             calls, Bandwidth(scale=scale), scale=scale)
         self.loader = LoaderService(self.arena, self.slots, self.compute, policy,
                                     leaves=self.leaves, n_workers=n_workers, staging=staging,
-                                    expert_read_qd=expert_read_qd, h2d_inflight=h2d_inflight, scale=scale)
+                                    expert_read_qd=expert_read_qd, h2d_inflight=h2d_inflight,
+                                    scale=scale, observer=self.obs)
         self.scale = scale
         # THE PREFETCH SEAM. The default predicts nothing, which is the honest baseline: both arms
         # run this identical driver and differ only in what predict() returns. Nothing is granted
@@ -62,7 +68,7 @@ class Engine:
         # Every real happens-before edge of a step, named and waited on even where the for-loop
         # would have provided it. An edge that is only implicit is invisible to a plugged-in
         # component -- see chain.py.
-        self.chain = Chain()
+        self.chain = Chain(observer=self.obs)
         self.engram = engram if engram is not None else EngramSource()
         self._spec: dict[tuple, tuple] = {}     # key -> (slot, gen) still speculative, not yet used
         # Every key the predictor NAMED, including ones already resident. Needed because precision
@@ -95,7 +101,7 @@ class Engine:
             self.c.blocked_s += time.perf_counter() - t0
 
     # ------------------------------------------------------------------ decode
-    def decode_layer(self, layer: int) -> None:
+    def decode_layer(self, layer: int, ctx: OpContext | None = None) -> None:
         """One layer of one decode step.
 
         NOTE ON D3, recorded because it changes what the table can say. At decode the driver cannot
@@ -115,8 +121,18 @@ class Engine:
         # source signals per layer; the driver only waits.
         self.chain.wait("engram", layer)
 
+        ctx = ctx if ctx is not None else OpContext(self.request_id, self.c.steps, layer)
+        e = self.obs.enabled
+        if e:
+            self.obs.emit(Event(now_ns(), "layer_a_start", step=ctx.step, layer=layer))
+        self.obs.gpu_begin("layer_a", ctx)
         route = self._compute(lambda: self.leaves.layer_a(layer))
+        self.obs.gpu_end("layer_a", ctx)
         uniq = route.uniq
+        if e:
+            self.obs.emit(Event(now_ns(), "layer_a_end", step=ctx.step, layer=layer))
+            self.obs.emit(Event(now_ns(), "route_ready", step=ctx.step, layer=layer,
+                                value=len(uniq), aux=uniq))
         # EDGE 2 and 6: A wrote y / route_idx / route_w, and the KV buffers this layer's
         # bookkeeping will clone.
         self.chain.set("y", layer)
@@ -128,6 +144,12 @@ class Engine:
         self._settle_speculation(layer, uniq)
 
         slot_of, to_load, to_wait = self.slots.reserve(layer, uniq, prefill=False)
+        if e:
+            for k, sl, g in to_load:
+                self.obs.emit(Event(now_ns(), "cache_miss", step=ctx.step, layer=layer,
+                                    key=k, slot=sl, gen=g))
+            self.obs.emit(Event(now_ns(), "cache_hit", step=ctx.step, layer=layer,
+                                value=len(uniq) - len(to_load)))
         self.c.fetches += len(to_load)
         self.loader.submit(to_load)
         # A prefetch that has not landed yet is waited on exactly like a demand read. It is not
@@ -162,10 +184,16 @@ class Engine:
         # thing and collapsing them (passing sorted(set(...)) as the input) loses the per-expert
         # ordering and multiplicity that moe_fn needs.
         reads = sorted(set(slot_of.values()))
+        if e:
+            self.obs.emit(Event(now_ns(), "layer_b_start", step=ctx.step, layer=layer))
+        self.obs.gpu_begin("layer_b", ctx)
         # EDGE 3 and 4 are already enforced above: the ids came out of A, and _wait covers both the
         # `slots` mapping and the expert bytes being resident.
         self.chain.wait("y", layer)
         self._compute(lambda: self.leaves.layer_b(layer, route), slots=reads)
+        self.obs.gpu_end("layer_b", ctx)
+        if e:
+            self.obs.emit(Event(now_ns(), "layer_b_end", step=ctx.step, layer=layer))
         self.chain.set("h", layer)            # B wrote h and pre_mix for the next layer
 
     # ------------------------------------------------------------------ prefetch bookkeeping
@@ -181,9 +209,15 @@ class Engine:
             slot, gen = self._spec.pop(key)
             if key in want:
                 self.pf.used += 1               # resident when demanded: the prediction paid
+                if self.obs.enabled:
+                    self.obs.emit(Event(now_ns(), "prefetch_used", layer=layer, key=key,
+                                        slot=slot, gen=gen))
             else:
                 self.pf.wasted += 1
                 wrong.append((key, slot, gen))
+                if self.obs.enabled:
+                    self.obs.emit(Event(now_ns(), "prefetch_wasted", layer=layer, key=key,
+                                        slot=slot, gen=gen))
         if wrong and self.discard_wrong_asap:
             # A wrong prefetch holds a slot AND a pending write, so it blocks eviction as well as
             # occupying capacity. Cancelling recovers the slot for reads that are already known to
@@ -200,11 +234,22 @@ class Engine:
             self._pred.setdefault(k[0], set()).add(k)
         to_load, refused = self.slots.reserve_speculative(keys)
         self.pf.refused += refused
+        if self.obs.enabled:
+            self.obs.emit(Event(now_ns(), "prediction", layer=layer, value=len(keys),
+                                aux=self.prefetch.name))
+            if refused:
+                self.obs.emit(Event(now_ns(), "refused", layer=layer, value=refused))
         if not to_load:
             return
         for key, slot, gen in to_load:
             self._spec[key] = (slot, gen)
         self.pf.issued += len(to_load)
+        if self.obs.enabled:
+            for k, sl, g in to_load:
+                # source_layer / horizon travel with the event, so a prediction's whole life is
+                # readable without inferring it from timestamps.
+                self.obs.emit(Event(now_ns(), "prefetch_issued", layer=k[0], key=k, slot=sl, gen=g,
+                                    aux=(layer, self.prefetch.horizon, self.prefetch.name)))
         self.loader.submit(to_load, speculative=True)
 
     def decode(self, steps: int) -> Counters:
@@ -219,12 +264,17 @@ class Engine:
                 self.chain.wait("logits", step - 1)
             self.chain.reset(keep=("logits",))
             self.engram.issue(range(N_LAYERS), step, self.chain)
+            ctx = OpContext(self.request_id, step, -1)
             for layer in range(N_LAYERS):
-                self.decode_layer(layer)
+                self.decode_layer(layer, ctx.at(layer))
             self.chain.wait("h", N_LAYERS - 1)      # EDGE 7: gF replays after the last layer
             # Per-step GPU work outside the layer loop (head, draft). Zero unless the provider was
             # told that part of the unattributed 78.5 % lives here rather than in a layer.
+            if self.obs.enabled:
+                self.obs.emit(Event(now_ns(), "final_start", step=step))
             self._compute(self.leaves.step_other)
+            if self.obs.enabled:
+                self.obs.emit(Event(now_ns(), "final_end", step=step))
             self.chain.set("logits", step)
             self.c.steps += 1
         self.c.wall_s = time.perf_counter() - t0
@@ -236,12 +286,23 @@ class Engine:
         return self.c
 
     def warm(self, calls, upto: int) -> None:
-        """Bring the cache to the state the scored window starts in, with no I/O and no timing."""
-        for layer, uniq in calls[:upto]:
-            _, to_load, _ = self.slots.reserve(layer, uniq, prefill=False)
-            for key, slot, gen in to_load:
-                self.arena.content[slot] = key
-                self.loader.ready.set(slot, gen)
+        """Bring the cache to the state the scored window starts in, with no I/O and no timing.
+
+        AND NO EVENTS. Warm-up is not in the measured window; emitting from it flooded a trace with
+        ~13,000 slot_ready events for 172 real loads and would have made any counter meaningless.
+        """
+        obs, self.obs = self.obs, NullObserver()
+        self.loader.obs = self.loader.ready.obs = self.loader.stage.obs = self.obs
+        try:
+            for layer, uniq in calls[:upto]:
+                _, to_load, _ = self.slots.reserve(layer, uniq, prefill=False)
+                for key, slot, gen in to_load:
+                    self.arena.content[slot] = key
+                    self.loader.ready.set(slot, gen)
+        finally:
+            self.obs = obs
+            self.loader.obs = self.loader.ready.obs = self.loader.stage.obs = obs
+            self.chain.obs = obs
 
     # ------------------------------------------------------------------ prefill
     def prefill_chunked(self, layer: int, chunks) -> None:

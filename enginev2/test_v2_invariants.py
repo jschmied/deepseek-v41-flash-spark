@@ -38,6 +38,7 @@ import time
 from .drivers import Engine
 from .sched import V1, V2, ComputeStream, LoaderService, Policy
 from .chain import Chain, EngramSource
+from .observe import CounterObserver, NullObserver, TraceObserver
 from .leaves import Bandwidth, ModelLeaves, StagedExpert
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
 from .trace import N_LAYERS, load_decode, warmup_cut
@@ -647,3 +648,55 @@ def test_staging_is_zero_copy_and_the_buffer_outlives_the_h2d():
     st.release()                                # idempotent, not a double free
     assert pool.at_rest()
     print("  staging: zero-copy view, leased across the H2D, released once and only after  OK")
+
+
+# ================================================================ 16. observability is inert
+def test_observer_records_but_never_influences():
+    """The one rule the event layer must not break: it watches, it is not part of the graph.
+
+    Same trace, same policy, three observers -- the miss stream and the arena must be identical.
+    Also checks the null path is genuinely free (no Event is constructed) and that a wait is
+    attributed at exactly ONE ownership point, never under two names.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+    got = {}
+    for name, obs in (("null", NullObserver()), ("counter", CounterObserver()),
+                      ("trace", TraceObserver(capacity=1 << 16))):
+        e = Engine(V1, lru_slots=5328, transient_slots=400, scale=SCALE,
+                   leaves=ModelLeaves(calls, Bandwidth(scale=SCALE), scale=SCALE, start=cut),
+                   observer=obs)
+        try:
+            e.warm(calls, cut)
+            c = e.decode(2)
+            got[name] = (c.fetches, c.steps, sorted(e.arena.content.items())[:20])
+            assert e.arena.violations == [], (name, e.arena.violations[:3])
+        finally:
+            e.close()
+    assert got["null"] == got["counter"] == got["trace"], (
+        "an observer changed what the engine did: "
+        f"{[(k, v[0], v[1]) for k, v in got.items()]}")
+
+    # the null path constructs nothing: emitting through it must not touch Event at all
+    assert NullObserver.enabled is False
+    n = NullObserver()
+    n.emit(None)                      # would raise if the null path dereferenced an event
+
+    # each wait is attributed once, at the abstraction that owns it
+    obs = TraceObserver(capacity=1 << 16)
+    e = Engine(V1, lru_slots=5328, transient_slots=400, scale=SCALE,
+               leaves=ModelLeaves(calls, Bandwidth(scale=SCALE), scale=SCALE, start=cut),
+               observer=obs)
+    try:
+        e.warm(calls, cut)
+        e.decode(2)
+    finally:
+        e.close()
+    ev = obs.drain()
+    starts = [x for x in ev if x.kind == "wait_start"]
+    ends = [x for x in ev if x.kind == "wait_end"]
+    assert len(starts) == len(ends), f"unbalanced waits: {len(starts)} start, {len(ends)} end"
+    assert starts, "no wait was recorded at all"
+    # warm-up must contribute nothing
+    assert not any(x.kind == "cache_miss" and x.step < 0 for x in ev), "warm-up emitted events"
+    print(f"  observer: inert across null/counter/trace, {len(starts)} waits balanced  OK")

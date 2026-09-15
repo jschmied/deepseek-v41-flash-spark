@@ -43,6 +43,7 @@ import threading
 import time
 
 from .leaves import Bandwidth, ModelLeaves
+from .observe import Event, NullObserver, WaitReason, now_ns
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
 
 
@@ -123,7 +124,8 @@ class LoaderService:
     def __init__(self, arena: SlotArena, slots: ExpertSlots, compute: ComputeStream,
                  policy: Policy, leaves=None, n_workers: int = 48, staging: int = 48,
                  expert_read_qd: int = 8, h2d_inflight: int = 8, scale: float = 1.0,
-                 fail: set | None = None):
+                 fail: set | None = None, observer=None):
+        self.obs = observer if observer is not None else NullObserver()
         self.arena = arena
         self.slots = slots
         self.compute = compute
@@ -134,8 +136,8 @@ class LoaderService:
         # reader of it must tolerate None.
         self.leaves = leaves if leaves is not None else _default_leaves(scale)
         self.bw = getattr(self.leaves, "bw", None)
-        self.stage = StagingPool(staging)
-        self.ready = SlotReady()
+        self.stage = StagingPool(staging, observer=self.obs)
+        self.ready = SlotReady(observer=self.obs)
         self.scale = scale
         # FOUR SEPARATE RESOURCES. They were conflated: one semaphore named `device_queue_depth`
         # sat around the H2D, so it bounded device copies while every worker could enter the NVMe
@@ -218,23 +220,64 @@ class LoaderService:
         try:
             if key in self.fail:
                 raise IOError(f"injected NVMe failure {key}")
-            self.read_qd.acquire()                 # admission to the device
+            if self.obs.enabled and self.read_qd._value == 0:
+                self.obs.emit(Event(now_ns(), "wait_start", key=key, slot=slot, gen=gen,
+                                    aux=WaitReason.NVME_ADMISSION))
+                self.read_qd.acquire()
+                self.obs.emit(Event(now_ns(), "wait_end", key=key, slot=slot, gen=gen,
+                                    aux=WaitReason.NVME_ADMISSION))
+            else:
+                self.read_qd.acquire()     # admission to the device
             permit_held = True
+            # The FRAMEWORK brackets the provider's call. A provider performs the operation; only
+            # the caller knows when it was queued, began and ended, so measurement semantics stay
+            # put when the provider is swapped.
+            if self.obs.enabled:
+                self.obs.emit(Event(now_ns(), "nvme_start", key=key, slot=slot, gen=gen))
             staged = self.leaves.read(key, self.stage)
+            if self.obs.enabled:
+                self.obs.emit(Event(now_ns(), "nvme_end", key=key, slot=slot, gen=gen))
             if not self.policy.lease_until_completion:
                 # D2 OFF: give the ADMISSION back now. Another read may enter the device while this
                 # expert's buffer waits on its copy. The buffer itself stays ours until H2D done.
                 self.read_qd.release()
                 permit_held = False
-            if self.policy.compute_barrier_global:
-                self.compute.wait_idle()          # D1 ON: wait for ALL compute
+            # D1 ON is a COMPUTE barrier; D3's wait_all is the global READ barrier. Tagging both
+            # GLOBAL_BARRIER made one wait appear under another's name -- the double-counting the
+            # ownership-point rule exists to prevent.
+            reason = (WaitReason.COMPUTE_BARRIER if self.policy.compute_barrier_global
+                      else WaitReason.SLOT_READER)
+            if self.obs.enabled:
+                self.obs.emit(Event(now_ns(), "wait_start", key=key, slot=slot, gen=gen, aux=reason))
+            try:
+                if self.policy.compute_barrier_global:
+                    self.compute.wait_idle()          # D1 ON: wait for ALL compute
+                else:
+                    self.compute.wait_slot_free(slot)  # D1 OFF: only this slot's previous reader
+            finally:
+                if self.obs.enabled:
+                    self.obs.emit(Event(now_ns(), "wait_end", key=key, slot=slot, gen=gen,
+                                        aux=reason))
+            if self.obs.enabled and self.h2d_sem._value == 0:
+                self.obs.emit(Event(now_ns(), "wait_start", key=key, slot=slot, gen=gen,
+                                    aux=WaitReason.H2D_CAPACITY))
+                self.h2d_sem.acquire()
+                self.obs.emit(Event(now_ns(), "wait_end", key=key, slot=slot, gen=gen,
+                                    aux=WaitReason.H2D_CAPACITY))
             else:
-                self.compute.wait_slot_free(slot)  # D1 OFF: only this slot's previous reader
-            with self.h2d_sem:
+                self.h2d_sem.acquire()
+            try:
                 with self.arena.writing(slot, key):
+                    if self.obs.enabled:
+                        self.obs.emit(Event(now_ns(), "h2d_start", key=key, slot=slot, gen=gen))
                     t0 = time.perf_counter()
                     self.leaves.h2d(slot, key, staged)
                     dt = time.perf_counter() - t0
+                    if self.obs.enabled:
+                        self.obs.emit(Event(now_ns(), "h2d_end", key=key, slot=slot, gen=gen,
+                                            value=dt))
+            finally:
+                self.h2d_sem.release()
             with self._lk:
                 self.h2d_calls += 1
                 self.h2d_s += dt
@@ -275,6 +318,10 @@ class LoaderService:
         self.slots.mark_pending(to_load)
         for key, slot, gen in to_load:
             self.ready.arm(slot, gen)
+        if self.obs.enabled:
+            for key, slot, gen in to_load:
+                self.obs.emit(Event(now_ns(), "load_queued", key=key, slot=slot, gen=gen,
+                                    aux="spec" if speculative else "demand"))
         prio = 1 if speculative else 0
         if not speculative:
             with self._demand_cv:
@@ -313,10 +360,24 @@ class LoaderService:
             raise err
 
     def wait_all(self, timeout: float = 60.0) -> None:
-        """The global barrier: every pending DEMAND read, whether or not this consumer needs it."""
+        """The global barrier: every pending DEMAND read, whether or not this consumer needs it.
+
+        Instrumented here because this is where D3 actually costs something. It was invisible, and
+        its absence made the wait table read as if nothing blocked at all -- every later per-slot
+        wait found its data already there, because this had drained the queue first.
+        """
         with self._demand_cv:
-            if not self._demand_cv.wait_for(lambda: self._demand == 0, timeout):
-                raise TimeoutError("global barrier never drained")
+            if self._demand == 0:
+                return
+            if self.obs.enabled:
+                self.obs.emit(Event(now_ns(), "wait_start", value=self._demand,
+                                    aux=WaitReason.GLOBAL_BARRIER))
+            try:
+                if not self._demand_cv.wait_for(lambda: self._demand == 0, timeout):
+                    raise TimeoutError("global barrier never drained")
+            finally:
+                if self.obs.enabled:
+                    self.obs.emit(Event(now_ns(), "wait_end", aux=WaitReason.GLOBAL_BARRIER))
 
     def shutdown(self) -> None:
         for _ in self.workers:

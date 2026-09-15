@@ -16,6 +16,8 @@ import collections
 import contextlib
 import threading
 
+from .observe import Event, NullObserver, WaitReason, now_ns
+
 N_EXPERTS = 384
 # ---------------------------------------------------------------------------
 # Eviction: an interface, not a flag.
@@ -196,7 +198,8 @@ class StagingPool:
     is checked by object, so the test survives the substitution.
     """
 
-    def __init__(self, n: int, nbytes: int = 4096):
+    def __init__(self, n: int, nbytes: int = 4096, observer=None):
+        self.obs = observer if observer is not None else NullObserver()
         self.n = n
         self.nbytes = nbytes
         self._sem = threading.Semaphore(n)
@@ -243,7 +246,14 @@ class StagingPool:
             return sid in self._leased
 
     def acquire(self) -> int:
-        self._sem.acquire()
+        # The lease is the ownership point for STAGING_BUFFER waits: whoever blocks here is blocked
+        # on a pinned buffer, whatever they meant to do with it.
+        if self.obs.enabled and self._sem._value == 0:
+            self.obs.emit(Event(now_ns(), "wait_start", aux=WaitReason.STAGING_BUFFER))
+            self._sem.acquire()
+            self.obs.emit(Event(now_ns(), "wait_end", aux=WaitReason.STAGING_BUFFER))
+        else:
+            self._sem.acquire()
         with self._lk:
             sid = self.free.pop()
             self._leased.add(sid)
@@ -291,7 +301,8 @@ class SlotReady:
     is exact for the same reason and is naturally recycled.
     """
 
-    def __init__(self):
+    def __init__(self, observer=None):
+        self.obs = observer if observer is not None else NullObserver()
         self._lk = threading.Lock()
         self._cv = threading.Condition(self._lk)
         self._done: set[tuple] = set()       # (slot, generation) pairs that have completed
@@ -302,6 +313,8 @@ class SlotReady:
         pass
 
     def set(self, slot: int, gen: int, err: BaseException | None = None) -> None:
+        if self.obs.enabled:
+            self.obs.emit(Event(now_ns(), "slot_ready", slot=slot, gen=gen, aux=err))
         with self._lk:
             self._done.add((slot, gen))
             if err is not None:
@@ -310,8 +323,17 @@ class SlotReady:
 
     def wait(self, slot: int, gen: int, timeout: float | None = None) -> None:
         with self._lk:
-            if not self._cv.wait_for(lambda: (slot, gen) in self._done, timeout):
-                raise TimeoutError(f"slot {slot} gen {gen} never became ready")
+            blocked = (slot, gen) not in self._done
+            if blocked and self.obs.enabled:
+                self.obs.emit(Event(now_ns(), "wait_start", slot=slot, gen=gen,
+                                    aux=WaitReason.EXPERT_DATA))
+            try:
+                if not self._cv.wait_for(lambda: (slot, gen) in self._done, timeout):
+                    raise TimeoutError(f"slot {slot} gen {gen} never became ready")
+            finally:
+                if blocked and self.obs.enabled:
+                    self.obs.emit(Event(now_ns(), "wait_end", slot=slot, gen=gen,
+                                        aux=WaitReason.EXPERT_DATA))
             err = self._err.get((slot, gen))
         if err is not None:
             raise err

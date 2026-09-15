@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import threading
 
+from .observe import Event, NullObserver, WaitReason, now_ns
+
 
 class Chain:
     """Named happens-before edges, keyed by (name, index). One-shot, monotonic within a step.
@@ -52,10 +54,13 @@ class Chain:
     which is not a special case worth branching on at the call site.
     """
 
-    def __init__(self):
+    def __init__(self, observer=None):
         self._lk = threading.Lock()
         self._cv = threading.Condition(self._lk)
         self._done: set = set()
+        # The edge abstraction owns its own instrumentation: every caller of wait() is covered by
+        # this one site, so a blocked edge is never also counted by whoever asked for it.
+        self.obs = observer if observer is not None else NullObserver()
         # Two different numbers, and the difference is the finding. `checks` counts every edge the
         # driver actually reached; `blocks` counts the ones that were not yet satisfied. Today
         # blocks is ZERO on a healthy run: the driver is strictly sequential, so every edge is
@@ -76,17 +81,30 @@ class Chain:
         with self._lk:
             self._done.add((name, index))
             self._cv.notify_all()
+        if self.obs.enabled:
+            self.obs.emit(Event(now_ns(), "edge_set", layer=index, aux=name))
 
     def wait(self, name: str, index: int = -1, timeout: float = 60.0) -> None:
         if index < 0 and name in _PER_LAYER:
             return                     # no predecessor: layer 0
         with self._lk:
             self.checks += 1
+            if self.obs.enabled:
+                self.obs.emit(Event(now_ns(), "edge_check", layer=index, aux=name))
             if (name, index) in self._done:
                 return
             self.blocks += 1
-            if not self._cv.wait_for(lambda: (name, index) in self._done, timeout):
-                raise TimeoutError(f"edge {name}@{index} never satisfied")
+            if self.obs.enabled:
+                self.obs.emit(Event(now_ns(), "wait_start", layer=index,
+                                    aux=WaitReason.ENGRAM if name == "engram" else WaitReason.CHAIN))
+            try:
+                if not self._cv.wait_for(lambda: (name, index) in self._done, timeout):
+                    raise TimeoutError(f"edge {name}@{index} never satisfied")
+            finally:
+                if self.obs.enabled:
+                    self.obs.emit(Event(now_ns(), "wait_end", layer=index,
+                                        aux=WaitReason.ENGRAM if name == "engram"
+                                        else WaitReason.CHAIN))
 
     def is_set(self, name: str, index: int = -1) -> bool:
         with self._lk:
