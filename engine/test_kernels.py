@@ -27,8 +27,12 @@ from fp4_linear import (FP4GroupedWeight, fp4_grouped_linear,  # noqa: E402
                         quantize_fp8_grouped_to_fp4)
 from decode_attn import decode_attention, decode_attention_ref  # noqa: E402
 from fp32_skinny import skinny_linear  # noqa: E402
+from engine import _testenv as ET  # noqa: E402
 
-MD = os.environ.get("MODEL_DIR", os.path.expanduser("~/models/DeepSeek-V4.1-Flash"))
+# ~models/DeepSeek-V4.1-Flash stopped existing when the box moved to dsv41-lean; wo_a/config.json
+# are dense weights that ARE still present there (see .env's DSV41_DENSE_FP4), so this only needs
+# MODEL_DIR, not the CB3 cache or the deleted routed-expert shards.
+MD = ET.env("MODEL_DIR", os.path.expanduser("~/dsv41-lean"))
 fails = []
 
 

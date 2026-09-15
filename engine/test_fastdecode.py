@@ -2,10 +2,14 @@
 import os, sys, time, json, torch
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.join(HERE, ".."))
 os.environ.setdefault("DSV41_FAST", "0")
+from engine import _testenv as ET
 from engine.v41_engine import V41Engine, log
 from engine.fastdecode import FastDecoder
-md = os.environ.get("MODEL_DIR", os.path.expanduser("~/models/DeepSeek-V4.1-Flash"))
+md = ET.env("MODEL_DIR", os.path.expanduser("~/dsv41-lean"))
 keep = float(os.environ.get("KEEP", "0.25"))
+# This is a full 40-layer engine load (weights + arena + KV, tens of GB) -- skip cleanly rather
+# than contend with whatever else is already using this unified-memory box's GPU/host pool.
+ET.require_memory_or_skip(60, "test_fastdecode (full 40-layer V41Engine)")
 eng = V41Engine(md, max_seq=8192, trace_stats="results/trace-full-20260910/stats/coverage.json", spec=True, prune_keep=keep,
                 arena_gb=float(os.environ.get("ARENA_GB", 0)) or None, transient_slots=int(os.environ.get("TRANSIENT_SLOTS", 400)),
                 keep_free_gb=float(os.environ.get("KEEP_FREE_GB", 20)), expert_format=os.environ.get("EXPERT_FORMAT", "fp4"))

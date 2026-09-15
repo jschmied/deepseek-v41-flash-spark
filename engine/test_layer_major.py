@@ -21,6 +21,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 
+from engine import _testenv as ET  # noqa: E402
 from engine.v41_engine import V41Engine, log  # noqa: E402
 
 import sys as _s
@@ -39,7 +40,7 @@ def run(eng, ids, max_tokens):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-dir", default=os.path.expanduser("~/dsv41-lean"))
+    ap.add_argument("--model-dir", default=ET.env("MODEL_DIR", os.path.expanduser("~/dsv41-lean")))
     ap.add_argument("--max-tokens", type=int, default=60)
     ap.add_argument("--engine-kwargs", default="{}")
     a = ap.parse_args()
@@ -49,6 +50,10 @@ def main() -> int:
         kw.setdefault("expert_format", "cb3")
     kw.setdefault("transient_slots", 400)
     kw.setdefault("keep_free_gb", 6.0)
+
+    # This runs a full 40-layer engine TWICE (chunk-major then layer-major), tens of GB each time --
+    # skip cleanly rather than contend with whatever else is already using this unified-memory box.
+    ET.require_memory_or_skip(60, "test_layer_major (two full 40-layer V41Engine loads)")
 
     import engine.v41_engine as E
     eng = V41Engine(a.model_dir, max_seq=32768, **kw)

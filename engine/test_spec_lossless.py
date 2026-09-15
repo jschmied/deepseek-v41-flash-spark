@@ -18,6 +18,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 
+from engine import _testenv as ET  # noqa: E402
 from engine.v41_engine import V41Engine, log  # noqa: E402
 
 PROMPTS = [
@@ -60,12 +61,21 @@ def _wait_for_host_memory(min_gb: float, timeout_s: float = 300.0) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-dir", default=os.path.expanduser("~/models/DeepSeek-V4.1-Flash"))
+    ap.add_argument("--model-dir", default=ET.env("MODEL_DIR", os.path.expanduser("~/dsv41-lean")))
     ap.add_argument("--max-tokens", type=int, default=120)
     ap.add_argument("--engine-kwargs", default="{}")
     a = ap.parse_args()
     kw = json.loads(a.engine_kwargs)
     kw.setdefault("trace_stats", "results/trace-full-20260910/stats/coverage.json")
+    # The routed-expert shards this needs for a raw "fp4" load are gone for layers 0-39 (see
+    # .env); this box's working format is the CB3 cache.
+    kw.setdefault("expert_format", os.environ.get("EXPERT_FORMAT", "cb3"))
+
+    # Two full 40-layer engine loads, tens of GB each (the second waits for the first's memory to
+    # come back, see _wait_for_host_memory below) -- refuse to even start the first one next to
+    # another job that is already holding most of this unified-memory box, rather than either OOM
+    # it or sit in _wait_for_host_memory's loop for 300s and load anyway.
+    ET.require_memory_or_skip(90, "test_spec_lossless (two full 40-layer V41Engine loads)")
 
     outs = {}
     for spec in (False, True):

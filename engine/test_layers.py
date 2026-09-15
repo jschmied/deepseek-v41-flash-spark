@@ -16,16 +16,24 @@ HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.jo
 from engine.model import Caches, Model, Weights
 from engine import experts as EX, moe_fallback as K
 from engine.engram import make_hash_state
+from engine import _testenv as ET
 import numpy as np
 import v41_ref as R
 
-md = os.environ.get("MODEL_DIR") or "./models/DeepSeek-V4.1-Flash"; dev = "cuda"
+md = ET.env("MODEL_DIR", os.path.expanduser("~/dsv41-lean")); dev = "cuda"
+# The arena alone is ~1600 * 13.8 MB =~ 22 GB, on top of 4 layers of dense weights and KV --
+# tens of GB on a unified-memory box, so do not attempt this next to another job that already
+# holds most of it (see MEMORY.md: GB10 OOM protection).
+ET.require_memory_or_skip(30, "test_layers (4-layer smoke test, ~22 GB expert arena + weights)")
 index = json.load(open(f"{md}/model.safetensors.index.json"))
 args = R.Args.from_json(f"{md}/inference/config.json")
 NL = 4
 SEQS = [0, 5, 20]
 W = Weights(md, index, args, dev, act_quant=True, n_layers=NL, load_mtp=False)
 arena = K.ExpertArena(1600, dev)
+# DSV41_CB3_CACHE (from .env) makes the store's resolve()/forward path read the routed experts
+# from the CB3 cache instead of the raw shards -- those shards are gone for layers 0-3 (see
+# build_reference() below, which still needs them and degrades instead of crashing).
 store = EX.ExpertStore(md, index, arena, NL, transient_slots=400, io_threads=8)
 caches = Caches(args, 4096, dev)
 m = Model(W, store, caches, K.moe_forward, act_quant=True)
@@ -88,10 +96,21 @@ elif os.path.exists(REF_CACHE):
     ref_h = torch.load(REF_CACHE, map_location="cpu")
 else:
     print(f"no reference state (expert_trace has moved past layer {NL - 1}); computing one ...")
-    t0 = time.time(); ref_h = build_reference()
-    os.makedirs(os.path.dirname(REF_CACHE), exist_ok=True)
-    torch.save(ref_h, REF_CACHE)
-    print(f"reference built and cached in {REF_CACHE} ({time.time() - t0:.0f}s)")
+    try:
+        t0 = time.time(); ref_h = build_reference()
+        os.makedirs(os.path.dirname(REF_CACHE), exist_ok=True)
+        torch.save(ref_h, REF_CACHE)
+        print(f"reference built and cached in {REF_CACHE} ({time.time() - t0:.0f}s)")
+    except FileNotFoundError as e:
+        # build_reference() dequantizes experts straight from the raw shards for layers 0-3
+        # (model-00003..00006), which were converted into the CB3 cache and deleted -- CB3 only
+        # helps the arena-backed forward path below (store.resolve()), not this naive one. Without
+        # a cached reference (checked above) there is no ground truth left on this box for those
+        # layers; report that honestly instead of crashing, and still run the self-consistency
+        # checks below (chunk-invariance and rollback), which need no ground truth at all.
+        print(f"NO GROUND TRUTH: {e} -- raw shards for layers 0-{NL - 1} are gone from this box "
+              f"(see .env). 'vs ref' below will read N/A; chunk-invariance and rollback still run.")
+        ref_h = None
 
 
 # ------------------------------------------------------------------ runs
@@ -132,7 +151,8 @@ for i in SEQS:
         if e >= 0.01:
             fails.append((sid, ch, e))
     two = dict((tuple(c), e) for c, e in errs)
-    print(f"{sid}: T={T} single-chunk vs ref rel err {rel(h1, ref_h[i]):.4f}  "
+    vs_ref = f"{rel(h1, ref_h[i]):.4f}" if ref_h is not None else "N/A (no raw shards, see above)"
+    print(f"{sid}: T={T} single-chunk vs ref rel err {vs_ref}  "
           f"two-chunk vs single {two[(T // 3, T - T // 3)]:.4f}  "
           f"odd-chunks vs single {max(e for c, e in errs if len(c) > 2) if T > 20 else two[(1, T - 1)]:.4f}  "
           f"worst of {len(errs)} splittings {max(e for _, e in errs):.4f}  ({dt:.1f}s)")
