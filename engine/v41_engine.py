@@ -431,7 +431,24 @@ class V41Engine:
             # `reserve` lets the factor shrink the reservation too, which under-reserves by ~1.3 GB
             # of the 7.2 GB it is supposed to be holding back.
             _ss = int(os.environ.get("DSV41_CB3_SCRATCH_SLOTS", 0)) if self.expert_format == "cb3" else 0
-            arena_gb = max(10.0, (budget - reserve) / 1e9 * 0.82 - _ss * 18_800_640 / 1e9)
+            # The sizer must leave room for the SAME prefill chunk the refusal check below reserves.
+            # It used to reserve only `reserve` (~9 GB of activations and page-cache headroom) while
+            # the check reserved max(keep_free, MAX_CHUNK * 5e6) -- 20.5 GB at chunk 4096. So the
+            # auto arena came out 83.1 GB at BOTH chunk 2048 and 4096, and under sustained load the
+            # 4096 arm fell to 4 GiB MemAvailable and the watchdog stopped the server (job 150,
+            # 2026-09-15). Sizing for one request while the runtime needs twice that is the bug.
+            # Subtract every known term EXPLICITLY instead of taking 82 % of the remainder. The
+            # 0.82 was a fudge that reserves nothing in particular: at chunk 2048 it still produced
+            # an 82.0 GB arena that fell to 7 GiB MemAvailable by the third sustained cycle and the
+            # watchdog stopped the server (job 150, both attempts). Chunk size was never the cause --
+            # the sizer over-allocates at any chunk, because the slack it leaves is a percentage
+            # rather than the sum of what actually gets allocated later.
+            #   reserve            activations + indexer slices + page-cache headroom (~9 GB)
+            #   MAX_CHUNK * 5e6    one prefill chunk, the same term the refusal check uses
+            #   keep_free_gb       what the box must still have free (watchdog floor is 8 GiB)
+            #   _ss * 18.8 MB      the CB3 unpack scratch, allocated lazily at the first prefill
+            arena_gb = max(10.0, (budget - reserve - MAX_CHUNK * 5e6 - keep_free_gb * 1e9
+                                  - _ss * 18_800_640) / 1e9)
         if host_avail is not None:
             cap = (host_avail - keep_free_gb * 1e9) / 1e9
             if cap < 10.0:
