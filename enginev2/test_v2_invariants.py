@@ -75,7 +75,7 @@ def test_no_torn_slot_under_concurrent_submission():
     and no load writes a slot while a consumer reads it."""
     e = mk()
     try:
-        _, to_load = e.slots.reserve(0, tuple(range(12)), prefill=False)
+        _, to_load, _ = e.slots.reserve(0, tuple(range(12)), prefill=False)
         e.loader.submit(to_load)
         e.loader.wait_slots(to_load)
         assert e.arena.violations == [], e.arena.violations
@@ -95,7 +95,7 @@ def test_no_torn_slot_decode_lru_eviction():
     e = mk(lru_slots=64, transient_slots=8)
     try:
         for layer, uniq in calls[:80]:
-            _, to_load = e.slots.reserve(layer, uniq[:10], prefill=False)
+            _, to_load, _ = e.slots.reserve(layer, uniq[:10], prefill=False)
             e.loader.submit(to_load)
             e.loader.wait_slots(to_load)
         assert e.arena.violations == [], e.arena.violations[:4]
@@ -128,14 +128,14 @@ def test_lease_conservation_normal_and_under_failure():
     s = threading.Thread(target=sampler, daemon=True)
     s.start()
     try:
-        _, to_load = e.slots.reserve(0, tuple(range(20)), prefill=False)
+        _, to_load, _ = e.slots.reserve(0, tuple(range(20)), prefill=False)
         e.loader.submit(to_load)
         e.loader.wait_slots(to_load)
         assert e.loader.stage.at_rest(), "leases not at rest after 20 clean loads"
 
         # the read raises, inside the lease
         e.loader.fail.update({(1, 4), (1, 9)})
-        _, to_load = e.slots.reserve(1, tuple(range(12)), prefill=False)
+        _, to_load, _ = e.slots.reserve(1, tuple(range(12)), prefill=False)
         e.loader.submit(to_load)
         err = None
         try:
@@ -160,14 +160,14 @@ def test_lease_released_at_handoff_is_still_conserved():
     let two loads share one staging buffer, which is the torn-slot bug with extra steps."""
     e = mk(Policy(False, False, False, False), staging=4, n_workers=4, lru_slots=32)
     try:
-        _, to_load = e.slots.reserve(0, tuple(range(16)), prefill=False)
+        _, to_load, _ = e.slots.reserve(0, tuple(range(16)), prefill=False)
         e.loader.submit(to_load)
         e.loader.wait_slots(to_load)
         assert e.loader.stage.at_rest(), (e.loader.stage.free, e.loader.stage.sem_value)
         assert e.loader.stage.sem_value == e.loader.stage.n
         # and under failure, where the release-at-handoff path and the finally path could both fire
         e.loader.fail.update({(2, 3)})
-        _, to_load = e.slots.reserve(2, (1, 2, 3, 4), prefill=False)
+        _, to_load, _ = e.slots.reserve(2, (1, 2, 3, 4), prefill=False)
         e.loader.submit(to_load)
         try:
             e.loader.wait_slots(to_load)
@@ -190,7 +190,7 @@ def test_driver_must_not_wait_for_a_slot_inside_a_compute_region():
     """
     e = mk(Policy(False, True, False, False), n_workers=2, staging=2)
     try:
-        _, to_load = e.slots.reserve(0, (1, 2), prefill=False)
+        _, to_load, _ = e.slots.reserve(0, (1, 2), prefill=False)
         e.loader.submit(to_load)
 
         def bad_driver():
@@ -223,7 +223,7 @@ def test_wait_completes_even_when_a_load_raises():
     """
     e = mk(lru_slots=32, fail={(3, 2), (3, 5)})
     try:
-        _, to_load = e.slots.reserve(3, (0, 1, 2, 3, 4, 5, 6), prefill=False)
+        _, to_load, _ = e.slots.reserve(3, (0, 1, 2, 3, 4, 5, 6), prefill=False)
         e.loader.submit(to_load)
         err = None
         try:
@@ -254,9 +254,9 @@ def test_cross_layer_pending_is_safe_by_generation():
     """
     e = mk(lru_slots=16, transient_slots=8)
     try:
-        _, a = e.slots.reserve(0, tuple(range(6)), prefill=False)
+        _, a, _ = e.slots.reserve(0, tuple(range(6)), prefill=False)
         e.loader.submit(a)
-        _, b = e.slots.reserve(1, tuple(range(6)), prefill=False)     # spans layers: legal in v2
+        _, b, _ = e.slots.reserve(1, tuple(range(6)), prefill=False)     # spans layers: legal in v2
         e.loader.submit(b)
         assert not ({s for _, s, _ in a} & {s for _, s, _ in b}), (
             "layer 1 was handed a slot layer 0 is still writing")
@@ -277,7 +277,7 @@ def test_cross_layer_pending_is_safe_by_generation():
     # never protected this: they keep a consumer off a stale tenant, they do not serialise producers.
     e = mk(lru_slots=8, transient_slots=8)
     try:
-        _, a = e.slots.reserve(0, tuple(range(6)), prefill=False)
+        _, a, _ = e.slots.reserve(0, tuple(range(6)), prefill=False)
         e.loader.submit(a)
         try:
             e.slots.reserve(1, tuple(range(6)), prefill=False)
@@ -296,7 +296,7 @@ def test_generation_is_what_makes_cross_layer_safe():
     slot that has been recycled returns before its new tenant has landed."""
     e = mk()
     try:
-        _, to_load = e.slots.reserve(0, (1,), prefill=False)
+        _, to_load, _ = e.slots.reserve(0, (1,), prefill=False)
         key, slot, gen = to_load[0]
         e.loader.ready.arm(slot, gen)
         e.loader.ready.set(slot, gen - 1)             # a previous tenant completing
@@ -333,7 +333,7 @@ def test_barrier_sits_between_the_read_and_the_arena_write():
             e.compute.wait_idle = lambda *a, _r=real_idle: (order.append("wait_idle"), _r(*a))[1]
             e.compute.wait_slot_free = lambda *a, _r=real_slot: (order.append("wait_slot"), _r(*a))[1]
             e.arena.writing = lambda s, k, _r=real_writing: (order.append("h2d"), _r(s, k))[1]
-            _, to_load = e.slots.reserve(0, (7,), prefill=False)
+            _, to_load, _ = e.slots.reserve(0, (7,), prefill=False)
             e.loader.submit(to_load)
             e.loader.wait_slots(to_load)
             assert order == ["read", want, "h2d"], (pol.name, order)
@@ -356,7 +356,7 @@ def test_per_slot_barrier_removes_v1s_cross_layer_overlap():
     def attempt(policy, barrier_off_mutation: bool):
         e = mk(policy, lru_slots=8, transient_slots=8, n_workers=4, staging=4)
         try:
-            _, first = e.slots.reserve(0, tuple(range(8)), prefill=False)
+            _, first, _ = e.slots.reserve(0, tuple(range(8)), prefill=False)
             e.loader.submit(first)
             e.loader.wait_slots(first)
             slot0 = first[0][1]
@@ -373,7 +373,7 @@ def test_per_slot_barrier_removes_v1s_cross_layer_overlap():
             assert started.wait(5)
             e.slots.lru.clear()
             e.slots.free_lru = [slot0]                 # force layer 1 onto layer 0's slot
-            _, second = e.slots.reserve(1, (0,), prefill=False)
+            _, second, _ = e.slots.reserve(1, (0,), prefill=False)
             assert second[0][1] == slot0
             if barrier_off_mutation:
                 e.compute.wait_slot_free = lambda *a, **k: None

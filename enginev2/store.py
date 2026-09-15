@@ -17,7 +17,120 @@ import contextlib
 import threading
 
 N_EXPERTS = 384
-EVICT_POLICIES = ("lru", "age_over_freq")
+# ---------------------------------------------------------------------------
+# Eviction: an interface, not a flag.
+# ---------------------------------------------------------------------------
+#
+# This used to be a two-valued string dispatched through `if self._afq:` at six sites, so a third
+# policy meant editing all six. A policy is now an object owning its own bookkeeping, and the one
+# thing that makes the swap safe is that phase1 is an EXACT reproduction gate: lru must still give
+# 92.67 % / 64.6 / 849 and age_over_freq 94.07 % / 52.3 / 687, bit for bit.
+#
+# `victim(residents, protected)` returns the KEY to evict, or None if it cannot. `protected` covers
+# both slots promised earlier in this call and slots with a write in flight -- a policy never needs
+# to know which, only that it may not touch them.
+
+
+class EvictionPolicy:
+    """Bookkeeping for one cache region. All hooks are called with the store's lock held."""
+
+    name = "abstract"
+
+    def on_hit(self, key: tuple, slot: int, clock: int) -> None:
+        """A resident was used. `clock` is the store's logical time (decode resolves only)."""
+
+    def on_insert(self, key: tuple, slot: int, clock: int) -> None:
+        """A key became resident in `slot`."""
+
+    def on_drop(self, key: tuple) -> None:
+        """A key stopped being resident (evicted, or un-mapped after a torn read)."""
+
+    def victim(self, residents: "collections.OrderedDict", protected: frozenset,
+               clock: int) -> tuple | None:
+        raise NotImplementedError
+
+
+class LRUPolicy(EvictionPolicy):
+    """Least-recently-used. The residents dict is already in LRU order, so the head wins."""
+
+    name = "lru"
+
+    def victim(self, residents, protected, clock):
+        for k, slot in residents.items():
+            if slot not in protected:
+                return k
+        return None
+
+
+class AgeOverFreqPolicy(EvictionPolicy):
+    """EXACT global argmax of age/(1+count), in O(#distinct use counts).
+
+    Within a count bucket the count is constant, so that bucket's maximum age is its LRU head -- the
+    global winner is the best of the bucket heads. ~228 comparisons per eviction at 5,328 slots,
+    verified bit-identical to the brute-force scan offline. This is what makes 94.07 % / 52.3
+    affordable at all.
+
+    `_use_count` and `_last_acc` survive eviction ON PURPOSE, exactly as the offline replay's
+    per-key stats do: an expert that comes back from NVMe comes back with its history, and that is
+    the only way a use count means anything when 5,328 slots cover 15,360 pairs.
+    """
+
+    name = "age_over_freq"
+
+    def __init__(self):
+        self._use_count: dict[tuple, int] = {}
+        self._last_acc: dict[tuple, int] = {}
+        self._buckets: dict[int, collections.OrderedDict] = {}
+
+    def _touch(self, key: tuple, slot: int, clock: int) -> None:
+        old = self._use_count.get(key, 0)
+        b = self._buckets.get(old)
+        if b is not None:
+            b.pop(key, None)
+            if not b:
+                del self._buckets[old]
+        new = old + 1
+        self._use_count[key] = new
+        self._last_acc[key] = clock
+        self._buckets.setdefault(new, collections.OrderedDict())[key] = slot
+
+    on_hit = _touch
+    on_insert = _touch
+
+    def on_drop(self, key: tuple) -> None:
+        c = self._use_count.get(key)
+        if c is None:
+            return
+        b = self._buckets.get(c)
+        if b is not None:
+            b.pop(key, None)
+            if not b:
+                del self._buckets[c]
+
+    def victim(self, residents, protected, clock):
+        best = best_key = None
+        for c, b in self._buckets.items():
+            for k, s in b.items():
+                if s in protected:
+                    continue
+                score = (clock - self._last_acc.get(k, 0)) / (1.0 + c)
+                rank = (score, -self._last_acc.get(k, 0))
+                if best_key is None or rank > best_key:
+                    best_key, best = rank, k
+                break                             # only the head of each bucket can win
+        return best
+
+
+EVICT_POLICIES = {"lru": LRUPolicy, "age_over_freq": AgeOverFreqPolicy}
+
+
+def make_policy(spec) -> EvictionPolicy:
+    """Accept a name or an EvictionPolicy instance -- the latter is the plug point."""
+    if isinstance(spec, EvictionPolicy):
+        return spec
+    if spec not in EVICT_POLICIES:
+        raise ValueError(f"policy {spec!r} not in {sorted(EVICT_POLICIES)} and not an EvictionPolicy")
+    return EVICT_POLICIES[spec]()
 
 
 class SlotArena:
@@ -166,15 +279,15 @@ class ExpertSlots:
     `y[t] +=` silently dropped a contribution.
     """
 
-    def __init__(self, lru_slots: int, transient_slots: int, policy: str = "lru"):
-        if policy not in EVICT_POLICIES:
-            raise ValueError(f"policy {policy!r} not in {EVICT_POLICIES}")
+    def __init__(self, lru_slots: int, transient_slots: int, policy="lru"):
+        # `policy` is a name or an EvictionPolicy instance. The instance form is the plug point:
+        # a new policy implements on_hit / on_insert / on_drop / victim and needs no edit here.
+        self.evict = make_policy(policy)
         assert transient_slots >= 8, "transient ring too small"
         self.lru_slots = lru_slots
         self.transient_slots = transient_slots
         self.n_slots = lru_slots + transient_slots
-        self.policy = policy
-        self._afq = policy == "age_over_freq"
+        self.policy = self.evict.name
 
         self.lru: collections.OrderedDict[tuple, int] = collections.OrderedDict()
         self.slot_key: dict[int, tuple] = {}
@@ -196,9 +309,6 @@ class ExpertSlots:
         # per-key stats do: an expert that comes back from NVMe comes back with its history, and
         # that is the only way a use count means anything when 5,328 slots cover 15,360 pairs.
         self._clock = 0
-        self._use_count: dict[tuple, int] = {}
-        self._last_acc: dict[tuple, int] = {}
-        self._buckets: dict[int, collections.OrderedDict] = {}
         self.hits = 0
         self.misses = 0
         self.prefill_misses = 0
@@ -221,75 +331,26 @@ class ExpertSlots:
         with self._pending_lk:
             return frozenset(self._pending)
 
-    # ---------------------------------------------------------------- age/(1+count)
-    def _afq_touch(self, key: tuple, slot: int) -> None:
-        old = self._use_count.get(key, 0)
-        b = self._buckets.get(old)
-        if b is not None:
-            b.pop(key, None)
-            if not b:
-                del self._buckets[old]
-        new = old + 1
-        self._use_count[key] = new
-        self._last_acc[key] = self._clock
-        self._buckets.setdefault(new, collections.OrderedDict())[key] = slot
-
-    def _afq_drop(self, key: tuple) -> None:
-        c = self._use_count.get(key)
-        if c is None:
-            return
-        b = self._buckets.get(c)
-        if b is not None:
-            b.pop(key, None)
-            if not b:
-                del self._buckets[c]
-
-    def _afq_victim(self, used: frozenset) -> tuple:
-        """EXACT global argmax of (age)/(1+count) over residents, in O(#distinct use counts).
-
-        Within a count bucket the count is constant, so the maximum of age/(1+count) is that
-        bucket's LRU head -- the global winner is the best of the bucket heads. ~228 comparisons
-        per eviction at 5,328 slots, verified bit-identical to the brute-force scan offline. This
-        is what makes 94.07 % / 52.3 fetches affordable at all.
-        """
-        best = None
-        best_key = None
-        for c, b in self._buckets.items():
-            for k, s in b.items():
-                if s in used:
-                    continue                      # protected: promised earlier in THIS call
-                score = (self._clock - self._last_acc.get(k, 0)) / (1.0 + c)
-                rank = (score, -self._last_acc.get(k, 0))
-                if best_key is None or rank > best_key:
-                    best_key, best = rank, k
-                break                             # only the head of each bucket can win
-        return best
+    def pending_gen(self, slot: int):
+        with self._pending_lk:
+            return self._pending.get(slot)
 
     # ---------------------------------------------------------------- allocation
     def _lru_slot_for(self, key: tuple, used: frozenset) -> int:
         if self.free_lru:
             slot = self.free_lru.pop()
         else:
-            if self._afq:
-                victim = self._afq_victim(used)
-            else:
-                victim = None
-                for k in self.lru:
-                    if self.lru[k] not in used:
-                        victim = k
-                        break
+            victim = self.evict.victim(self.lru, used, self._clock)
             if victim is None:
                 raise RuntimeError(
                     "no evictable LRU slot: every resident is in use by this call or has a write "
                     "in flight -- raise lru_slots, or bound how far lookahead may run ahead")
             slot = self.lru.pop(victim)
             self.slot_key.pop(slot, None)
-            if self._afq:
-                self._afq_drop(victim)
+            self.evict.on_drop(victim)
         self.lru[key] = slot
         self.slot_key[slot] = key
-        if self._afq:
-            self._afq_touch(key, slot)
+        self.evict.on_insert(key, slot, self._clock)
         return slot
 
     def _transient_slot_for(self, key: tuple, used: frozenset) -> int:
@@ -309,13 +370,16 @@ class ExpertSlots:
     def reserve(self, layer: int, uniq, prefill: bool) -> tuple[dict, list]:
         """Host-only bookkeeping: assign every requested expert a slot, return the misses to load.
 
-        Returns (slot_of, to_load) where to_load is [(key, slot, gen)]. No I/O happens here and no
+        Returns (slot_of, to_load, to_wait). to_load is [(key, slot, gen)] to ISSUE; to_wait is
+        already-in-flight writes (a prefetch, or another layer's read) this consumer must still
+        wait on. No I/O happens here and no
         blocking -- which is the point: in v1 `slots` is already correct the moment this returns,
         and the only thing the wait afterwards provides is DATA readiness. v2 exploits that; v1
         does not.
         """
         slot_of: dict[int, int] = {}
         to_load: list = []
+        to_wait: list = []
         used: set[int] = set()
         for e in uniq:
             key = (layer, e)
@@ -324,16 +388,24 @@ class ExpertSlots:
                 s = self.transient_map.get(key)
             else:
                 self.lru.move_to_end(key)
-                if self._afq and not prefill:
+                if not prefill:
                     # DECODE hits only. A prefill chunk touches nearly every expert of a layer, so
                     # letting it write the counter would push every resident up by one per chunk
                     # and drown the decode signal the policy was fitted on.
                     self._clock += 1
-                    self._afq_touch(key, s)
+                    self.evict.on_hit(key, s, self._clock)
             if s is not None:
                 slot_of[e] = s
                 used.add(s)
                 self.hits += 1
+                # RESIDENT IS NOT THE SAME AS READY. A speculative reserve maps its key the moment
+                # it allocates a slot, so a prefetch whose H2D is still in flight looks exactly
+                # like a hit here. Waiting on nothing would compute against a half-written slot --
+                # the same silent-wrong-data failure as a torn read counted as a HIT. Anything with
+                # a write outstanding goes on the wait list even though it is not a new fetch.
+                g = self.pending_gen(s)
+                if g is not None:
+                    to_wait.append((key, s, g))
         # Slots with a write in flight from an EARLIER call are protected exactly as slots promised
         # within this call are. Read once: a slot can only leave this set (a completion), and losing
         # that race costs one extra protected slot for one call, never a mid-write reassignment.
@@ -354,7 +426,35 @@ class ExpertSlots:
             g = self.gen[s] = self.gen.get(s, 0) + 1
             to_load.append((key, s, g))
         assert len(set(slot_of.values())) == len(slot_of), "slot collision in reserve()"
-        return slot_of, to_load
+        return slot_of, to_load, to_wait
+
+    def reserve_speculative(self, keys) -> list:
+        """Allocate slots for PREDICTED keys without perturbing any cache statistic.
+
+        A speculative touch must not count as a hit, must not advance the age/(1+count) clock and
+        must not bump a use count -- otherwise the predictor rewrites the miss stream it is being
+        measured against, and phase1's exact reproduction becomes meaningless. So this calls
+        on_insert (the key really does become resident) and nothing else.
+
+        Refusal is normal, not an error: with pending-write protection the store can legitimately
+        have no free slot, and a prefetcher that cannot place a key simply does not get it. The
+        caller is told how many were refused.
+        """
+        to_load, refused = [], 0
+        used = set()
+        inflight = self.pending_slots()
+        for key in keys:
+            if key in self.lru or key in self.transient_map:
+                continue                                   # already resident: nothing to do
+            try:
+                s = self._lru_slot_for(key, frozenset(used) | inflight)
+            except RuntimeError:
+                refused += 1
+                continue
+            used.add(s)
+            g = self.gen[s] = self.gen.get(s, 0) + 1
+            to_load.append((key, s, g))
+        return to_load, refused
 
     def forget(self, key: tuple, slot: int) -> None:
         """Un-map a key whose load did not complete: the slot holds a torn read.
@@ -365,8 +465,7 @@ class ExpertSlots:
         if self.lru.get(key) == slot:
             del self.lru[key]
             self.free_lru.append(slot)
-            if self._afq:
-                self._afq_drop(key)
+            self.evict.on_drop(key)
         if self.transient_map.get(key) == slot:
             del self.transient_map[key]
         if self.slot_key.get(slot) == key:

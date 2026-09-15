@@ -11,6 +11,7 @@ import dataclasses
 import time
 
 from .leaves import Bandwidth, ModelLeaves
+from .prefetch import PrefetchStats, Prefetcher
 from .sched import ComputeStream, LoaderService, Policy
 from .store import ExpertSlots, SlotArena
 from .trace import N_LAYERS
@@ -36,7 +37,7 @@ class Engine:
     def __init__(self, policy: Policy, evict: str = "lru", lru_slots: int = 5328,
                  transient_slots: int = 400, n_workers: int = 48, staging: int = 48,
                  nvme_qd: int = 8, h2d_inflight: int = 8, scale: float = 1.0,
-                 leaves=None, calls=()):
+                 leaves=None, calls=(), prefetch=None, discard_wrong_asap: bool = True):
         self.policy = policy
         self.slots = ExpertSlots(lru_slots, transient_slots, policy=evict)
         self.arena = SlotArena(self.slots.n_slots)
@@ -50,6 +51,13 @@ class Engine:
                                     leaves=self.leaves, n_workers=n_workers, staging=staging,
                                     nvme_qd=nvme_qd, h2d_inflight=h2d_inflight, scale=scale)
         self.scale = scale
+        # THE PREFETCH SEAM. The default predicts nothing, which is the honest baseline: both arms
+        # run this identical driver and differ only in what predict() returns. Nothing is granted
+        # to either side.
+        self.prefetch = prefetch if prefetch is not None else Prefetcher()
+        self.discard_wrong_asap = discard_wrong_asap
+        self.pf = PrefetchStats()
+        self._spec: dict[tuple, tuple] = {}     # key -> (slot, gen) still speculative, not yet used
         self.c = Counters()
 
     def close(self):
@@ -88,9 +96,21 @@ class Engine:
         # Graph A. The expert ids come OUT of it -- they are not handed to the driver. This is the
         # line that makes this an engine and not a replay of someone else's route.
         uniq = self._compute(lambda: self.leaves.layer_a(layer))
-        slot_of, to_load = self.slots.reserve(layer, uniq, prefill=False)
+
+        # What did speculation actually buy, and what did it cost? Settled BEFORE reserve(), while
+        # the previous prediction for this layer is still distinguishable from a real residency.
+        self._settle_speculation(layer, uniq)
+
+        slot_of, to_load, to_wait = self.slots.reserve(layer, uniq, prefill=False)
         self.c.fetches += len(to_load)
         self.loader.submit(to_load)
+        # A prefetch that has not landed yet is waited on exactly like a demand read. It is not
+        # counted as a fetch -- it was already counted when it was issued.
+        to_load = to_load + to_wait
+
+        # Speculation is queued AFTER this layer's demand reads, at lower priority, so a demand
+        # miss never sits behind a prefetch for a layer we have not reached.
+        self._issue_speculation(layer, uniq)
 
         if self.policy.resolve_blocks:
             # v1: resolve() ends in list(pool.map(...)). Nothing issues work except a call that
@@ -111,6 +131,39 @@ class Engine:
         reads = sorted(set(slot_of.values()))
         self._compute(lambda: self.leaves.layer_b(layer, reads), slots=reads)
 
+    # ------------------------------------------------------------------ prefetch bookkeeping
+    def _settle_speculation(self, layer: int, uniq) -> None:
+        """Score the predictions that were made for THIS layer, then drop the ones that missed."""
+        want = {(layer, e) for e in uniq}
+        wrong = []
+        for key in [k for k in self._spec if k[0] == layer]:
+            slot, gen = self._spec.pop(key)
+            if key in want:
+                self.pf.used += 1               # resident when demanded: the prediction paid
+            else:
+                self.pf.wasted += 1
+                wrong.append((key, slot, gen))
+        if wrong and self.discard_wrong_asap:
+            # A wrong prefetch holds a slot AND a pending write, so it blocks eviction as well as
+            # occupying capacity. Cancelling recovers the slot for reads that are already known to
+            # be needed. Reads already in flight are not interrupted -- that cost is real and stays.
+            self.pf.cancelled += self.loader.cancel(wrong)
+
+    def _issue_speculation(self, layer: int, uniq) -> None:
+        self.prefetch.observe(layer, uniq, self.c.steps)
+        keys = self.prefetch.predict(layer, uniq, self.c.steps)
+        if not keys:
+            return
+        keys = [k for k in keys if k not in self._spec]
+        to_load, refused = self.slots.reserve_speculative(keys)
+        self.pf.refused += refused
+        if not to_load:
+            return
+        for key, slot, gen in to_load:
+            self._spec[key] = (slot, gen)
+        self.pf.issued += len(to_load)
+        self.loader.submit(to_load, speculative=True)
+
     def decode(self, steps: int) -> Counters:
         """Run `steps` decode steps. Where the expert ids come from is the provider's business."""
         t0 = time.perf_counter()
@@ -129,7 +182,7 @@ class Engine:
     def warm(self, calls, upto: int) -> None:
         """Bring the cache to the state the scored window starts in, with no I/O and no timing."""
         for layer, uniq in calls[:upto]:
-            _, to_load = self.slots.reserve(layer, uniq, prefill=False)
+            _, to_load, _ = self.slots.reserve(layer, uniq, prefill=False)
             for key, slot, gen in to_load:
                 self.arena.content[slot] = key
                 self.loader.ready.set(slot, gen)
@@ -151,7 +204,8 @@ class Engine:
         pending = []
         per_chunk = []
         for uniq in chunks:
-            slot_of, to_load = self.slots.reserve(layer, uniq, prefill=True)
+            slot_of, to_load, to_wait = self.slots.reserve(layer, uniq, prefill=True)
+            to_load = to_load + to_wait
             self.c.fetches += len(to_load)
             self.loader.submit(to_load)
             pending.extend(to_load)

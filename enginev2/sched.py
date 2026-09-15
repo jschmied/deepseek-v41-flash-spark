@@ -157,7 +157,17 @@ class LoaderService:
                 f"lease_until_completion=False needs staging ({staging}) > nvme_qd ({nvme_qd}): "
                 f"releasing the permit early cannot help if every buffer is already committed")
         self.fail = fail if fail is not None else set()
-        self.q: queue.Queue = queue.Queue()
+        # PRIORITY QUEUE: demand reads (0) ahead of speculation (1). Speculation still takes the
+        # same nvme_qd permits once it starts -- it is deprioritised, never exempted, because a
+        # prefetch for layer L+1 and a demand miss on layer L really do contend for one device.
+        self.q: queue.PriorityQueue = queue.PriorityQueue()
+        self._seq = 0
+        self._cancelled: set = set()
+        # D3's barrier is over DEMAND reads only. v1's join_pending() has no speculation to wait
+        # for, so folding prefetches into it would make the v1 arm wait on work v1 never issues --
+        # a confound, not a finding. Speculation is deprioritised and uncounted here by design.
+        self._demand = 0
+        self._demand_cv = threading.Condition(threading.Lock())
         self.h2d_calls = 0
         self.h2d_s = 0.0
         self._lk = threading.Lock()
@@ -178,6 +188,17 @@ class LoaderService:
         # cudaMemcpyAsync reads out of this buffer until its completion event, so handing it to
         # another reader early corrupts the transfer in flight. The previous revision released it
         # at handoff under D2, which made the v2 arm compare against something unbuildable.
+        with self._lk:
+            if (slot, gen) in self._cancelled:
+                self._cancelled.discard((slot, gen))
+                cancelled = True
+            else:
+                cancelled = False
+        if cancelled:
+            # Never started, so nothing to undo but the reservation itself.
+            self.slots.forget(key, slot)
+            self.slots.clear_pending(slot, gen)
+            return
         sid = self.stage.acquire()
         permit_held = False
         try:
@@ -219,22 +240,46 @@ class LoaderService:
 
     def _worker(self) -> None:
         while True:
-            item = self.q.get()
+            entry = self.q.get()
             try:
-                if item is None:
+                if entry is None or entry[2] is None:
                     return
-                self._load_one(*item)
+                try:
+                    self._load_one(*entry[2])
+                finally:
+                    if entry[3]:
+                        with self._demand_cv:
+                            self._demand -= 1
+                            self._demand_cv.notify_all()
             finally:
                 self.q.task_done()
 
     # ------------------------------------------------------------------ service api
-    def submit(self, to_load) -> None:
+    def submit(self, to_load, speculative: bool = False) -> None:
         # Protect before queueing, never after: between the two a worker can already be writing.
         self.slots.mark_pending(to_load)
         for key, slot, gen in to_load:
             self.ready.arm(slot, gen)
-        for item in to_load:
-            self.q.put(item)
+        prio = 1 if speculative else 0
+        if not speculative:
+            with self._demand_cv:
+                self._demand += len(to_load)
+        with self._lk:
+            for item in to_load:
+                self._seq += 1
+                self.q.put((prio, self._seq, item, prio == 0))
+
+    def cancel(self, items) -> int:
+        """Drop speculation that has not started. Nothing ever WAITS on a speculative read, so a
+        cancelled one just frees its slot -- that is what makes `discard wrong prefetch asap`
+        implementable at all. Already-running reads are not interrupted; they finish and are simply
+        never used, which is the honest cost of having been wrong."""
+        n = 0
+        with self._lk:
+            for key, slot, gen in items:
+                self._cancelled.add((slot, gen))
+                n += 1
+        return n
 
     def wait_slots(self, to_load) -> None:
         """Wait only for the slots THIS consumer needs. Errors are drained, then the first re-raised."""
@@ -248,12 +293,15 @@ class LoaderService:
         if err is not None:
             raise err
 
-    def wait_all(self) -> None:
-        """The global barrier: every pending read, whether or not this consumer needs it."""
-        self.q.join()
+    def wait_all(self, timeout: float = 60.0) -> None:
+        """The global barrier: every pending DEMAND read, whether or not this consumer needs it."""
+        with self._demand_cv:
+            if not self._demand_cv.wait_for(lambda: self._demand == 0, timeout):
+                raise TimeoutError("global barrier never drained")
 
     def shutdown(self) -> None:
         for _ in self.workers:
-            self.q.put(None)
+            self._seq += 1
+            self.q.put((-1, self._seq, None, False))
         for w in self.workers:
             w.join(timeout=5)
