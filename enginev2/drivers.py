@@ -70,7 +70,7 @@ class Engine:
         # component -- see chain.py.
         self.chain = Chain(observer=self.obs)
         self.engram = engram if engram is not None else EngramSource()
-        self._spec: dict[tuple, tuple] = {}     # key -> (slot, gen) still speculative, not yet used
+        self._spec: dict[tuple, tuple] = {}     # key -> (slot, gen, cause_id) still speculative
         # Every key the predictor NAMED, including ones already resident. Needed because precision
         # over predictions and precision over fetches are different numbers (see PrefetchStats):
         # a correct prediction that was already cached never becomes a fetch, so scoring only the
@@ -116,27 +116,27 @@ class Engine:
         # EDGE 1: graph A reads h and pre_mix, which graph B of the PREVIOUS layer wrote. Both
         # stages write the same single `h` buffer, so this is also why A(L+1) cannot simply be run
         # early: it would clobber what B(L) still needs.
-        self.chain.wait("h", layer - 1)
+        self.chain.wait("h", layer - 1, ctx=ctx)
         # EDGE 5: eg_rows[L] comes off a second async NVMe stream and is read by graph A. The
         # source signals per layer; the driver only waits.
-        self.chain.wait("engram", layer)
+        self.chain.wait("engram", layer, ctx=ctx)
 
         ctx = ctx if ctx is not None else OpContext(self.request_id, self.c.steps, layer)
         e = self.obs.enabled
         if e:
             self.obs.safe_emit(Event(now_ns(), "layer_a_start", ctx=ctx))
-        self.obs.gpu_begin("layer_a", ctx)
+        self.obs.safe_gpu_begin("layer_a", ctx)
         route = self._compute(lambda: self.leaves.layer_a(layer))
-        self.obs.gpu_end("layer_a", ctx)
+        self.obs.safe_gpu_end("layer_a", ctx)
         uniq = route.uniq
         if e:
             self.obs.safe_emit(Event(now_ns(), "layer_a_end", ctx=ctx))
             self.obs.safe_emit(Event(now_ns(), "route_ready", ctx=ctx, value=len(uniq), aux=uniq))
         # EDGE 2 and 6: A wrote y / route_idx / route_w, and the KV buffers this layer's
         # bookkeeping will clone.
-        self.chain.set("y", layer)
-        self.chain.set("route", layer)
-        self.chain.set("kv", layer)
+        self.chain.set("y", layer, ctx=ctx)
+        self.chain.set("route", layer, ctx=ctx)
+        self.chain.set("kv", layer, ctx=ctx)
 
         # What did speculation actually buy, and what did it cost? Settled BEFORE reserve(), while
         # the previous prediction for this layer is still distinguishable from a real residency.
@@ -189,15 +189,15 @@ class Engine:
         reads = sorted(set(slot_of.values()))
         if e:
             self.obs.safe_emit(Event(now_ns(), "layer_b_start", ctx=ctx))
-        self.obs.gpu_begin("layer_b", ctx)
+        self.obs.safe_gpu_begin("layer_b", ctx)
         # EDGE 3 and 4 are already enforced above: the ids came out of A, and _wait covers both the
         # `slots` mapping and the expert bytes being resident.
-        self.chain.wait("y", layer)
+        self.chain.wait("y", layer, ctx=ctx)
         self._compute(lambda: self.leaves.layer_b(layer, route), slots=reads)
-        self.obs.gpu_end("layer_b", ctx)
+        self.obs.safe_gpu_end("layer_b", ctx)
         if e:
             self.obs.safe_emit(Event(now_ns(), "layer_b_end", ctx=ctx))
-        self.chain.set("h", layer)            # B wrote h and pre_mix for the next layer
+        self.chain.set("h", layer, ctx=ctx)            # B wrote h and pre_mix for the next layer
 
     # ------------------------------------------------------------------ prefetch bookkeeping
     def _settle_speculation(self, layer: int, uniq, ctx=None) -> None:
@@ -209,7 +209,7 @@ class Engine:
             self.pf.pred_miss += len(named - want)
         wrong = []
         for key in [k for k in self._spec if k[0] == layer]:
-            slot, gen = self._spec.pop(key)
+            slot, gen, cause = self._spec.pop(key)
             if key in want:
                 self.pf.used += 1
                 # READY or LATE? A prefetch whose read is still in flight is a mapping hit that the
@@ -222,18 +222,19 @@ class Engine:
                     self.pf.lead_ns += lead
                     if self.obs.enabled:
                         self.obs.safe_emit(Event(now_ns(), "prefetch_ready_hit", ctx=ctx or NO_CTX,
-                                                 key=key, slot=slot, gen=gen, value=lead))
+                                                 key=key, slot=slot, gen=gen, cause_id=cause,
+                                                 value=lead))
                 else:
                     self.pf.late_hit += 1
                     if self.obs.enabled:
                         self.obs.safe_emit(Event(now_ns(), "prefetch_late_hit", ctx=ctx or NO_CTX,
-                                                 key=key, slot=slot, gen=gen))
+                                                 key=key, slot=slot, gen=gen, cause_id=cause))
             else:
                 self.pf.wasted += 1
                 wrong.append((key, slot, gen))
                 if self.obs.enabled:
                     self.obs.safe_emit(Event(now_ns(), "prefetch_wasted", ctx=ctx or NO_CTX,
-                                             key=key, slot=slot, gen=gen))
+                                             key=key, slot=slot, gen=gen, cause_id=cause))
         if wrong and self.discard_wrong_asap:
             # A wrong prefetch holds a slot AND a pending write, so it blocks eviction as well as
             # occupying capacity. Cancelling recovers the slot for reads that are already known to
@@ -255,24 +256,24 @@ class Engine:
         to_load, refused = self.slots.reserve_speculative(keys)
         self.pf.refused += refused
         if self.obs.enabled:
-            self.obs.safe_emit(Event(now_ns(), "prediction", ctx=ctx or NO_CTX, span=pred_id,
+            self.obs.safe_emit(Event(now_ns(), "prediction", ctx=ctx or NO_CTX, cause_id=pred_id,
                                      value=len(keys), aux=self.prefetch.name))
             if refused:
-                self.obs.safe_emit(Event(now_ns(), "refused", ctx=ctx or NO_CTX, span=pred_id,
+                self.obs.safe_emit(Event(now_ns(), "refused", ctx=ctx or NO_CTX, cause_id=pred_id,
                                          value=refused))
         if not to_load:
             return
         for key, slot, gen in to_load:
-            self._spec[key] = (slot, gen)
+            self._spec[key] = (slot, gen, pred_id)
         self.pf.issued += len(to_load)
         if self.obs.enabled:
             for k, sl, g in to_load:
                 # source_layer / horizon travel with the event, so a prediction's whole life is
                 # readable without inferring it from timestamps.
                 self.obs.safe_emit(Event(now_ns(), "prefetch_issued", ctx=ctx or NO_CTX, key=k,
-                                         slot=sl, gen=g, span=pred_id,
+                                         slot=sl, gen=g, cause_id=pred_id,
                                          aux=(layer, self.prefetch.horizon, self.prefetch.name)))
-        self.loader.submit(to_load, speculative=True, ctx=ctx or NO_CTX)
+        self.loader.submit(to_load, speculative=True, ctx=ctx or NO_CTX, cause_id=pred_id)
 
     def decode(self, steps: int) -> Counters:
         """Run `steps` decode steps. Where the expert ids come from is the provider's business."""

@@ -95,7 +95,8 @@ class Event:
     key: tuple | None = None
     slot: int = -1
     gen: int = -1
-    span: int = 0
+    span: int = 0            # identifies ONE WAIT: pairs a start with its own end
+    cause_id: int = 0        # identifies WHAT CAUSED this work: one prediction batch, end to end
     value: float = 0.0
     aux: object = None
 
@@ -139,6 +140,23 @@ class Observer:
     def gpu_end(self, name: str, ctx: OpContext) -> None:
         pass
 
+    # The quarantine has to cover these as well: a CUDA-event or NVTX observer that raises here
+    # would abort inference, which is precisely what the contract forbids. Only the safe_ variants
+    # are ever called from the engine.
+    def safe_gpu_begin(self, name: str, ctx: OpContext) -> None:
+        try:
+            self.gpu_begin(name, ctx)
+        except BaseException as exc:            # noqa: BLE001
+            self.failed = exc
+            self.enabled = False
+
+    def safe_gpu_end(self, name: str, ctx: OpContext) -> None:
+        try:
+            self.gpu_end(name, ctx)
+        except BaseException as exc:            # noqa: BLE001
+            self.failed = exc
+            self.enabled = False
+
 
 class NullObserver(Observer):
     enabled = False
@@ -147,6 +165,12 @@ class NullObserver(Observer):
         pass
 
     def safe_emit(self, event: Event) -> None:
+        pass
+
+    def safe_gpu_begin(self, name: str, ctx: OpContext) -> None:
+        pass
+
+    def safe_gpu_end(self, name: str, ctx: OpContext) -> None:
         pass
 
 
@@ -181,7 +205,11 @@ class CounterObserver(Observer):
         by_scope: dict = {}
         for reason, ns in self.wait_ns.items():
             by_scope.setdefault(SCOPE.get(reason, WaitScope.LOADER), {})[reason] = ns / 1e6
-        crit = sum(by_scope.get(WaitScope.CONSUMER, {}).values())
+        # A blocked Chain.wait() runs on the DRIVER thread, so dependency time is critical-path
+        # time. It is reported broken out, but it counts in the total -- excluding it would
+        # understate the step the moment anything genuinely runs ahead.
+        crit = (sum(by_scope.get(WaitScope.CONSUMER, {}).values())
+                + sum(by_scope.get(WaitScope.DEPENDENCY, {}).values()))
         return {
             "counts": dict(self.counts),
             "critical_path_ms": by_scope.get(WaitScope.CONSUMER, {}),
@@ -199,10 +227,16 @@ class TraceObserver(Observer):
     bytecodes and 48 loader threads will interleave them, losing and overwriting events. A global
     lock would instead put contention into the path that exists to measure contention. Per-thread
     rings avoid both; merging by timestamp happens in drain(), off the hot path.
+
+    `capacity` is a TOTAL event budget, divided across rings as threads appear -- not a per-thread
+    size. As per-thread it was a memory hazard rather than a knob: 1<<20 with 48 loader workers is
+    ~392 MB of reference arrays before a single Event is stored, taken from the same unified memory
+    pool the run is measuring. The default is deliberately small for the same reason.
     """
 
-    def __init__(self, capacity: int = 1 << 20):
+    def __init__(self, capacity: int = 1 << 17, max_threads: int = 64, per_ring_min: int = 1024):
         self.capacity = capacity
+        self.per_ring = max(per_ring_min, capacity // max(1, max_threads))
         self._local = threading.local()
         self._rings: list = []
         self._lk = threading.Lock()
@@ -210,7 +244,7 @@ class TraceObserver(Observer):
     def _ring(self):
         r = getattr(self._local, "ring", None)
         if r is None:
-            r = self._local.ring = [[None] * self.capacity, 0]
+            r = self._local.ring = [[None] * self.per_ring, 0]
             with self._lk:
                 self._rings.append(r)
         return r
@@ -218,23 +252,29 @@ class TraceObserver(Observer):
     def emit(self, event: Event) -> None:
         r = self._ring()
         i = r[1]
-        r[0][i % self.capacity] = event
+        r[0][i % self.per_ring] = event
         r[1] = i + 1
 
     @property
     def dropped(self) -> int:
         with self._lk:
-            return sum(max(0, r[1] - self.capacity) for r in self._rings)
+            return sum(max(0, r[1] - self.per_ring) for r in self._rings)
+
+    @property
+    def bytes_reserved(self) -> int:
+        """Reference-array footprint only; the Events themselves are on top of this."""
+        with self._lk:
+            return len(self._rings) * self.per_ring * 8
 
     def drain(self) -> list:
         out = []
         with self._lk:
             rings = list(self._rings)
         for buf, n in rings:
-            if n <= self.capacity:
+            if n <= self.per_ring:
                 out.extend(e for e in buf[:n] if e is not None)
             else:
-                s = n % self.capacity
+                s = n % self.per_ring
                 out.extend(e for e in (buf[s:] + buf[:s]) if e is not None)
         out.sort(key=lambda e: e.ts_ns)
         return out

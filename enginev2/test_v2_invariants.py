@@ -38,7 +38,8 @@ import time
 from .drivers import Engine
 from .sched import V1, V2, ComputeStream, LoaderService, Policy
 from .chain import Chain, EngramSource
-from .observe import CounterObserver, NullObserver, TraceObserver
+from .prefetch import OraclePrefetcher
+from .observe import CounterObserver, NullObserver, TraceObserver, WaitReason
 from .leaves import Bandwidth, ModelLeaves, StagedExpert
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
 from .trace import N_LAYERS, load_decode, warmup_cut
@@ -700,3 +701,80 @@ def test_observer_records_but_never_influences():
     # warm-up must contribute nothing
     assert not any(x.kind == "cache_miss" and x.step < 0 for x in ev), "warm-up emitted events"
     print(f"  observer: inert across null/counter/trace, {len(starts)} waits balanced  OK")
+
+
+# ================================================================ 17. identity and quarantine
+def test_context_and_cause_survive_async_and_a_bad_observer_cannot_break_the_engine():
+    """The four properties the previous test did not cover, each of which was a real gap.
+
+    a) the critical-path wait -- EXPERT_DATA -- must know WHICH request/step was blocked. It is
+       produced by SlotReady on a worker's completion, so the context has to be retained at arm().
+    b) a prediction must be joinable end to end by cause_id, not reconstructed from timestamps.
+    c) a throwing observer must be quarantined, INCLUDING from the GPU hooks -- those bypassed
+       safe_emit entirely and could abort inference.
+    d) the trace ring is a total budget, not a per-thread allocation.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+
+    # (a) + (b)
+    # Budget sized to the run: 3 steps x 40 layers emits ~1.8k events on the driver thread alone,
+    # and the ring correctly drops the oldest when it does not fit -- which silently removed the
+    # `prediction` events this test joins on. That is the ring working, not a bug, but a causal
+    # join needs the whole window present.
+    obs = TraceObserver(capacity=1 << 19)
+    e = Engine(V2, lru_slots=5328, transient_slots=400, scale=SCALE, request_id=17,
+               leaves=ModelLeaves(calls, Bandwidth(scale=SCALE), scale=SCALE, start=cut),
+               prefetch=OraclePrefetcher(calls, 2, start=cut), observer=obs)
+    try:
+        e.warm(calls, cut)
+        e.decode(3)
+    finally:
+        e.close()
+    ev = obs.drain()
+
+    waits = [x for x in ev if x.kind == "wait_start" and x.aux is WaitReason.EXPERT_DATA]
+    assert waits, "no EXPERT_DATA wait was recorded"
+    identified = [x for x in waits if x.ctx.request_id == 17 and x.ctx.step >= 0]
+    assert identified, "EXPERT_DATA waits carry no request/step -- context is lost at SlotReady"
+
+    issued = [x for x in ev if x.kind == "prefetch_issued"]
+    assert issued, "no prefetch was issued"
+    cause = issued[0].cause_id
+    assert cause, "prefetch_issued carries no cause_id"
+    chain_of_one = {x.kind for x in ev if x.cause_id == cause}
+    assert "prediction" in chain_of_one, "the prediction that caused this is not joinable"
+    assert chain_of_one & {"load_queued", "nvme_start", "h2d_start"}, (
+        f"the cause_id does not follow the work into the loader: {sorted(chain_of_one)}")
+    assert obs.dropped == 0, f"the ring wrapped ({obs.dropped} dropped); the join window is partial"
+
+    # (c) an observer that throws -- from emit AND from the GPU hooks -- must not break the engine
+    class Hostile(CounterObserver):
+        def emit(self, event):
+            raise RuntimeError("observer blew up")
+
+    class HostileGPU(CounterObserver):
+        def gpu_begin(self, name, ctx):
+            raise RuntimeError("nvtx blew up")
+
+    for cls in (Hostile, HostileGPU):
+        bad = cls()
+        e = Engine(V2, lru_slots=5328, transient_slots=400, scale=SCALE,
+                   leaves=ModelLeaves(calls, Bandwidth(scale=SCALE), scale=SCALE, start=cut),
+                   observer=bad)
+        try:
+            e.warm(calls, cut)
+            c = e.decode(1)                      # must complete
+            assert c.steps == 1, cls.__name__
+            assert bad.failed is not None and not bad.enabled, (
+                f"{cls.__name__} was not quarantined")
+        finally:
+            e.close()
+
+    # (d) capacity is a total budget: many rings must not multiply it
+    t = TraceObserver(capacity=1 << 17)
+    assert t.per_ring * 64 <= t.capacity + t.per_ring, (
+        f"per-ring {t.per_ring} x 64 threads exceeds the {t.capacity} budget")
+    assert t.per_ring < t.capacity, "capacity is being used as a per-thread size"
+    print("  identity: EXPERT_DATA carries request/step, cause_id joins a prediction to its I/O, "
+          "a hostile observer is quarantined  OK")

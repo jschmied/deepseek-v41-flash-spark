@@ -192,7 +192,7 @@ class LoaderService:
             w.start()
 
     # ------------------------------------------------------------------ the leaf
-    def _load_one(self, ctx, key: tuple, slot: int, gen: int) -> None:
+    def _load_one(self, ctx, cause_id: int, key: tuple, slot: int, gen: int) -> None:
         """read -> (handoff) -> compute-order barrier -> H2D -> per-slot event.
 
         Every step between the lease and the release must be inside the try, or the lease leaks and
@@ -234,10 +234,10 @@ class LoaderService:
             # the caller knows when it was queued, began and ended, so measurement semantics stay
             # put when the provider is swapped.
             if self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "nvme_start", ctx=ctx, key=key, slot=slot, gen=gen))
+                self.obs.safe_emit(Event(now_ns(), "nvme_start", ctx=ctx, cause_id=cause_id, key=key, slot=slot, gen=gen))
             staged = self.leaves.read(key, self.stage)
             if self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "nvme_end", ctx=ctx, key=key, slot=slot, gen=gen))
+                self.obs.safe_emit(Event(now_ns(), "nvme_end", ctx=ctx, cause_id=cause_id, key=key, slot=slot, gen=gen))
             if not self.policy.lease_until_completion:
                 # D2 OFF: give the ADMISSION back now. Another read may enter the device while this
                 # expert's buffer waits on its copy. The buffer itself stays ours until H2D done.
@@ -273,13 +273,13 @@ class LoaderService:
             try:
                 with self.arena.writing(slot, key):
                     if self.obs.enabled:
-                        self.obs.safe_emit(Event(now_ns(), "h2d_start", ctx=ctx, key=key,
+                        self.obs.safe_emit(Event(now_ns(), "h2d_start", ctx=ctx, cause_id=cause_id, key=key,
                                                  slot=slot, gen=gen))
                     t0 = time.perf_counter()
                     self.leaves.h2d(slot, key, staged)
                     dt = time.perf_counter() - t0
                     if self.obs.enabled:
-                        self.obs.safe_emit(Event(now_ns(), "h2d_end", ctx=ctx, key=key, slot=slot,
+                        self.obs.safe_emit(Event(now_ns(), "h2d_end", ctx=ctx, cause_id=cause_id, key=key, slot=slot,
                                                  gen=gen, value=dt))
             finally:
                 self.h2d_sem.release()
@@ -318,15 +318,16 @@ class LoaderService:
                 self.q.task_done()
 
     # ------------------------------------------------------------------ service api
-    def submit(self, to_load, speculative: bool = False, ctx=NO_CTX) -> None:
+    def submit(self, to_load, speculative: bool = False, ctx=NO_CTX, cause_id: int = 0) -> None:
         # Protect before queueing, never after: between the two a worker can already be writing.
         self.slots.mark_pending(to_load)
         for key, slot, gen in to_load:
-            self.ready.arm(slot, gen)
+            self.ready.arm(slot, gen, ctx, cause_id)
         if self.obs.enabled:
             for key, slot, gen in to_load:
                 self.obs.safe_emit(Event(now_ns(), "load_queued", ctx=ctx, key=key, slot=slot,
-                                         gen=gen, aux="spec" if speculative else "demand"))
+                                         gen=gen, cause_id=cause_id,
+                                         aux="spec" if speculative else "demand"))
         prio = 1 if speculative else 0
         if not speculative:
             with self._demand_cv:
@@ -337,7 +338,7 @@ class LoaderService:
                 self._queued.add((item[1], item[2]))
                 # the context travels WITH the work: a completion on a worker thread must still
                 # know which request and step asked for it.
-                self.q.put((prio, self._seq, (ctx,) + tuple(item), prio == 0))
+                self.q.put((prio, self._seq, (ctx, cause_id) + tuple(item), prio == 0))
 
     def cancel(self, items) -> int:
         """Drop speculation that has not started. Nothing ever WAITS on a speculative read, so a

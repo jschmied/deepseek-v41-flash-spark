@@ -16,7 +16,7 @@ import collections
 import contextlib
 import threading
 
-from .observe import Event, NullObserver, WaitReason, next_span, now_ns
+from .observe import NO_CTX, Event, NullObserver, WaitReason, next_span, now_ns
 
 N_EXPERTS = 384
 # ---------------------------------------------------------------------------
@@ -245,7 +245,7 @@ class StagingPool:
         with self._lk:
             return sid in self._leased
 
-    def acquire(self) -> int:
+    def acquire(self, ctx=NO_CTX) -> int:
         # The lease is the ownership point for STAGING_BUFFER waits: whoever blocks here is blocked
         # on a pinned buffer, whatever they meant to do with it.
         # Atomic probe: testing a private _value and then acquiring is racy in both directions --
@@ -253,9 +253,11 @@ class StagingPool:
         # false ones recorded. try-acquire answers exactly the question being asked.
         if self.obs.enabled and not self._sem.acquire(blocking=False):
             sp = next_span()
-            self.obs.safe_emit(Event(now_ns(), "wait_start", span=sp, aux=WaitReason.STAGING_BUFFER))
+            self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, span=sp,
+                                     aux=WaitReason.STAGING_BUFFER))
             self._sem.acquire()
-            self.obs.safe_emit(Event(now_ns(), "wait_end", span=sp, aux=WaitReason.STAGING_BUFFER))
+            self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, span=sp,
+                                     aux=WaitReason.STAGING_BUFFER))
         elif not self.obs.enabled:
             self._sem.acquire()
         with self._lk:
@@ -311,15 +313,23 @@ class SlotReady:
         self._cv = threading.Condition(self._lk)
         self._done: set[tuple] = set()       # (slot, generation) pairs that have completed
         self._ts: dict[tuple, int] = {}      # when each became ready, for prefetch lead time
+        # arm() is where a generation's identity is established, so it is where the context is
+        # retained. Without this the most important critical-path wait in the engine --
+        # EXPERT_DATA -- could not say which request or step was blocked on it.
+        self._ctx: dict[tuple, tuple] = {}   # (slot, gen) -> (ctx, cause_id)
         self._err: dict[tuple, BaseException] = {}
 
-    def arm(self, slot: int, gen: int) -> None:
-        # Deliberately a no-op on state. Clearing anything here is what stranded waiters before.
-        pass
+    def arm(self, slot: int, gen: int, ctx=NO_CTX, cause_id: int = 0) -> None:
+        # Still clears nothing -- clearing here is what stranded waiters before. It only RECORDS
+        # who this generation belongs to, so later events can carry it.
+        if ctx is not NO_CTX or cause_id:
+            self._ctx[(slot, gen)] = (ctx, cause_id)
 
     def set(self, slot: int, gen: int, err: BaseException | None = None) -> None:
         if self.obs.enabled:
-            self.obs.safe_emit(Event(now_ns(), "slot_ready", slot=slot, gen=gen, aux=err))
+            c, cause = self._ctx.get((slot, gen), (NO_CTX, 0))
+            self.obs.safe_emit(Event(now_ns(), "slot_ready", ctx=c, slot=slot, gen=gen,
+                                     cause_id=cause, aux=err))
         with self._lk:
             self._done.add((slot, gen))
             self._ts[(slot, gen)] = now_ns()
@@ -337,15 +347,17 @@ class SlotReady:
         with self._lk:
             blocked = (slot, gen) not in self._done
             sp = next_span()
+            c, cause = self._ctx.get((slot, gen), (NO_CTX, 0))
             if blocked and self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "wait_start", slot=slot, gen=gen, span=sp,
-                                         aux=WaitReason.EXPERT_DATA))
+                self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=c, slot=slot, gen=gen,
+                                         span=sp, cause_id=cause, aux=WaitReason.EXPERT_DATA))
             try:
                 if not self._cv.wait_for(lambda: (slot, gen) in self._done, timeout):
                     raise TimeoutError(f"slot {slot} gen {gen} never became ready")
             finally:
                 if blocked and self.obs.enabled:
-                    self.obs.safe_emit(Event(now_ns(), "wait_end", slot=slot, gen=gen, span=sp,
+                    self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=c, slot=slot, gen=gen,
+                                             span=sp, cause_id=cause,
                                              aux=WaitReason.EXPERT_DATA))
             err = self._err.get((slot, gen))
         if err is not None:
