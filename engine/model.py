@@ -29,9 +29,9 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 import v41_ref as R  # noqa: E402
 
 try:
-    from decode_attn import prefill_attention  # tools/decode_attn.py (Triton)
+    from decode_attn import prefill_attention, prefill_attention_gather  # tools/decode_attn.py
 except Exception:  # noqa: BLE001
-    prefill_attention = None
+    prefill_attention = prefill_attention_gather = None
 
 # Window ring slots. Must exceed window_size + the longest chunk a single forward sees, because
 # `attention` gathers a query's window out of the ring AFTER writing the whole chunk into it
@@ -94,6 +94,21 @@ def nvtx_range(name: str):
 # shape is max|d|/max|ref| 7.5e-4, ||d||/||ref|| 9.3e-5, 0.02 % of elements more than one bf16 step
 # apart; engine/test_fused_prefill_attn.py holds it there. DSV41_ATTN_FUSED_PREFILL=1 turns it on.
 ATTN_FUSED_PREFILL = os.environ.get("DSV41_ATTN_FUSED_PREFILL", "0") == "1"
+
+# ... and one step further: let that kernel do the KV gather itself instead of being handed a
+# materialised [T, 128+512, 512] bf16 `kv_all`. Requires DSV41_ATTN_FUSED_PREFILL (it is the same
+# kernel, with a row-addressing mode per segment) and changes no arithmetic at all -- same softmax,
+# same PV split, same sink -- so it is bit-identical to the fused path, unlike that path against
+# eager. What it removes is memory and copies: the gathered kv_all is 1.34 GB at T=2048 and ~2.7 GB
+# at its construction peak, which is the ceiling MAX_CHUNK is written against, plus 2.15 s of
+# CatArrayBatchedCopy* and 1.31 s of vectorized_gather_kernel out of a 40 s GPU-busy prefill.
+# Measured at T=2048, H=64, D=512, 128+512 keys: 5.65 ms against 27.23 ms for gather+cat+kernel
+# (4.8x), and even the K-loop alone is faster (5.65 vs 7.02 ms) because the ring and the compressed
+# cache are 4 MB tables every query shares, where kv_all is 1.34 GB streamed once.
+# DSV41_ATTN_GATHER_FUSED=1 turns it on.
+# NOTE the ring must still hold window_size + MAX_CHUNK positions (RING >= 8320 for a 8192 chunk);
+# the kernel derives the same rows the host gather did, it does not relax that.
+ATTN_GATHER_FUSED = os.environ.get("DSV41_ATTN_GATHER_FUSED", "0") == "1"
 
 # Chunk invariance requires every GEMM to give the same row whatever the batch length M. cuBLAS
 # picks split-K kernels for small M and, with this flag on, reduces the K-splits in bf16, so
@@ -376,19 +391,40 @@ class Model:
         with nvtx_range("attn.rope"):
             kv = torch.cat([kv[:, :-rd], R.apply_rotary(kv[:, -rd:], fq)], dim=-1)
         self._tap("kv_new", L, kv)
+        # the gather-fused arm: the attention kernel reads the ring and the compressed cache
+        # itself, so `kv_all` is never built. It cannot serve the draft branch below, whose second
+        # segment is the draft's own kv, not rows of a shared table.
+        fuse = (mtp_extra is None and ATTN_GATHER_FUSED and ATTN_FUSED_PREFILL
+                and prefill_attention_gather is not None and q.dtype == torch.bfloat16 and q.is_cuda)
+        g_ckv = g_idx = kv_all = None
         if mtp_extra is None:
             # gather the window BEFORE writing (a chunk may overwrite slots older queries still need)
             wpos = self._window_positions(pos)  # [T, 128]
             ring[pos % RING] = kv
-            wkv = ring[wpos.clamp_min(0) % RING]  # [T, 128, d]
             wmask = wpos >= win_lo if win_lo else wpos >= 0
-            self._tap("win_kv", L, wkv); self._tap("win_mask", L, wmask)
-            kv_all, mask = wkv, wmask
+            if not fuse:
+                wkv = ring[wpos.clamp_min(0) % RING]  # [T, 128, d]
+                self._tap("win_kv", L, wkv)
+            elif self.tap is not None:
+                # the fused arm never builds these rows, but the taps are how this engine is
+                # checked against tools/v41_ref, so a diagnostic run pays for them explicitly
+                # rather than silently going dark. `self.tap is None` in serving.
+                self._tap("win_kv", L, ring[wpos.clamp_min(0) % RING])
+            self._tap("win_mask", L, wmask)
+            mask = wmask
+            if not fuse:
+                kv_all = wkv
             if w.ratio:
-                ckv_rows, cmask = self._compressed(x, qr, w, L, S, T, pos, sh)
-                self._tap("ckv_rows", L, ckv_rows); self._tap("c_mask", L, cmask)
-                kv_all = torch.cat([wkv, ckv_rows], dim=1)
+                got, cmask = self._compressed(x, qr, w, L, S, T, pos, sh, return_rows=not fuse)
+                self._tap("c_mask", L, cmask)
                 mask = torch.cat([wmask, cmask], dim=1)
+                if fuse:
+                    g_ckv, g_idx = sh.ckv, got  # [n_c, d] table + [T, k] rows, not the rows
+                    if self.tap is not None:
+                        self._tap("ckv_rows", L, sh.ckv[got.clamp_min(0)])
+                else:
+                    self._tap("ckv_rows", L, got)
+                    kv_all = torch.cat([wkv, got], dim=1)
         else:
             # DSpark draft attention: window from the main stream's ring (positions <= S-1) + all draft kvs
             main_last = mtp_extra  # position of the last main token in the ring
@@ -403,7 +439,10 @@ class Model:
         # fp32 PV product, like tools/v41_ref: rounding the probabilities to bf16 first is a
         # cliff that turns 1e-7 fp32 GEMM jitter into 1e-4 output jitter, which is enough to flip
         # a borderline router top-k and make the MoE output depend on the chunk length.
-        o = self._softmax_attn(q, kv_all, mask, w.attn_sink)
+        if fuse:
+            o = self._gather_attn(q, ring, g_ckv, g_idx, S, mask, w.attn_sink)
+        else:
+            o = self._softmax_attn(q, kv_all, mask, w.attn_sink)
         with nvtx_range("attn.rope"):
             o = torch.cat([o[..., :-rd], R.apply_rotary(o[..., -rd:], fq, inverse=True)], dim=-1)
         o = o.reshape(T, a.o_groups, -1)
@@ -413,6 +452,22 @@ class Model:
         out = R.qlinear(o.flatten(1), w.wo_b)
         self._tap("attn_out", L, out)
         return out
+
+    def _gather_attn(self, q, ring, ckv, idx, S: int, mask, sink):
+        """`_softmax_attn` for the prefill window+compressed case, without the gathered KV.
+
+        Same kernel, same math, same launch shape as the DSV41_ATTN_FUSED_PREFILL path -- the only
+        difference is that the two key segments are ADDRESSED (ring row (pos - 127 + j) % RING,
+        compressed row idx[t, j]) instead of having been copied into a [T, 640, 512] tensor first,
+        so the result is bit-identical to `_softmax_attn` under that gate, not merely close.
+
+        `S` is the absolute position of query row 0; prefill positions are contiguous, which is
+        what lets the window rows be derived without any index tensor at all.
+        """
+        with nvtx_range("attn.softmax"):
+            return prefill_attention_gather(q, ring, ckv, idx, S, mask, sink,
+                                            self.args.head_dim ** -0.5,
+                                            self.args.window_size, RING)
 
     def _softmax_attn(self, q, kv_all, mask, sink):
         """Sinked softmax attention over [T, n, d] KV, in fixed-size query tiles.
@@ -465,9 +520,14 @@ class Model:
                 out[i:j].copy_(y)          # fp32 -> bf16 here, same rounding, no fp32 concatenation
             return out if ATTN_NOCAT else torch.cat(outs).to(torch.bfloat16)
 
-    def _compressed(self, x, qr, w, L, S, T, pos, sh: Shared):
+    def _compressed(self, x, qr, w, L, S, T, pos, sh: Shared, return_rows: bool = True):
         """Produce/read the shared compressed KV for this chunk; run/reuse the indexer; return the
-        gathered rows [T, k, d] and their mask [T, k]."""
+        gathered rows [T, k, d] and their mask [T, k].
+
+        `return_rows=False` hands back the indexer's [T, k] absolute rows instead of the gathered
+        KV, for the gather-fused attention kernel that follows the index itself: the gather is
+        1.31 s of vectorized_gather_kernel per prefill and, at T=2048, 1.07 GB of the chunk's
+        peak (512 rows x 512 dims x bf16 per query) before the concatenation doubles it."""
         with nvtx_range("attn.compressed"):
             a = self.args
             r = w.ratio
@@ -521,6 +581,8 @@ class Model:
                 sh.topk = self._indexer(x, qr, L, pos, compress_lens, n_c, sh)
             idx = sh.topk  # [T, k] absolute compressed positions, -1 = none
             self._tap("topk", L, idx); self._tap("n_c", L, n_c)
+            if not return_rows:
+                return idx, idx >= 0
             rows = sh.ckv[idx.clamp_min(0)]
             return rows, idx >= 0
 
