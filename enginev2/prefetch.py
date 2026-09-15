@@ -69,7 +69,13 @@ class PrefetchStats:
     cancelled_queued: int = 0
     discarded_running: int = 0
     discarded_finished: int = 0
-    started: int = 0         # speculative reads that actually BEGAN -- see precision
+    # TWO BOUNDARIES, because speculation is asynchronous. `started_at_window_end` is what had
+    # begun when the timed window closed; `started` is the honest total after outstanding
+    # speculation is resolved, which is the I/O the prediction window actually caused. Reading
+    # precision off the first flatters the predictor: predictions issued near the last layer start
+    # their reads after the window closed.
+    started_at_window_end: int = 0
+    started: int = 0
     refused: int = 0         # predictions the store had no free slot for
 
     @property
@@ -79,7 +85,11 @@ class PrefetchStats:
         `issued` counts SUBMISSIONS, and a queued cancellation means the submission never became a
         read -- which is the entire point of cancelling it. Dividing by `issued` therefore charged
         the predictor for I/O it did not do and understated fetch precision, on exactly the surface
-        a training decision is read from. `started` is counted where the read begins.
+        a training decision is read from.
+
+        `started` is counted where the read leaf is entered, and only settles once outstanding
+        speculation is resolved -- call Engine.finalize_stats(). Before that it holds the
+        window-end value, which is an UNDERCOUNT of the I/O caused.
         """
         n = self.started or self.issued
         return self.used / n if n else 0.0

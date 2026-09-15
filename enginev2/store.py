@@ -37,6 +37,13 @@ class EvictionPolicy:
     """Bookkeeping for one cache region. All hooks are called with the store's lock held."""
 
     name = "abstract"
+    # Does this policy read the global LRU ORDER? Only then must a rollback restore the victim's
+    # exact position in it; otherwise placing it anywhere is invisible.
+    uses_lru_order = False
+    # Keys victim() passed over because their slots were protected. The chosen victim is the first
+    # UNPROTECTED candidate, not the head -- so restoring it at the head is wrong by exactly this
+    # prefix, and under lookahead protected slots are common rather than rare.
+    last_skipped: tuple = ()
 
     def on_hit(self, key: tuple, slot: int, clock: int) -> None:
         """A resident was used. `clock` is the store's logical time (decode resolves only)."""
@@ -44,11 +51,12 @@ class EvictionPolicy:
     def on_insert(self, key: tuple, slot: int, clock: int) -> None:
         """A key became resident in `slot` because something DEMANDED it."""
 
-    def on_restore(self, key: tuple, slot: int) -> None:
+    def on_restore(self, key: tuple, slot: int, skipped: tuple = ()) -> None:
         """A key that was evicted is resident again and NOTHING about it changed.
 
-        Distinct from on_admit: a restore must not touch age or count at all, because the eviction
-        it undoes never physically happened.
+        Distinct from on_admit: a restore must not touch age or count, because the eviction it
+        undoes never physically happened. `skipped` is what victim() passed over to reach this key,
+        and it goes back IN FRONT -- restoring at the head is only correct when nothing was skipped.
         """
         self.on_admit(key, slot, 0)
 
@@ -73,11 +81,16 @@ class LRUPolicy(EvictionPolicy):
     """Least-recently-used. The residents dict is already in LRU order, so the head wins."""
 
     name = "lru"
+    uses_lru_order = True
 
     def victim(self, residents, protected, clock):
+        skipped = []
         for k, slot in residents.items():
             if slot not in protected:
+                self.last_skipped = tuple(skipped)
                 return k
+            skipped.append(k)
+        self.last_skipped = ()
         return None
 
 
@@ -146,30 +159,37 @@ class AgeOverFreqPolicy(EvictionPolicy):
             if not b:
                 del self._buckets[c]
 
-    def on_restore(self, key: tuple, slot: int) -> None:
-        """Re-register at the count and age it already had, AT THE HEAD of its bucket.
+    def on_restore(self, key: tuple, slot: int, skipped: tuple = ()) -> None:
+        """Re-register at the count and age it already had, at its EXACT position in the bucket.
 
-        victim() only ever considers each bucket's HEAD, so bucket order is recency and appending
-        at the tail changes which key is evicted next -- the same class of mistake as restoring at
-        the MRU end of the global LRU, and it also contradicted "an undone eviction leaves no
-        trace". The key was its bucket's head when it was chosen; that is where it goes back.
+        victim() only walks each bucket to its first UNPROTECTED entry, so bucket order is recency
+        and appending at the tail changes who is evicted next -- the same class of mistake as
+        restoring at the MRU end of the global LRU. But the head is only right when nothing was
+        skipped: whatever victim() passed over was ahead of this key and must go back in front.
+        O(protected entries), which is the layer's working set, not the cache size.
         """
         c = self._use_count.get(key, 0)
         b = self._buckets.setdefault(c, collections.OrderedDict())
         b[key] = slot
         b.move_to_end(key, last=False)
+        for k in reversed(skipped):
+            if k in b:
+                b.move_to_end(k, last=False)
 
     def victim(self, residents, protected, clock):
-        best = best_key = None
+        best = best_key = best_skipped = None
         for c, b in self._buckets.items():
+            skipped = []
             for k, s in b.items():
                 if s in protected:
+                    skipped.append(k)
                     continue
                 score = (clock - self._last_acc.get(k, 0)) / (1.0 + c)
                 rank = (score, -self._last_acc.get(k, 0))
                 if best_key is None or rank > best_key:
-                    best_key, best = rank, k
-                break                             # only the head of each bucket can win
+                    best_key, best, best_skipped = rank, k, tuple(skipped)
+                break                 # only the first UNPROTECTED entry of each bucket can win
+        self.last_skipped = best_skipped or ()
         return best
 
 
@@ -506,11 +526,15 @@ class ExpertSlots:
     # ---------------------------------------------------------------- allocation
     def _lru_slot_for(self, key: tuple, used: frozenset, touch: bool = True) -> int:
         self._last_victim = None
+        self._last_skipped = ()
         if self.free_lru:
             slot = self.free_lru.pop()
         else:
             victim = self.evict.victim(self.lru, used, self._clock)
+            # What the policy passed over to reach this victim. Needed to put it back exactly, and
+            # captured here because last_skipped is only valid until the next victim() call.
             self._last_victim = victim
+            self._last_skipped = self.evict.last_skipped
             if victim is None:
                 raise RuntimeError(
                     "no evictable LRU slot: every resident is in use by this call or has a write "
@@ -628,7 +652,7 @@ class ExpertSlots:
             used.add(s)
             g = self.gen[s] = self.gen.get(s, 0) + 1
             if self._last_victim is not None:
-                self._displaced[s] = (g, self._last_victim)
+                self._displaced[s] = (g, self._last_victim, self._last_skipped)
             else:
                 self._displaced.pop(s, None)      # this generation displaced nobody
             to_load.append((key, s, g))
@@ -644,7 +668,7 @@ class ExpertSlots:
         rec = self._displaced.pop(slot, None)
         if rec is None or rec[0] != gen:          # a newer generation owns this slot now
             return False
-        victim = rec[1]
+        _g, victim, skipped = rec
         if self.lru.get(victim) is not None:
             return False
         try:
@@ -652,13 +676,19 @@ class ExpertSlots:
         except ValueError:
             return False                      # the slot was taken again: too late, and that is fine
         self.lru[victim] = slot
-        # ...at the LRU END, not the MRU end. `lru[k] = v` appends, which would promote the tenant
-        # we just evicted to most-recently-used -- an undone eviction that left a large trace, and
-        # it made the rollback arm measurably WORSE than no rollback. It was the least-recently-used
-        # entry when it was chosen as victim, so that is where it goes back.
+        # ...at its EXACT position, not merely the LRU end. `lru[k] = v` appends, which would
+        # promote the evicted tenant to most-recently-used -- that made rollback measurably WORSE
+        # than no rollback. But the LRU end is only right when victim() skipped nothing: it returns
+        # the first UNPROTECTED entry, so anything protected ahead of it must go back in front.
+        # Restoring at the head and stopping there was wrong exactly under lookahead, where
+        # protected slots are common. Only policies that READ the order need this.
         self.lru.move_to_end(victim, last=False)
+        if self.evict.uses_lru_order:
+            for k in reversed(skipped):
+                if k in self.lru:
+                    self.lru.move_to_end(k, last=False)
         self.slot_key[slot] = victim
-        self.evict.on_restore(victim, slot)
+        self.evict.on_restore(victim, slot, skipped)
         self.restored += 1
         return True
 

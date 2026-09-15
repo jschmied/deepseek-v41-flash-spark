@@ -1020,4 +1020,54 @@ def test_rollback_restores_the_exact_eviction_state_under_both_policies():
             sl.clear_pending(spec[0][1], spec[0][2])
     assert len(sl._displaced) <= 16, (
         f"displaced records grew with speculation count: {len(sl._displaced)} for 16 slots")
-    print("  rollback: same victim, same order, both policies; displaced bounded by slots  OK")
+    # AND WITH PROTECTED PREDECESSORS, which is the case the above cannot see. victim() returns the
+    # first UNPROTECTED entry, so when slots ahead of it are protected the victim is NOT the head --
+    # and restoring at the head puts it in front of keys that were ahead of it. Under lookahead,
+    # protected slots (used this call, or mid-write) are the normal case, not the rare one.
+    for policy in ("lru", "age_over_freq"):
+        sl = ExpertSlots(16, 8, policy=policy)
+        for e in range(16):
+            sl.reserve(0, (e,), prefill=False)
+        before_order = list(sl.lru)
+        # protect the first few slots exactly as a live reserve() would
+        head = [sl.lru[k] for k in before_order[:3]]
+        protected = frozenset(head)
+        victim = sl.evict.victim(sl.lru, protected, sl._clock)
+        assert victim is not None and victim not in before_order[:3], (
+            f"{policy}: fixture did not protect ahead of the victim")
+
+        # snapshot BEFORE the speculation -- taking it after captures the state being undone
+        before_buckets = ({c: list(b) for c, b in sl.evict._buckets.items()}
+                          if policy == "age_over_freq" else None)
+        # drive the real path: reserve_speculative protects pending slots, so make them pending
+        fake = [((99, i), slot, sl.gen.get(slot, 0) + 1) for i, slot in enumerate(head)]
+        for _k, slot, g in fake:
+            sl.gen[slot] = g
+        sl.mark_pending(fake)
+        spec, refused = sl.reserve_speculative([(9, 950)])
+        assert spec and not refused, f"{policy}: protected-prefix speculation was refused"
+        k, slot, gen = spec[0]
+        evicted = [kk for kk in before_order if kk not in sl.lru]
+        assert evicted and evicted[0] not in before_order[:3], (
+            f"{policy}: a protected key was evicted: {evicted}")
+
+        assert sl.rollback_speculative(k, slot, gen), f"{policy}: rollback refused"
+        if sl.evict.uses_lru_order:
+            assert list(sl.lru) == before_order, (
+                f"{policy}: rollback with a protected prefix changed LRU order\n"
+                f"  before {before_order[:6]}\n  after  {list(sl.lru)[:6]}")
+        else:
+            # age_over_freq never reads the global order, so it is not part of its restore
+            # contract -- asserting it would pin state the policy does not use. Its own state is
+            # the bucket order, and THAT must come back exactly.
+            after_buckets = {c: list(b) for c, b in sl.evict._buckets.items()}
+            assert after_buckets == before_buckets, (
+                f"{policy}: rollback changed bucket order\n  before {before_buckets}\n"
+                f"  after  {after_buckets}")
+        after_victim = sl.evict.victim(sl.lru, protected, sl._clock)
+        assert after_victim == victim, (
+            f"{policy}: protected-prefix rollback changed the next victim: "
+            f"{victim} -> {after_victim}")
+
+    print("  rollback: same victim and order, with and without a protected prefix, both "
+          "policies; displaced bounded by slots  OK")

@@ -321,6 +321,9 @@ class Engine:
             self.chain.set("logits", step)
             self.c.steps += 1
         self.c.wall_s = time.perf_counter() - t0
+        # The window boundary, not the total: speculation issued near the last layer has not begun
+        # reading yet. finalize_stats() settles it.
+        self.pf.started_at_window_end = self.loader.started_spec
         self.pf.started = self.loader.started_spec
         bw = self.loader.bw
         if bw is not None:                      # a real provider models no device; leave at 0.0
@@ -328,6 +331,26 @@ class Engine:
             self.c.achieved_gbs = bw.achieved_gbs
             self.c.device_busy_s = bw.busy_s
         return self.c
+
+    def finalize_stats(self, cancel_outstanding: bool = False, timeout: float = 60.0) -> None:
+        """Settle the asynchronous counters. Call before reading pf for an experiment.
+
+        Speculation outstanding when the timed window closed still causes real I/O, and reading
+        precision before it resolves flatters the predictor. Two honest choices, both offered:
+        let it finish (the I/O the window caused), or cancel what has not started (the I/O a
+        predictor would cause if the request ended here). Default is the former, because it is the
+        one that answers "what did this prediction window cost".
+        """
+        if cancel_outstanding:
+            pending = [(k, sl, g) for k, (sl, g, _c) in self._spec.items()]
+            if pending:
+                q, r, f = self.loader.cancel(pending)
+                self.pf.cancelled_queued += q
+                self.pf.discarded_running += r
+                self.pf.discarded_finished += f
+        self.loader.quiesce(timeout)
+        self.loader.drain_forgets()
+        self.pf.started = self.loader.started_spec
 
     def warm(self, calls, upto: int) -> None:
         """Bring the cache to the state the scored window starts in, with no I/O and no timing.
