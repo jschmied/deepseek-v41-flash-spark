@@ -313,10 +313,12 @@ class SlotReady:
         self._cv = threading.Condition(self._lk)
         self._done: set[tuple] = set()       # (slot, generation) pairs that have completed
         self._ts: dict[tuple, int] = {}      # when each became ready, for prefetch lead time
-        # arm() is where a generation's identity is established, so it is where the context is
-        # retained. Without this the most important critical-path wait in the engine --
-        # EXPERT_DATA -- could not say which request or step was blocked on it.
-        self._ctx: dict[tuple, tuple] = {}   # (slot, gen) -> (ctx, cause_id)
+        # arm() records the PRODUCER's context -- who submitted this read. That is the right owner
+        # for nvme/h2d/slot_ready, and the WRONG one for a wait: a speculative read armed at layer
+        # 12 for layer 16 would attribute layer 16's blocking to layer 12. The consumer passes its
+        # own context to wait(); only cause_id is recovered from here, because the cause really is
+        # the prediction that issued the read.
+        self._ctx: dict[tuple, tuple] = {}   # (slot, gen) -> (producer_ctx, cause_id)
         self._err: dict[tuple, BaseException] = {}
 
     def arm(self, slot: int, gen: int, ctx=NO_CTX, cause_id: int = 0) -> None:
@@ -343,21 +345,27 @@ class SlotReady:
         with self._lk:
             return self._ts.get((slot, gen))
 
-    def wait(self, slot: int, gen: int, timeout: float | None = None) -> None:
+    def wait(self, slot: int, gen: int, timeout: float | None = None, ctx=NO_CTX,
+             key: tuple | None = None) -> None:
         with self._lk:
             blocked = (slot, gen) not in self._done
             sp = next_span()
-            c, cause = self._ctx.get((slot, gen), (NO_CTX, 0))
+            _producer, cause = self._ctx.get((slot, gen), (NO_CTX, 0))
             if blocked and self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=c, slot=slot, gen=gen,
-                                         span=sp, cause_id=cause, aux=WaitReason.EXPERT_DATA))
+                # ctx is the CONSUMER: the layer actually blocked. cause_id is the producer's
+                # prediction, so "who waited" and "what caused the wait" stay separable.
+                # the key travels with the wait: without it a trace cannot say WHICH expert the
+                # consumer was blocked on, only which slot, and slots are recycled.
+                self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, key=key, slot=slot,
+                                         gen=gen, span=sp, cause_id=cause,
+                                         aux=WaitReason.EXPERT_DATA))
             try:
                 if not self._cv.wait_for(lambda: (slot, gen) in self._done, timeout):
                     raise TimeoutError(f"slot {slot} gen {gen} never became ready")
             finally:
                 if blocked and self.obs.enabled:
-                    self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=c, slot=slot, gen=gen,
-                                             span=sp, cause_id=cause,
+                    self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, key=key, slot=slot,
+                                             gen=gen, span=sp, cause_id=cause,
                                              aux=WaitReason.EXPERT_DATA))
             err = self._err.get((slot, gen))
         if err is not None:

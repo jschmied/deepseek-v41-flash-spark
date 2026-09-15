@@ -235,7 +235,7 @@ class LoaderService:
             # put when the provider is swapped.
             if self.obs.enabled:
                 self.obs.safe_emit(Event(now_ns(), "nvme_start", ctx=ctx, cause_id=cause_id, key=key, slot=slot, gen=gen))
-            staged = self.leaves.read(key, self.stage)
+            staged = self.leaves.read(key, self.stage, ctx)
             if self.obs.enabled:
                 self.obs.safe_emit(Event(now_ns(), "nvme_end", ctx=ctx, cause_id=cause_id, key=key, slot=slot, gen=gen))
             if not self.policy.lease_until_completion:
@@ -355,19 +355,19 @@ class LoaderService:
                 # it will complete and simply never be used, which is the cost of being wrong.
         return n
 
-    def wait_slots(self, to_load) -> None:
+    def wait_slots(self, to_load, ctx=NO_CTX) -> None:
         """Wait only for the slots THIS consumer needs. Errors are drained, then the first re-raised."""
         err = None
         for key, slot, gen in to_load:
             try:
-                self.ready.wait(slot, gen)
+                self.ready.wait(slot, gen, ctx=ctx, key=key)
             except BaseException as e:            # noqa: BLE001
                 if err is None:
                     err = e
         if err is not None:
             raise err
 
-    def wait_all(self, timeout: float = 60.0) -> None:
+    def wait_all(self, timeout: float = 60.0, ctx=NO_CTX) -> None:
         """The global barrier: every pending DEMAND read, whether or not this consumer needs it.
 
         Instrumented here because this is where D3 actually costs something. It was invisible, and
@@ -379,14 +379,14 @@ class LoaderService:
                 return
             sp = next_span()
             if self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "wait_start", span=sp, value=self._demand,
-                                         aux=WaitReason.GLOBAL_BARRIER))
+                self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, span=sp,
+                                         value=self._demand, aux=WaitReason.GLOBAL_BARRIER))
             try:
                 if not self._demand_cv.wait_for(lambda: self._demand == 0, timeout):
                     raise TimeoutError("global barrier never drained")
             finally:
                 if self.obs.enabled:
-                    self.obs.safe_emit(Event(now_ns(), "wait_end", span=sp,
+                    self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, span=sp,
                                              aux=WaitReason.GLOBAL_BARRIER))
 
     def shutdown(self) -> None:

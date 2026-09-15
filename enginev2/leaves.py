@@ -285,9 +285,14 @@ class Leaves:
     def step_other(self) -> None:
         """Per-step GPU work outside the layer loop. Default: none."""
 
-    def read(self, key: tuple, pool) -> "StagedExpert":
+    def read(self, key: tuple, pool, ctx=None) -> "StagedExpert":
         """Acquire a staging buffer from `pool`, read the expert into it, and return a handle that
-        OWNS that lease. The loader releases it after h2d completes, never before."""
+        OWNS that lease. The loader releases it after h2d completes, never before.
+
+        `ctx` is passed EXPLICITLY rather than through a thread-local so that a provider with its
+        own pool or thread layout still attributes a staging wait to the right request -- and so
+        that pool.acquire(ctx) is reachable at all, which it was not when read() took two args.
+        """
         raise NotImplementedError
 
     def h2d(self, slot: int, key: tuple, staged: "StagedExpert") -> None:
@@ -365,8 +370,8 @@ class ModelLeaves(Leaves):
     def prefill_moe(self, layer: int, slots, chunks: int = 1) -> None:
         delay(C_DEP * chunks / self.scale)
 
-    def read(self, key: tuple, pool) -> StagedExpert:
-        sid = pool.acquire()
+    def read(self, key: tuple, pool, ctx=None) -> StagedExpert:
+        sid = pool.acquire(ctx) if ctx is not None else pool.acquire()
         try:
             self.bw.read(EXPERT_BYTES)
             # A VIEW of the leased buffer, never a copy. This is the whole zero-copy contract: a

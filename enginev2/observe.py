@@ -228,29 +228,51 @@ class TraceObserver(Observer):
     lock would instead put contention into the path that exists to measure contention. Per-thread
     rings avoid both; merging by timestamp happens in drain(), off the hot path.
 
-    `capacity` is a TOTAL event budget, divided across rings as threads appear -- not a per-thread
-    size. As per-thread it was a memory hazard rather than a knob: 1<<20 with 48 loader workers is
-    ~392 MB of reference arrays before a single Event is stored, taken from the same unified memory
-    pool the run is measuring. The default is deliberately small for the same reason.
+    `capacity` is a HARD TOTAL, not a per-thread size and not an estimate. As per-thread it was a
+    memory hazard rather than a knob: 1<<20 with 48 loader workers is ~392 MB of reference arrays
+    before a single Event is stored, from the same unified memory pool the run is measuring.
+
+    Dividing by an ASSUMED thread count was still not a bound: thread 65 allocated ring 65, and a
+    small capacity lost to per_ring_min anyway. So the ring count is capped and threads past the cap
+    share one fallback ring under a lock. Those threads pay for contention, which is the correct
+    trade -- an unbounded allocator is a worse failure than a slow rare path, and instrumenting the
+    engram pool or the inner read_pool later would otherwise silently raise the footprint.
     """
 
-    def __init__(self, capacity: int = 1 << 17, max_threads: int = 64, per_ring_min: int = 1024):
+    def __init__(self, capacity: int = 1 << 17, max_rings: int = 64, per_ring_min: int = 256):
         self.capacity = capacity
-        self.per_ring = max(per_ring_min, capacity // max(1, max_threads))
+        self.max_rings = max(1, max_rings)
+        self.per_ring = max(per_ring_min, capacity // self.max_rings)
+        # A hard ceiling on what can ever be allocated, independent of how many threads appear.
+        self.max_bytes = (self.max_rings + 1) * self.per_ring * 8
         self._local = threading.local()
         self._rings: list = []
         self._lk = threading.Lock()
+        self._shared = [[None] * self.per_ring, 0]
+        self._shared_lk = threading.Lock()
+        self.shared_writers = 0
 
     def _ring(self):
         r = getattr(self._local, "ring", None)
         if r is None:
-            r = self._local.ring = [[None] * self.per_ring, 0]
             with self._lk:
-                self._rings.append(r)
-        return r
+                if len(self._rings) < self.max_rings:
+                    r = [[None] * self.per_ring, 0]
+                    self._rings.append(r)
+                else:
+                    r = None
+                    self.shared_writers += 1
+            self._local.ring = r if r is not None else False
+        return r or None
 
     def emit(self, event: Event) -> None:
         r = self._ring()
+        if r is None:                      # past the ring cap: shared, locked, rare
+            with self._shared_lk:
+                i = self._shared[1]
+                self._shared[0][i % self.per_ring] = event
+                self._shared[1] = i + 1
+            return
         i = r[1]
         r[0][i % self.per_ring] = event
         r[1] = i + 1
@@ -258,18 +280,23 @@ class TraceObserver(Observer):
     @property
     def dropped(self) -> int:
         with self._lk:
-            return sum(max(0, r[1] - self.per_ring) for r in self._rings)
+            n = sum(max(0, r[1] - self.per_ring) for r in self._rings)
+        with self._shared_lk:
+            return n + max(0, self._shared[1] - self.per_ring)
 
     @property
     def bytes_reserved(self) -> int:
         """Reference-array footprint only; the Events themselves are on top of this."""
         with self._lk:
-            return len(self._rings) * self.per_ring * 8
+            n = len(self._rings)
+        return (n + 1) * self.per_ring * 8
 
     def drain(self) -> list:
         out = []
         with self._lk:
             rings = list(self._rings)
+        with self._shared_lk:
+            rings = rings + [list(self._shared)]
         for buf, n in rings:
             if n <= self.per_ring:
                 out.extend(e for e in buf[:n] if e is not None)

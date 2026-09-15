@@ -604,9 +604,9 @@ def test_staging_is_zero_copy_and_the_buffer_outlives_the_h2d():
             seen.setdefault("released_during_h2d", []).append(staged.released)
             super().h2d(slot, key, staged)
 
-        def read(self, key, pool):
+        def read(self, key, pool, ctx=None):
             self.__dict__["_pool"] = pool
-            return super().read(key, pool)
+            return super().read(key, pool, ctx)
 
     for pol in (V1, V2):                       # D2 on and off: the buffer rule holds either way
         seen.clear()
@@ -778,3 +778,69 @@ def test_context_and_cause_survive_async_and_a_bad_observer_cannot_break_the_eng
     assert t.per_ring < t.capacity, "capacity is being used as a per-thread size"
     print("  identity: EXPERT_DATA carries request/step, cause_id joins a prediction to its I/O, "
           "a hostile observer is quarantined  OK")
+
+
+# ================================================================ 18. whose wait is it
+def test_waits_are_attributed_to_the_blocked_consumer_not_the_producer():
+    """Three attributions that test 17 did not check, each of which was wrong or missing.
+
+    a) a LATE speculative read must blame the layer that is blocked, not the layer that predicted
+       it. SlotReady.arm() stores the producer's context, so recovering it in wait() charged
+       layer 16's stall to layer 12.
+    b) D3's global barrier -- the dominant v1 consumer wait -- must carry a context at all.
+    c) a STAGING_BUFFER wait must carry one too; acquire(ctx) existed but read() never passed it.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+
+    # (a) speculative reads at horizon 1, forced to be late by a slow device
+    obs = TraceObserver(capacity=1 << 19)
+    e = Engine(V2, lru_slots=5328, transient_slots=400, request_id=9,
+               leaves=ModelLeaves(calls, Bandwidth(scale=0.25), scale=1.0, start=cut),
+               prefetch=OraclePrefetcher(calls, 1, start=cut), observer=obs)
+    try:
+        e.warm(calls, cut)
+        e.decode(2)
+    finally:
+        e.close()
+    spec_waits = [x for x in obs.drain()
+                  if x.kind == "wait_start" and x.aux is WaitReason.EXPERT_DATA
+                  and x.cause_id and x.key]
+    assert spec_waits, "no speculative read was waited on -- the arm proves nothing"
+    misattributed = [x for x in spec_waits if x.ctx.layer != x.key[0]]
+    assert not misattributed, (
+        "a late prefetch blamed the predicting layer instead of the blocked one: "
+        f"{[(x.ctx.layer, x.key[0]) for x in misattributed[:3]]}")
+
+    # (b) D3 under v1
+    obs = TraceObserver(capacity=1 << 19)
+    e = Engine(V1, lru_slots=5328, transient_slots=400, request_id=9,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut), observer=obs)
+    try:
+        e.warm(calls, cut)
+        e.decode(2)
+    finally:
+        e.close()
+    gb = [x for x in obs.drain()
+          if x.kind == "wait_start" and x.aux is WaitReason.GLOBAL_BARRIER]
+    assert gb, "D3 never blocked under v1, so this arm proves nothing"
+    assert any(x.ctx.request_id == 9 and x.ctx.layer >= 0 for x in gb), (
+        "the dominant v1 wait carries no context")
+
+    # (c) force staging contention: one buffer, many workers, v1 holds it to completion
+    obs = TraceObserver(capacity=1 << 19)
+    e = Engine(V1, lru_slots=5328, transient_slots=400, request_id=9,
+               n_workers=8, staging=1, expert_read_qd=8, h2d_inflight=8,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut), observer=obs)
+    try:
+        e.warm(calls, cut)
+        e.decode(1)
+    finally:
+        e.close()
+    st = [x for x in obs.drain()
+          if x.kind == "wait_start" and x.aux is WaitReason.STAGING_BUFFER]
+    assert st, "one staging buffer and eight workers produced no staging wait"
+    assert any(x.ctx.request_id == 9 for x in st), (
+        "staging waits carry no context -- read() is not passing it to acquire()")
+    print(f"  attribution: {len(spec_waits)} speculative waits blamed on the blocked layer, "
+          f"D3 and staging both carry context  OK")

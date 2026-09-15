@@ -75,7 +75,7 @@ class Engine:
         # over predictions and precision over fetches are different numbers (see PrefetchStats):
         # a correct prediction that was already cached never becomes a fetch, so scoring only the
         # fetches would credit the predictor with none of its cheap hits.
-        self._pred: dict[int, set] = {}
+        self._pred: dict[int, dict] = {}       # target layer -> {key: cause_id}
         self.c = Counters()
 
     def close(self):
@@ -91,12 +91,14 @@ class Engine:
         self.c.compute_s += time.perf_counter() - t0
         return r
 
-    def _wait(self, to_load):
+    def _wait(self, to_load, ctx=NO_CTX):
+        """The consumer's own context goes in, not the producer's: for a speculative read these
+        differ, and the wait belongs to whoever is blocked."""
         t0 = time.perf_counter()
         try:
             if self.policy.global_barrier:
-                self.loader.wait_all()
-            self.loader.wait_slots(to_load)
+                self.loader.wait_all(ctx=ctx)
+            self.loader.wait_slots(to_load, ctx=ctx)
         finally:
             self.c.blocked_s += time.perf_counter() - t0
 
@@ -111,6 +113,10 @@ class Engine:
         than measured-small. It is exercised in prefill_chunked(), where several chunks of one layer
         are in flight together.
         """
+        # FIRST statement: the edge waits below already use it, so constructing it afterwards left
+        # the documented fallback passing None into chain.wait and losing the context entirely.
+        ctx = ctx if ctx is not None else OpContext(self.request_id, self.c.steps, layer)
+
         # Graph A. The expert ids come OUT of it -- they are not handed to the driver. This is the
         # line that makes this an engine and not a replay of someone else's route.
         # EDGE 1: graph A reads h and pre_mix, which graph B of the PREVIOUS layer wrote. Both
@@ -121,7 +127,6 @@ class Engine:
         # source signals per layer; the driver only waits.
         self.chain.wait("engram", layer, ctx=ctx)
 
-        ctx = ctx if ctx is not None else OpContext(self.request_id, self.c.steps, layer)
         e = self.obs.enabled
         if e:
             self.obs.safe_emit(Event(now_ns(), "layer_a_start", ctx=ctx))
@@ -170,7 +175,7 @@ class Engine:
             # v1: resolve() ends in list(pool.map(...)). Nothing issues work except a call that
             # immediately blocks on it, which is why the device cannot be kept busy at any thread
             # count. Everything after this point runs with the loader already drained.
-            self._wait(to_load)
+            self._wait(to_load, ctx)
 
         # The shared expert is expert-INdependent, so a provider that captured it outside graph B
         # can run it here, while the reads fly. One that did not has it inside layer_b, where it
@@ -179,7 +184,7 @@ class Engine:
             self._compute(lambda: self.leaves.shared(layer))
 
         if not self.policy.resolve_blocks:
-            self._wait(to_load)
+            self._wait(to_load, ctx)
 
         # Graph B. `route` carries the FUNCTIONAL input -- the provider's route-aligned slot tensor,
         # built by bind_slots above. `reads` is safety bookkeeping only: which arena slots this
@@ -205,8 +210,17 @@ class Engine:
         want = {(layer, e) for e in uniq}
         named = self._pred.pop(layer, None)
         if named:
-            self.pf.pred_hit += len(named & want)
-            self.pf.pred_miss += len(named - want)
+            hit = set(named) & want
+            self.pf.pred_hit += len(hit)
+            self.pf.pred_miss += len(named) - len(hit)
+            if self.obs.enabled:
+                # A correct prediction that was ALREADY RESIDENT never became I/O, so it appears in
+                # no load chain. Emitting it keeps predictor accounting complete rather than
+                # I/O-only, and it carries its own batch id.
+                for k in hit:
+                    if k not in self._spec:
+                        self.obs.safe_emit(Event(now_ns(), "prediction_resident_hit",
+                                                 ctx=ctx or NO_CTX, key=k, cause_id=named[k]))
         wrong = []
         for key in [k for k in self._spec if k[0] == layer]:
             slot, gen, cause = self._spec.pop(key)
@@ -252,7 +266,7 @@ class Engine:
         # the schema did not have it.
         pred_id = next_span()
         for k in keys:
-            self._pred.setdefault(k[0], set()).add(k)
+            self._pred.setdefault(k[0], {})[k] = pred_id
         to_load, refused = self.slots.reserve_speculative(keys)
         self.pf.refused += refused
         if self.obs.enabled:
@@ -358,5 +372,5 @@ class Engine:
 
         for to_load, reads in per_chunk:
             # D3 ON: this chunk's FFN waits for EVERY chunk's reads. OFF: only its own.
-            self._wait(pending if self.policy.global_barrier else to_load)
+            self._wait(pending if self.policy.global_barrier else to_load, ctx)
             self._compute(lambda r=reads: self.leaves.prefill_moe(layer, r), slots=reads)
