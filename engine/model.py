@@ -49,6 +49,8 @@ LM_PHASES = os.environ.get("DSV41_LM_PHASES", "0") == "1"
 #             layer's expert set, so the union resolve at the end loads only the ~15 % tail)
 #   synconly  the per-chunk D2H barrier and nothing else -- the control that separates the cost of
 #             synchronising from the cost of overlapping
+# Remove the fp32 concatenation in _softmax_attn (bit-identical; see there).
+ATTN_NOCAT = os.environ.get("DSV41_ATTN_NOCAT", "0") == "1"
 EARLY_SUBMIT = os.environ.get("DSV41_EARLY_SUBMIT", "off").lower()
 if EARLY_SUBMIT in ("1", "true", "yes"):
     EARLY_SUBMIT = "all"
@@ -390,7 +392,15 @@ class Model:
             denom = p.sum(-1, keepdim=True) + torch.exp(sink[None, :, None] - mx)
             return torch.einsum("thn,tnd->thd", p / denom, kvt)
 
-        outs = []
+        # ATTN_NOCAT: write each tile straight into the final bf16 buffer instead of keeping every
+        # fp32 tile alive and concatenating at the end. The old form materialises [T, H, D] fp32
+        # (268 MB at T=2048), reads it back to concatenate, and reads it a third time to cast --
+        # measured across all torch.cat sites: CatArrayBatchedCopy* is 2.15 s of a 40.3 s GPU-busy
+        # prefill. Bit-identical by construction: the cast is elementwise, so converting a tile at a
+        # time rounds every element exactly as converting the concatenation does, and no reduction
+        # order changes. The gate exists only to A/B it; there is no numerical reason for two paths.
+        out = None
+        outs = [] if not ATTN_NOCAT else None
         for i in range(0, T, B):
             j = min(i + B, T)
             qt, kvt, mt = q[i:j].float(), kv_all[i:j].float(), mask[i:j]
@@ -399,8 +409,14 @@ class Model:
                 qt = torch.cat([qt, qt.new_zeros(B - n, *qt.shape[1:])])
                 kvt = torch.cat([kvt, kvt.new_zeros(B - n, *kvt.shape[1:])])
                 mt = torch.cat([mt, mt.new_zeros(B - n, mt.size(1))])
-            outs.append(tile(qt, kvt, mt)[:n])
-        return torch.cat(outs).to(torch.bfloat16)
+            y = tile(qt, kvt, mt)[:n]
+            if not ATTN_NOCAT:
+                outs.append(y)
+                continue
+            if out is None:
+                out = torch.empty((T, *y.shape[1:]), dtype=torch.bfloat16, device=y.device)
+            out[i:j].copy_(y)          # fp32 -> bf16 here, same rounding, no fp32 concatenation
+        return out if ATTN_NOCAT else torch.cat(outs).to(torch.bfloat16)
 
     def _compressed(self, x, qr, w, L, S, T, pos, sh: Shared):
         """Produce/read the shared compressed KV for this chunk; run/reuse the indexer; return the
