@@ -337,7 +337,7 @@ class V41Engine:
     supports_grammar = True
 
     def __init__(self, model_dir: str, max_seq: int = 32768, arena_gb: float | None = None, device: str = "cuda",
-                 trace_stats: str | None = None, act_quant: bool = False, spec: bool = True, io_threads: int = 12,
+                 trace_stats: str | None = None, act_quant: bool = False, spec: bool = True, io_threads: int = 48,
                  transient_slots: int = 400, keep_free_gb: float = 20.0, swa_replay: bool | None = None,
                  hot_profile: str | None = None, prune_keep: float | None = None,
                  sim_bits: int | None = None, sim_cold_frac: float = 1.0, prune_select: str = "uniform",

@@ -158,7 +158,7 @@ def _pread_chunk(fd: int, view: memoryview, off: int, need: int) -> None:
 
 class ExpertStore:
     def __init__(self, model_dir: str, index: dict, arena, n_layers: int, transient_slots: int = 400,
-                 io_threads: int = 12, mtp_prefix: str | None = None, read_threads: int | None = None,
+                 io_threads: int = 48, mtp_prefix: str | None = None, read_threads: int | None = None,
                  read_chunk_mb: float | None = None, evict_policy: str | None = None):
         self.model_dir = model_dir
         self.arena = arena  # tools.fp4_moe.ExpertArena or a compatible object with .slots and load_slot_bytes
@@ -208,7 +208,7 @@ class ExpertStore:
             from .cb3_cache import CB3Cache
             self.cb3_cache = CB3Cache(_cc, arena.device if hasattr(arena, "device") else "cuda")
         if read_threads is None:
-            read_threads = int(os.environ.get("DSV41_READ_THREADS", 24))
+            read_threads = int(os.environ.get("DSV41_READ_THREADS", 96))
         if read_chunk_mb is None:
             read_chunk_mb = float(os.environ.get("DSV41_READ_CHUNK_MB", 4))
         self.io_threads = io_threads

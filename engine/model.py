@@ -42,7 +42,12 @@ RING = int(os.environ.get("DSV41_RING", 4096))
 # chunk already touches ~370 of 384), so the NVMe traffic of a prompt is ~chunks x layers x 384
 # experts and quadrupling the chunk quarters it. The ceiling is activation memory: at T=2048 the
 # gathered window+compressed KV of one layer is ~2.7 GB.
-MAX_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", 2048))
+# 4096, not 2048: measured -4.7 s on a 12,624-token prefill (57.9 -> 53.2 s warm), byte-identical
+# output. Two of the three largest prefill costs scale with the CHUNK COUNT, not the token count --
+# the per-chunk kernel launches, and the CB3 unpack, which re-unpacks nearly the same ~362 experts
+# for every chunk of a layer. Halving the chunk count halves both. 8192 is better still on paper but
+# the pre-flight refuses it: the reserve below is MAX_CHUNK * 5e6, which is 41 GB at 8192.
+MAX_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", 4096))
 # Per-layer phase timing for the layer-major pass. Every scheduling idea on the table is a claim
 # about where time goes INSIDE a layer, and route_s/load_s/moe_s are per-request totals that
 # cannot see it. Costs a device sync per layer, so it is a diagnostic, never a serving setting.

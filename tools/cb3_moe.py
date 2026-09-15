@@ -431,7 +431,12 @@ PREFILL_MIN_P = int(os.environ.get("DSV41_CB3_PREFILL_MIN_P", 65))
 #
 # Holding a layer's union costs scratch: 400 slots x 18.80 MB = 7.5 GB, ~3.4 pp of expert
 # residency. That is the trade the A/B has to beat.
-SCRATCH_SLOTS = int(os.environ.get("DSV41_CB3_SCRATCH_SLOTS", 0))
+# 384 (a layer's expert set), not 0: measured -3.70 s of a 58.6 s prefill, and it still wins by
+# 3.7 s at EQUAL TOTAL MEMORY -- arena 82.8 GB with no cache (58.1 s) against arena 75.6 GB plus
+# 7.2 GB of scratch (54.4 s), i.e. after paying 3.3 pp of expert residency and ~7 GB more NVMe.
+# The engine's auto-sizer subtracts this scratch before sizing the arena (see v41_engine); it is
+# allocated lazily at the first prefill, which is why it must be reserved up front.
+SCRATCH_SLOTS = int(os.environ.get("DSV41_CB3_SCRATCH_SLOTS", 384))
 
 
 class CB3ArenaV2(CB3Arena):
