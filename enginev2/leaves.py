@@ -235,9 +235,15 @@ class StagedExpert:
         self._released = False
 
     def release(self) -> None:
-        if not self._released:
-            self._released = True
-            self._pool.release(self.sid)
+        if self._released:
+            return                      # idempotent: the loader releases in finally
+        self._released = True
+        self.payload = None             # use-after-release is a bug, so make it one
+        self._pool.release(self.sid)
+
+    @property
+    def released(self) -> bool:
+        return self._released
 
 
 class Leaves:
@@ -363,10 +369,14 @@ class ModelLeaves(Leaves):
         sid = pool.acquire()
         try:
             self.bw.read(EXPERT_BYTES)
+            # A VIEW of the leased buffer, never a copy. This is the whole zero-copy contract: a
+            # real reader preads into this memory and hands the H2D views that alias it. Returning
+            # a clone here would be the 13.8 MB-per-expert mistake, and the tests check identity.
+            view = pool.buffer(sid)
         except BaseException:
             pool.release(sid)
             raise
-        return StagedExpert(sid, None, pool)
+        return StagedExpert(sid, view, pool)
 
     def h2d(self, slot: int, key: tuple, staged: StagedExpert) -> None:
         delay(H2D_S / self.scale)

@@ -38,8 +38,8 @@ import time
 from .drivers import Engine
 from .sched import V1, V2, ComputeStream, LoaderService, Policy
 from .chain import Chain, EngramSource
-from .leaves import Bandwidth, ModelLeaves
-from .store import ExpertSlots, SlotArena, SlotReady
+from .leaves import Bandwidth, ModelLeaves, StagedExpert
+from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
 from .trace import N_LAYERS, load_decode, warmup_cut
 
 SCALE = 20.0          # leaves run 20x faster; ratios are preserved, the tests are about ordering
@@ -577,3 +577,73 @@ def test_declared_edges_are_load_bearing_not_decorative():
     finally:
         e.close()
     print("  edges: a missing producer HANGS the step, and every declared edge is produced  OK")
+
+
+# ================================================================ 15. zero-copy / buffer lifetime
+def test_staging_is_zero_copy_and_the_buffer_outlives_the_h2d():
+    """The four things a real pinned-memory provider must satisfy, checkable before it exists.
+
+    a) read() hands back views ALIASING the leased buffer, not a clone. A 13.8 MB copy per expert
+       would be a different performance model wearing the same interface.
+    b) the buffer is STILL LEASED while h2d runs -- cudaMemcpyAsync reads out of it until its
+       completion event, so releasing at handoff corrupts the transfer in flight. This is the
+       property the earlier `lease_until_completion=False` violated: it released the physical
+       buffer after the read.
+    c) it is released exactly once, and after h2d, on both the success and the failure path.
+    d) the payload is unusable after release, so a use-after-release is loud rather than silent.
+    """
+    seen = {}
+
+    class ProbeLeaves(ModelLeaves):
+        def h2d(self, slot, key, staged):
+            pool = self.__dict__["_pool"]
+            seen.setdefault("aliases", []).append(pool.same_buffer(staged.sid, staged.payload))
+            seen.setdefault("leased_during_h2d", []).append(pool.in_use(staged.sid))
+            seen.setdefault("released_during_h2d", []).append(staged.released)
+            super().h2d(slot, key, staged)
+
+        def read(self, key, pool):
+            self.__dict__["_pool"] = pool
+            return super().read(key, pool)
+
+    for pol in (V1, V2):                       # D2 on and off: the buffer rule holds either way
+        seen.clear()
+        e = mk(pol, lru_slots=32, transient_slots=8, n_workers=4, staging=8)
+        e.loader.leaves = ProbeLeaves((), Bandwidth(scale=SCALE), scale=SCALE)
+        try:
+            _, to_load, _ = e.slots.reserve(0, tuple(range(6)), prefill=False)
+            e.loader.submit(to_load)
+            e.loader.wait_slots(to_load)
+            assert seen["aliases"] and all(seen["aliases"]), (
+                f"{pol.name}: read() returned a COPY of the staging buffer, not a view")
+            assert all(seen["leased_during_h2d"]), (
+                f"{pol.name}: the staging buffer was back on the free list while the H2D ran")
+            assert not any(seen["released_during_h2d"]), (
+                f"{pol.name}: the lease was released before the copy completed")
+            assert e.loader.stage.at_rest(), f"{pol.name}: leases outstanding at rest"
+        finally:
+            e.close()
+
+    # (c) failure path: the read raises, and the buffer still comes back exactly once
+    e = mk(V2, lru_slots=32, transient_slots=8, n_workers=2, staging=4, fail={(0, 3)})
+    try:
+        _, to_load, _ = e.slots.reserve(0, (3,), prefill=False)
+        e.loader.submit(to_load)
+        try:
+            e.loader.wait_slots(to_load)
+        except IOError:
+            pass
+        assert e.loader.stage.at_rest(), "a failed read leaked its staging buffer"
+    finally:
+        e.close()
+
+    # (d) use-after-release is loud
+    pool = StagingPool(2, nbytes=64)
+    st = StagedExpert(pool.acquire(), None, pool)
+    st.payload = pool.buffer(st.sid)
+    assert pool.same_buffer(st.sid, st.payload)
+    st.release()
+    assert st.payload is None and st.released
+    st.release()                                # idempotent, not a double free
+    assert pool.at_rest()
+    print("  staging: zero-copy view, leased across the H2D, released once and only after  OK")

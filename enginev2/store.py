@@ -189,24 +189,54 @@ class StagingPool:
 
     A leaked lease is unrecoverable: there are only `n` for the life of the process and a handful
     of leaks means every miss blocks forever with the NVMe idle. Hence release-in-finally, always.
+
+    Each lease owns a real BUFFER, not just a ticket. That is what makes zero-copy testable: a
+    provider must hand the H2D views that ALIAS this memory, and `same_buffer()` can prove it did
+    not quietly clone. A real provider swaps these for `torch.empty(n, pin_memory=True)`; identity
+    is checked by object, so the test survives the substitution.
     """
 
-    def __init__(self, n: int):
+    def __init__(self, n: int, nbytes: int = 4096):
         self.n = n
+        self.nbytes = nbytes
         self._sem = threading.Semaphore(n)
         self._lk = threading.Lock()
         self.free = list(range(n))
         self.peak_in_use = 0
+        # Small by default: identity is what the contract tests need, not 48 x 13.8 MB.
+        self._buf = [bytearray(nbytes) for _ in range(n)]
+        self._leased: set[int] = set()
+
+    def buffer(self, sid: int) -> memoryview:
+        """The pinned buffer for this lease. Only valid while the lease is held."""
+        if sid not in self._leased:
+            raise RuntimeError(f"staging buffer {sid} accessed while not leased")
+        return memoryview(self._buf[sid])
+
+    def same_buffer(self, sid: int, view) -> bool:
+        """True if `view` aliases this lease's buffer rather than being a copy of it."""
+        try:
+            return view.obj is self._buf[sid]
+        except AttributeError:
+            return False
+
+    def in_use(self, sid: int) -> bool:
+        with self._lk:
+            return sid in self._leased
 
     def acquire(self) -> int:
         self._sem.acquire()
         with self._lk:
             sid = self.free.pop()
+            self._leased.add(sid)
             self.peak_in_use = max(self.peak_in_use, self.n - len(self.free))
             return sid
 
     def release(self, sid: int) -> None:
         with self._lk:
+            if sid not in self._leased:
+                raise RuntimeError(f"staging buffer {sid} released twice")
+            self._leased.discard(sid)
             self.free.append(sid)
         self._sem.release()
 
