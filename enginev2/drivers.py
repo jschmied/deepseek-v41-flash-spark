@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import time
 
+from .chain import Chain, EngramSource
 from .leaves import Bandwidth, ModelLeaves
 from .prefetch import PrefetchStats, Prefetcher
 from .sched import ComputeStream, LoaderService, Policy
@@ -37,7 +38,8 @@ class Engine:
     def __init__(self, policy: Policy, evict: str = "lru", lru_slots: int = 5328,
                  transient_slots: int = 400, n_workers: int = 48, staging: int = 48,
                  nvme_qd: int = 8, h2d_inflight: int = 8, scale: float = 1.0,
-                 leaves=None, calls=(), prefetch=None, discard_wrong_asap: bool = True):
+                 leaves=None, calls=(), prefetch=None, discard_wrong_asap: bool = True,
+                 engram=None):
         self.policy = policy
         self.slots = ExpertSlots(lru_slots, transient_slots, policy=evict)
         self.arena = SlotArena(self.slots.n_slots)
@@ -57,6 +59,11 @@ class Engine:
         self.prefetch = prefetch if prefetch is not None else Prefetcher()
         self.discard_wrong_asap = discard_wrong_asap
         self.pf = PrefetchStats()
+        # Every real happens-before edge of a step, named and waited on even where the for-loop
+        # would have provided it. An edge that is only implicit is invisible to a plugged-in
+        # component -- see chain.py.
+        self.chain = Chain()
+        self.engram = engram if engram is not None else EngramSource()
         self._spec: dict[tuple, tuple] = {}     # key -> (slot, gen) still speculative, not yet used
         self.c = Counters()
 
@@ -95,8 +102,21 @@ class Engine:
         """
         # Graph A. The expert ids come OUT of it -- they are not handed to the driver. This is the
         # line that makes this an engine and not a replay of someone else's route.
+        # EDGE 1: graph A reads h and pre_mix, which graph B of the PREVIOUS layer wrote. Both
+        # stages write the same single `h` buffer, so this is also why A(L+1) cannot simply be run
+        # early: it would clobber what B(L) still needs.
+        self.chain.wait("h", layer - 1)
+        # EDGE 5: eg_rows[L] comes off a second async NVMe stream and is read by graph A. The
+        # source signals per layer; the driver only waits.
+        self.chain.wait("engram", layer)
+
         route = self._compute(lambda: self.leaves.layer_a(layer))
         uniq = route.uniq
+        # EDGE 2 and 6: A wrote y / route_idx / route_w, and the KV buffers this layer's
+        # bookkeeping will clone.
+        self.chain.set("y", layer)
+        self.chain.set("route", layer)
+        self.chain.set("kv", layer)
 
         # What did speculation actually buy, and what did it cost? Settled BEFORE reserve(), while
         # the previous prediction for this layer is still distinguishable from a real residency.
@@ -137,7 +157,11 @@ class Engine:
         # thing and collapsing them (passing sorted(set(...)) as the input) loses the per-expert
         # ordering and multiplicity that moe_fn needs.
         reads = sorted(set(slot_of.values()))
+        # EDGE 3 and 4 are already enforced above: the ids came out of A, and _wait covers both the
+        # `slots` mapping and the expert bytes being resident.
+        self.chain.wait("y", layer)
         self._compute(lambda: self.leaves.layer_b(layer, route), slots=reads)
+        self.chain.set("h", layer)            # B wrote h and pre_mix for the next layer
 
     # ------------------------------------------------------------------ prefetch bookkeeping
     def _settle_speculation(self, layer: int, uniq) -> None:
@@ -175,12 +199,19 @@ class Engine:
     def decode(self, steps: int) -> Counters:
         """Run `steps` decode steps. Where the expert ids come from is the provider's business."""
         t0 = time.perf_counter()
-        for _ in range(steps):
+        for step in range(steps):
+            # EDGE 8: this step's inputs depend on the previous step's logits, through draft and
+            # verify. Declared, and the reset makes a step's edges unsatisfied until re-set, so a
+            # component cannot accidentally consume last step's events.
+            self.chain.reset()
+            self.engram.issue(range(N_LAYERS), step, self.chain)
             for layer in range(N_LAYERS):
                 self.decode_layer(layer)
+            self.chain.wait("h", N_LAYERS - 1)      # EDGE 7: gF replays after the last layer
             # Per-step GPU work outside the layer loop (head, draft). Zero unless the provider was
             # told that part of the unattributed 78.5 % lives here rather than in a layer.
             self._compute(self.leaves.step_other)
+            self.chain.set("logits")
             self.c.steps += 1
         self.c.wall_s = time.perf_counter() - t0
         bw = self.loader.bw

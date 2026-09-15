@@ -37,9 +37,10 @@ import time
 
 from .drivers import Engine
 from .sched import V1, V2, ComputeStream, LoaderService, Policy
+from .chain import Chain, EngramSource
 from .leaves import Bandwidth, ModelLeaves
 from .store import ExpertSlots, SlotArena, SlotReady
-from .trace import load_decode, warmup_cut
+from .trace import N_LAYERS, load_decode, warmup_cut
 
 SCALE = 20.0          # leaves run 20x faster; ratios are preserved, the tests are about ordering
 
@@ -526,3 +527,53 @@ def test_readiness_is_per_generation_and_cannot_regress():
     except IOError:
         pass
     print("  readiness: exact per (slot, generation), no regression, errors stay bound  OK")
+
+
+# ================================================================ 14. the edges are enforced
+def test_declared_edges_are_load_bearing_not_decorative():
+    """A dependency that is only implied by statement order is invisible to anything plugged in.
+
+    So each real edge is a named event, and this proves the driver actually blocks on one: an
+    engram source that never signals layer 7 must HANG the step, not let graph A read rows that
+    have not arrived. If this test ever passes without the timeout, the edge has become decorative.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+
+    class SkipsOneLayer(EngramSource):
+        def issue(self, layers, step, chain):
+            for L in layers:
+                if L != 7:
+                    chain.set("engram", L)
+
+    e = Engine(V2, lru_slots=5328, transient_slots=400, scale=SCALE,
+               leaves=ModelLeaves(calls, Bandwidth(scale=SCALE), scale=SCALE, start=cut),
+               engram=SkipsOneLayer())
+    try:
+        e.warm(calls, cut)
+        ok, _ = run_with_timeout(lambda: e.decode(1), 6)
+        assert not ok, "the step completed although layer 7's engram rows never arrived"
+    finally:
+        e.close()
+
+    # and the same driver completes when every layer IS signalled
+    e = Engine(V2, lru_slots=5328, transient_slots=400, scale=SCALE,
+               leaves=ModelLeaves(calls, Bandwidth(scale=SCALE), scale=SCALE, start=cut),
+               engram=EngramSource())
+    try:
+        e.warm(calls, cut)
+        c = e.decode(1)
+        assert c.steps == 1
+        # every per-layer edge the step declares must have been produced
+        for L in range(N_LAYERS):
+            for name in ("h", "y", "route", "engram", "kv"):
+                assert e.chain.is_set(name, L), f"{name}@{L} was never set"
+        assert e.chain.is_set("logits"), "the step-level edge was never set"
+        assert e.chain.checks >= N_LAYERS * 2, (
+            f"the driver only reached {e.chain.checks} edges -- the chain is not in the path")
+        assert e.chain.blocks == 0, (
+            f"{e.chain.blocks} edges blocked on a strictly sequential driver, which should be "
+            f"impossible: every edge is produced before it is reached")
+    finally:
+        e.close()
+    print("  edges: a missing producer HANGS the step, and every declared edge is produced  OK")
