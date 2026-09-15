@@ -178,7 +178,7 @@ class ExpertStore:
         self.transient_index = {s: i for i, s in enumerate(self.transient_ring)}
         self.transient_pos = 0
         self.transient_map: dict[tuple, int] = {}
-        self._pending: list = []          # futures from resolve(defer=True)
+        self._pending: list = []          # (future, key, slot) from resolve(defer=True)
         self._pending_slots: set[int] = set()   # slots those futures are still writing
         self._pending_layer: int | None = None
         # --- eviction policy (see the module docstring). Everything below is dead weight under
@@ -264,8 +264,11 @@ class ExpertStore:
         t_lease = time.perf_counter()
         sid = self._lease()
         self.stats["lease_s"] += time.perf_counter() - t_lease
-        buf = self.stage[sid]
         try:
+            # inside the try: everything between _lease() and the try must be infallible or the
+            # lease leaks, and there are only io_threads (48) of them for the life of the process --
+            # a handful of leaks and every miss blocks forever in _lease() with the NVMe idle.
+            buf = self.stage[sid]
             mv = self.stage_mv[sid]
             base_addr = buf.data_ptr()
             cur = (-base_addr) % ALIGN
@@ -311,9 +314,24 @@ class ExpertStore:
 
         The arena copy must not run on the default stream: every worker would then have to
         synchronise the stream the model is computing on, once per miss. On its own stream a worker
-        only has to (a) wait for whatever was queued on the compute stream when the lease started --
-        the previous layer's MoE kernel may still be reading the slot we are about to overwrite --
-        and (b) synchronise its own stream before releasing the pinned buffer.
+        only has to (a) wait on the compute stream -- the previous layer's MoE kernel may still be
+        reading the slot we are about to overwrite -- and (b) synchronise its own stream before
+        releasing the pinned buffer.
+
+        (a) is NOT "whatever was queued when the lease started", which is what this said until the
+        deferred path existed and is worth being precise about, because the difference is the whole
+        of the unexplained 14.5 %: `wait_stream` records its event where it is CALLED, and it is
+        called in the sink, after the ~5 ms read. Under EARLY_SUBMIT the caller spends that read
+        queueing the rest of the layer's attention onto the compute stream, so the H2D waits for
+        attention that was queued AFTER the load was submitted -- precisely the work it was meant
+        to overlap with. See DSV41_UNSAFE_NO_COMPUTE_WAIT at the top of this file.
+
+        `compute` is `torch.cuda.current_stream()` read on an io WORKER thread, and PyTorch's
+        current stream is thread-local: it is the device's default stream, which is where the model
+        computes today (engine/fastdecode.py is the only other stream user and it joins back). A
+        future change that moves compute onto a non-default stream would silently turn this barrier
+        into a no-op against a stream nobody uses -- the slot corruption it guards would come back
+        with no error and no flag flipped.
         """
         st = getattr(self._tls, "stream", None)
         if st is None:
@@ -479,10 +497,28 @@ class ExpertStore:
         self.stats["evict_cmps"] += cmps
         return best
 
+    def _protect_pending(self, used: set | frozenset) -> set | frozenset:
+        """`used` widened with the slots a deferred read is still landing in.
+
+        `_transient_slot_for` has skipped `_pending_slots` since the prefill-side bug; the LRU half
+        of the arena never did, and a deferred DECODE resolve is the same shape: the key goes into
+        self.lru the moment the slot is assigned, 13.8 MB before the data is there, so a second
+        deferred resolve inside the same layer is free to pick that slot as its eviction victim and
+        overwrite a read in flight. It does not happen at the shipped 5,328 LRU slots -- a fresh
+        entry is MRU under "lru" and scores age 0 (the minimum) under age_over_freq -- which is
+        exactly the "invisible because the numbers happen to be large" that cost us the first one.
+        Costs one set union per miss ONLY while something is pending; today nothing defers on the
+        decode path, so it is a single empty-set test per miss.
+        """
+        if not self._pending_slots:
+            return used
+        return set(used) | self._pending_slots
+
     def _lru_slot_for(self, key: tuple, used: set | frozenset = frozenset()) -> int:
         """Reserve an LRU slot for `key` (evicting if needed). Caller loads it.
         `used` holds the slots already promised to other experts of the SAME resolve() call; they
         must never be evicted, or two experts would end up sharing one slot."""
+        used = self._protect_pending(used)
         if self._afq:
             self._afq_tick()
         if self.free_lru:
@@ -556,6 +592,11 @@ class ExpertStore:
         i = self.transient_index.get(slot)
         if i is None:
             return False
+        # the DONOR must not be a slot a deferred read is still writing: the swap hands it to the
+        # transient ring, and the ring's own _pending_slots guard would then be looking at a slot
+        # that is no longer pending-by-position. Nothing is corrupted today (the write still lands
+        # in the same slot), but the read is wasted and the arena holds a key nobody maps.
+        used = self._protect_pending(used)
         if self._afq:
             # A promotion is a decode access to a resident expert (a hit, in the replay's terms) AND
             # an eviction, because the donor slot the ring gets back has to come from the LRU. Tick
@@ -695,7 +736,10 @@ class ExpertStore:
                     f"join_pending() must be called at a layer boundary")
                 self._pending_layer = layer
                 self._pending_slots.update(sl for _, sl in to_load)
-                self._pending += [self.pool.submit(self._load_into_slot, k, sl) for k, sl in to_load]
+                # (future, key, slot): join_pending() needs the key to un-map an expert whose read
+                # raised, and the slot to hand back
+                self._pending += [(self.pool.submit(self._load_into_slot, k, sl), k, sl)
+                                  for k, sl in to_load]
                 self.stats["load_submit_s"] += time.perf_counter() - t0
             else:
                 list(self.pool.map(lambda ks: self._load_into_slot(*ks), to_load))
@@ -709,19 +753,58 @@ class ExpertStore:
         Each io worker already `stream.synchronize()`s its own copy stream before releasing its
         pinned staging lease, so a resolved future IS a completion guarantee -- no CUDA events are
         needed for this to be safe.
+
+        EVERY future is waited on even when one raises, and the pending bookkeeping is cleared
+        before the first error is re-raised. The plain `for f: f.result()` this replaced returned
+        through the first exception with `_pending`/`_pending_slots`/`_pending_layer` still
+        populated: those slots were then blocked forever (the ring lost them permanently) and the
+        rest of the layer's reads were still in flight, writing into an arena the caller believed
+        was quiesced. The visible symptom was a LATER, unrelated request dying with "transient ring
+        exhausted" or "deferred resolves span layers" -- the wrong error, in the wrong place, one
+        request after the real one.
+
+        A failed expert is also un-mapped (`_forget`). Its slot holds a torn read, and leaving the
+        key in self.lru / transient_map would make the next resolve() count it as a HIT and compute
+        with whatever partial bytes landed -- silent, and permanent for the life of the process.
         """
         if not self._pending:
             return
         t0 = time.perf_counter()
-        for f in self._pending:
-            f.result()
-        self._pending = []
+        pending, self._pending = self._pending, []
+        err = None
+        for f, key, slot in pending:
+            try:
+                f.result()
+            except BaseException as e:      # noqa: BLE001 -- drain the rest, then re-raise the first
+                if err is None:
+                    err = e
+                self._forget(key, slot)
         self._pending_slots.clear()
         self._pending_layer = None
         # NOT load_s. With deferred submission the overlapped part of a load disappears from every
         # counter, so load_s would silently mean different things depending on `defer`. This is the
         # residual the overlap failed to hide -- the number the scheduler is judged on.
         self.stats["load_wait_s"] += time.perf_counter() - t0
+        if err is not None:
+            raise err
+
+    def _forget(self, key: tuple, slot: int) -> None:
+        """Un-map `key` from `slot` after a load that did not complete.
+
+        The slot is left holding a torn read, so it must not stay reachable as a hit. An LRU slot
+        goes back to free_lru (it belongs to neither pool otherwise -- a promoted transient slot has
+        already left transient_index, so free_lru is its only home); a transient-ring slot is left
+        in the ring, where the next wrap overwrites it anyway.
+        """
+        if self.lru.get(key) == slot:
+            del self.lru[key]
+            self.free_lru.append(slot)
+            if self._afq:
+                self._afq_drop(key)
+        if self.transient_map.get(key) == slot:
+            del self.transient_map[key]
+        if self.slot_key.get(slot) == key:
+            del self.slot_key[slot]
 
     def warm_start(self, ranked_keys: list[tuple], log=print):
         """Fill the LRU with `ranked_keys` (most important first) up to capacity."""
