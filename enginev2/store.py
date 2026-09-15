@@ -42,7 +42,16 @@ class EvictionPolicy:
         """A resident was used. `clock` is the store's logical time (decode resolves only)."""
 
     def on_insert(self, key: tuple, slot: int, clock: int) -> None:
-        """A key became resident in `slot`."""
+        """A key became resident in `slot` because something DEMANDED it."""
+
+    def on_admit(self, key: tuple, slot: int, clock: int) -> None:
+        """A key became resident SPECULATIVELY -- nothing has used it.
+
+        It must become evictable (a policy that cannot see it can never evict it, which leaks the
+        slot) without receiving any usage credit. Default: treat it as an insert, which is correct
+        for policies that carry no usage history.
+        """
+        self.on_insert(key, slot, clock)
 
     def on_drop(self, key: tuple) -> None:
         """A key stopped being resident (evicted, or un-mapped after a torn read)."""
@@ -98,6 +107,26 @@ class AgeOverFreqPolicy(EvictionPolicy):
 
     on_hit = _touch
     on_insert = _touch
+
+    def on_admit(self, key: tuple, slot: int, clock: int) -> None:
+        """Register in the bucket for the count it ALREADY has, and age from now.
+
+        A speculative insert that bumped the count was the bug: a wrong prefetch permanently
+        credited that expert with a use it never had, and on_drop preserves _use_count on purpose,
+        so the phantom survived eviction and made the expert harder to evict every time it came
+        back. That is precisely the eviction signal the predictor experiments must not rewrite.
+        Ageing from `clock` is deliberate too -- an unused speculative entry should age normally
+        from arrival, so it is evicted early rather than looking ancient or looking fresh.
+        """
+        c = self._use_count.get(key, 0)
+        # Materialise the count even when it is zero. on_drop() looks the key up in _use_count to
+        # find which bucket to remove it from and returns early when it is absent -- so admitting
+        # without writing it left the key in bucket 0 forever after eviction, and the victim search
+        # later returned a key no longer in `lru`. Writing 0 is not a usage credit: it records the
+        # count this key already had.
+        self._use_count.setdefault(key, c)
+        self._last_acc[key] = clock
+        self._buckets.setdefault(c, collections.OrderedDict())[key] = slot
 
     def on_drop(self, key: tuple) -> None:
         c = self._use_count.get(key)
@@ -339,6 +368,10 @@ class SlotReady:
                 self._err[(slot, gen)] = err
             self._cv.notify_all()
 
+    def is_done(self, slot: int, gen: int) -> bool:
+        with self._lk:
+            return (slot, gen) in self._done
+
     def ready_ts(self, slot: int, gen: int):
         """When (slot, gen) became ready, or None if it has not. Lets the driver tell a prefetch
         that ARRIVED from one that was merely mapped and is still in flight."""
@@ -439,7 +472,7 @@ class ExpertSlots:
             return self._pending.get(slot)
 
     # ---------------------------------------------------------------- allocation
-    def _lru_slot_for(self, key: tuple, used: frozenset) -> int:
+    def _lru_slot_for(self, key: tuple, used: frozenset, touch: bool = True) -> int:
         if self.free_lru:
             slot = self.free_lru.pop()
         else:
@@ -453,7 +486,10 @@ class ExpertSlots:
             self.evict.on_drop(victim)
         self.lru[key] = slot
         self.slot_key[slot] = key
-        self.evict.on_insert(key, slot, self._clock)
+        if touch:
+            self.evict.on_insert(key, slot, self._clock)
+        else:
+            self.evict.on_admit(key, slot, self._clock)
         return slot
 
     def _transient_slot_for(self, key: tuple, used: frozenset) -> int:
@@ -550,7 +586,8 @@ class ExpertSlots:
             if key in self.lru or key in self.transient_map:
                 continue                                   # already resident: nothing to do
             try:
-                s = self._lru_slot_for(key, frozenset(used) | inflight)
+                # touch=False: speculation makes a key resident, it does not USE it.
+                s = self._lru_slot_for(key, frozenset(used) | inflight, touch=False)
             except RuntimeError:
                 refused += 1
                 continue

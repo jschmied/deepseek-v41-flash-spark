@@ -147,6 +147,9 @@ class Engine:
         # the previous prediction for this layer is still distinguishable from a real residency.
         self._settle_speculation(layer, uniq, ctx)
 
+        # Apply anything the loader asked to un-map (discarded speculation, torn reads) HERE, on
+        # the driver thread, so the cache is only ever mutated from one place.
+        self.loader.drain_forgets()
         slot_of, to_load, to_wait = self.slots.reserve(layer, uniq, prefill=False)
         if e:
             for k, sl, g in to_load:
@@ -253,7 +256,9 @@ class Engine:
             # A wrong prefetch holds a slot AND a pending write, so it blocks eviction as well as
             # occupying capacity. Cancelling recovers the slot for reads that are already known to
             # be needed. Reads already in flight are not interrupted -- that cost is real and stays.
-            self.pf.cancelled += self.loader.cancel(wrong)
+            c, r, f = self.loader.cancel(wrong)
+            self.pf.cancelled += c + f
+            self.pf.discarded_running += r
 
     def _issue_speculation(self, layer: int, uniq, ctx=None) -> None:
         self.prefetch.observe(layer, uniq, self.c.steps)
@@ -359,6 +364,7 @@ class Engine:
         pending = []
         per_chunk = []
         for uniq in chunks:
+            self.loader.drain_forgets()
             slot_of, to_load, to_wait = self.slots.reserve(layer, uniq, prefill=True)
             self.c.fetches += len(to_load)
             # SUBMIT ONLY THE NEW READS. `to_wait` is already in flight from an earlier chunk;

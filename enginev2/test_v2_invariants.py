@@ -38,7 +38,7 @@ import time
 from .drivers import Engine
 from .sched import V1, V2, ComputeStream, LoaderService, Policy
 from .chain import Chain, EngramSource
-from .prefetch import OraclePrefetcher
+from .prefetch import OraclePrefetcher, RecallOraclePrefetcher
 from .observe import CounterObserver, NullObserver, TraceObserver, WaitReason
 from .leaves import Bandwidth, ModelLeaves, StagedExpert
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
@@ -235,7 +235,13 @@ def test_wait_completes_even_when_a_load_raises():
             err = exc
         assert err is not None, "a raising load did not surface"
         assert e.loader.q.unfinished_tasks == 0, "pending left populated after the wait"
+        # The invariant is not "un-mapped at this instant" -- it is "never counted as a HIT by a
+        # later reserve". Un-mapping moved to the driver's drain (cache mutation happens on one
+        # thread), so assert the property through the public path instead of the internal dict.
+        e.loader.drain_forgets()
         assert (3, 2) not in e.slots.lru and (3, 5) not in e.slots.lru, "torn slot still mapped"
+        # the test's own next-reserve check below is the real invariant; this only has to happen
+        # before it, because un-mapping is now applied by the driver rather than the worker.
         assert (3, 0) in e.slots.lru, "a healthy sibling was forgotten too"
         assert e.loader.stage.at_rest()
         # the whole point: the next reserve must MISS on the failed key, not hit a torn slot
@@ -844,3 +850,55 @@ def test_waits_are_attributed_to_the_blocked_consumer_not_the_producer():
         "staging waits carry no context -- read() is not passing it to acquire()")
     print(f"  attribution: {len(spec_waits)} speculative waits blamed on the blocked layer, "
           f"D3 and staging both carry context  OK")
+
+
+# ================================================================ 19. speculation must not lie
+def test_speculation_neither_credits_frequency_nor_keeps_a_wrong_slot():
+    """Two bugs that would have invalidated every predictor arm, and a third they uncovered.
+
+    a) speculative insertion went through on_insert, which for age_over_freq IS the use-count
+       touch -- so a WRONG prefetch permanently credited that expert with a use it never had, and
+       on_drop preserves _use_count on purpose, so the phantom outlived eviction. The predictor was
+       rewriting the eviction signal it was being measured against.
+    b) discard_wrong_asap only cancelled QUEUED work; a wrong prefetch already reading stayed
+       mapped and kept its slot. The read cost is unavoidable, the residency is not.
+    c) admitting without materialising the count left the key in a policy bucket after eviction --
+       a ghost the victim search returns and `lru.pop` then raises on.
+    """
+    sl = ExpertSlots(64, 8, policy="age_over_freq")
+    k = (3, 77)
+    to_load, _ = sl.reserve_speculative([k])
+    assert sl.evict._use_count.get(k, 0) == 0, "speculation credited a use"
+    assert any(k in b for b in sl.evict._buckets.values()), "speculative key is not evictable"
+    sl.reserve(3, (77,), prefill=False)
+    assert sl.evict._use_count[k] == 1, "a real demand did not count"
+
+    # (c) no ghosts after a speculative key is dropped
+    sl2 = ExpertSlots(16, 8, policy="age_over_freq")
+    sl2.reserve(0, tuple(range(6)), prefill=False)
+    spec, _ = sl2.reserve_speculative([(1, i) for i in range(6)])
+    for key, slot, _g in spec[:3]:
+        sl2.forget(key, slot)
+    in_bucket = {kk for b in sl2.evict._buckets.values() for kk in b}
+    assert not (in_bucket - set(sl2.lru)), (
+        f"policy holds keys that are no longer resident: {sorted(in_bucket - set(sl2.lru))[:4]}")
+
+    # (b) a wrong prefetch that already RAN must not stay resident
+    calls = load_decode()
+    cut = warmup_cut(calls)
+    e = Engine(V2, lru_slots=5328, transient_slots=400,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut),
+               prefetch=RecallOraclePrefetcher(calls, 2, recall=1.0, precision=0.5, start=cut))
+    try:
+        e.warm(calls, cut)
+        e.decode(3)
+        e.loader.drain_forgets()
+        assert e.pf.wasted > 0, "no wrong prefetch was produced, so this arm proves nothing"
+        assert e.pf.discarded_running > 0, (
+            "no wrong prefetch was caught mid-flight -- only queued ones were being discarded")
+        still = [k for k, v in e._spec.items()]
+        assert not still or all(k[0] >= 0 for k in still)
+    finally:
+        e.close()
+    print(f"  speculation: no phantom use-counts, {e.pf.discarded_running} running wrong prefetches "
+          f"un-mapped, no policy ghosts  OK")

@@ -177,6 +177,16 @@ class LoaderService:
         # consumes one. Membership here is the truth, and both sides take _lk, so there is no race
         # between a worker dequeuing and a cancel arriving.
         self._queued: set = set()
+        # Wrong speculation that is ALREADY RUNNING cannot be un-read, but it must not stay
+        # resident: its slot was taken from the cache and it will never be used. The read is paid
+        # for either way -- that is the honest cost of being wrong -- but the residency is not.
+        self._discard: set = set()
+        # ExpertSlots IS NOT THREAD-SAFE -- lru, free_lru and the policy buckets are plain dicts
+        # mutated by the driver. Un-mapping from a worker was tolerable while it only happened on
+        # the rare error path; routing every discarded prefetch through it made the race routine and
+        # produced KeyError in the victim search. Workers therefore only RECORD what to un-map, and
+        # the driver drains it between layers, where all other cache mutation already happens.
+        self._forget: list = []
         # D3's barrier is over DEMAND reads only. v1's join_pending() has no speculation to wait
         # for, so folding prefetches into it would make the v1 arm wait on work v1 never issues --
         # a confound, not a finding. Speculation is deprioritised and uncounted here by design.
@@ -287,11 +297,22 @@ class LoaderService:
                 self.h2d_calls += 1
                 self.h2d_s += dt
             self.ready.set(slot, gen)
+            # Was this speculation discarded while it was in flight? The read is done and paid for;
+            # refuse it the cache slot. Nothing ever waits on a speculative read, so un-mapping
+            # after completion cannot strand a consumer.
+            with self._lk:
+                drop = (slot, gen) in self._discard
+                self._discard.discard((slot, gen))
+            if drop:
+                with self._lk:
+                    self._forget.append((key, slot))
         except BaseException as exc:              # noqa: BLE001
             # A failed expert must be UN-MAPPED: its slot holds a torn read, and leaving the key
             # mapped would make the next reserve() count it as a HIT and compute with partial
-            # bytes -- silent, and permanent for the life of the process.
-            self.slots.forget(key, slot)
+            # bytes -- silent, and permanent for the life of the process. Deferred to the driver
+            # for the same reason as above; drain_forgets() runs before the next reserve().
+            with self._lk:
+                self._forget.append((key, slot))
             self.ready.set(slot, gen, err=exc)
         finally:
             if permit_held:
@@ -340,20 +361,44 @@ class LoaderService:
                 # know which request and step asked for it.
                 self.q.put((prio, self._seq, (ctx, cause_id) + tuple(item), prio == 0))
 
-    def cancel(self, items) -> int:
-        """Drop speculation that has not started. Nothing ever WAITS on a speculative read, so a
-        cancelled one just frees its slot -- that is what makes `discard wrong prefetch asap`
-        implementable at all. Already-running reads are not interrupted; they finish and are simply
-        never used, which is the honest cost of having been wrong."""
-        n = 0
+    def cancel(self, items) -> tuple:
+        """Discard wrong speculation in whichever of its three states it is in.
+
+        An earlier version only cancelled QUEUED work and let a running or finished wrong prefetch
+        stay mapped in the LRU -- which contradicts the policy it implements and quietly hands the
+        predictor arms cache residency they did not earn. The three states:
+
+          queued    -> cancel; the worker drops it and frees the slot
+          running   -> cannot be un-read, so mark it: the loader forgets the key when the H2D ends
+          finished  -> forget immediately
+
+        The read cost of a running one is still paid in full. Only the residency is refused.
+        -> (cancelled, marked_running, forgotten_now)
+        """
+        cancelled = running = 0
+        forget_now = []
         with self._lk:
             for key, slot, gen in items:
-                if (slot, gen) in self._queued:      # still queued: a real cancellation
+                if (slot, gen) in self._queued:
                     self._cancelled.add((slot, gen))
-                    n += 1
-                # already running or finished: not interruptible, and NOT counted as cancelled --
-                # it will complete and simply never be used, which is the cost of being wrong.
-        return n
+                    cancelled += 1
+                elif self.ready.is_done(slot, gen):
+                    forget_now.append((key, slot))
+                else:
+                    self._discard.add((slot, gen))   # in flight: collected at completion
+                    running += 1
+        if forget_now:
+            with self._lk:
+                self._forget.extend(forget_now)
+        return cancelled, running, len(forget_now)
+
+    def drain_forgets(self) -> int:
+        """Apply pending un-maps. MUST be called from the driver thread, before reserve()."""
+        with self._lk:
+            pending, self._forget = self._forget, []
+        for key, slot in pending:
+            self.slots.forget(key, slot)
+        return len(pending)
 
     def wait_slots(self, to_load, ctx=NO_CTX) -> None:
         """Wait only for the slots THIS consumer needs. Errors are drained, then the first re-raised."""

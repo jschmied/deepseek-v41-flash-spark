@@ -62,7 +62,8 @@ class PrefetchStats:
     late_hit: int = 0        # wanted, but its read was still in flight -- consumer blocked anyway
     lead_ns: int = 0         # summed (demand_ts - ready_ts) over ready hits
     wasted: int = 0          # prefetched keys evicted or cancelled without ever being demanded
-    cancelled: int = 0       # still-pending speculation dropped by discard_wrong_asap
+    cancelled: int = 0       # queued speculation dropped before it started
+    discarded_running: int = 0   # wrong speculation already in flight: read paid, residency refused
     refused: int = 0         # predictions the store had no free slot for
 
     @property
