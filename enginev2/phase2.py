@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import random
 import statistics
 import sys
 import time
@@ -58,14 +59,32 @@ def run(policy: Policy, calls, cut: int, steps: int, evict: str, **kw) -> tuple:
         e.close()
 
 
-def median_run(policy, calls, cut, steps, reps, evict, **kw):
-    out = [run(policy, calls, cut, steps, evict, **kw) for _ in range(reps)]
+def summarise(out):
     sps = [o[0] for o in out]
     return (statistics.median(sps), min(sps), max(sps),
             statistics.median([o[1] for o in out]), statistics.median([o[2] for o in out]),
             out[0][3], sum(o[4] for o in out),
             statistics.median([o[5] for o in out]), statistics.median([o[6] for o in out]),
             statistics.median([o[7] for o in out]))
+
+
+def sweep(arms, calls, cut, steps, reps, evict, seed=1234, **kw):
+    """Run every arm once per rep, in a SHUFFLED order, and only then take medians.
+
+    Running each arm's reps back to back makes run ORDER a confounder, and it bit hard: in the
+    first non-interleaved sweep every leave-one-in arm came out +5.7 to +9.7 % -- i.e. turning ANY
+    dependency back on made v2 faster than both v1 and v2, which is not a physical result. Those
+    arms simply ran ~5 minutes later than the baselines they were compared against. Interleaving
+    spreads any drift across all arms instead of loading it onto the ones measured last.
+    """
+    rng = random.Random(seed)
+    acc = {name: [] for name, _ in arms}
+    for _ in range(reps):
+        order = list(arms)
+        rng.shuffle(order)
+        for name, policy in order:
+            acc[name].append(run(policy, calls, cut, steps, evict, **kw))
+    return {name: summarise(v) for name, v in acc.items()}
 
 
 def main(argv) -> int:
@@ -80,8 +99,13 @@ def main(argv) -> int:
     print(f"phase 2 -- decode, {a.steps} steps x {a.reps} reps per arm, evict={a.evict}, "
           f"warm to call {cut:,}\n")
 
-    base = median_run(V1, calls, cut, a.steps, a.reps, a.evict)
-    v2 = median_run(V2, calls, cut, a.steps, a.reps, a.evict)
+    arms = [("v1", V1), ("v2", V2),
+            ("pair", dataclasses.replace(V1, resolve_blocks=False, global_barrier=False))]
+    for f in FIELDS:
+        arms.append((f"A:{f}", dataclasses.replace(V1, **{f: False})))
+        arms.append((f"B:{f}", dataclasses.replace(V2, **{f: True})))
+    res = sweep(arms, calls, cut, a.steps, a.reps, a.evict)
+    base, v2 = res["v1"], res["v2"]
 
     # ---------------------------------------------------------------- the gap
     mod_step = 1.0 / base[0]
@@ -150,8 +174,7 @@ def main(argv) -> int:
           f"{'--':>9s} {'':>5s} {'':>7s} {100 * base[3]:8.1f} %")
     a_rows = {}
     for f in FIELDS:
-        p = dataclasses.replace(V1, **{f: False})
-        r = median_run(p, calls, cut, a.steps, a.reps, a.evict)
+        r = res[f"A:{f}"]
         a_rows[f] = r
         eff, sig, fl = mark(r, base)
         print(f"  {LABEL[f]:38s} {r[0]:9.2f} {r[1]:6.2f}-{r[2]:<6.2f} {eff} {sig:>5s} "
@@ -164,8 +187,7 @@ def main(argv) -> int:
     print(f"  {'v2 (all five off)':38s} {v2[0]:9.2f} {v2[1]:6.2f}-{v2[2]:<6.2f} {eff} {sig:>5s} "
           f"{fl:6.1f} % {100 * v2[3]:8.1f} %   <- vs v1")
     for f in FIELDS:
-        p = dataclasses.replace(V2, **{f: True})
-        r = median_run(p, calls, cut, a.steps, a.reps, a.evict)
+        r = res[f"B:{f}"]
         eff, sig, fl = mark(r, v2)
         print(f"  {LABEL[f]:38s} {r[0]:9.2f} {r[1]:6.2f}-{r[2]:<6.2f} {eff} {sig:>5s} "
               f"{fl:6.1f} % {100 * r[3]:8.1f} %")
@@ -174,8 +196,7 @@ def main(argv) -> int:
     # The pair the coordinator asked for explicitly: if the 26.2 s turns out to be CPU work on the
     # MAIN thread, these two are partly one phenomenon in reality and the single-toggle columns
     # over-credit their separation.
-    pair = dataclasses.replace(V1, resolve_blocks=False, global_barrier=False)
-    rp = median_run(pair, calls, cut, a.steps, a.reps, a.evict)
+    rp = res["pair"]
     s_rb = a_rows["resolve_blocks"][0] / base[0] - 1
     s_gb = a_rows["global_barrier"][0] / base[0] - 1
     s_both = rp[0] / base[0] - 1
