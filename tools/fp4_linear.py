@@ -31,7 +31,8 @@ import triton.language as tl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # same decoder / packing as the routed experts; imported from fp4_moe so there is exactly one
 # copy of the PTX. (v41_ref is NOT imported here: it imports this module.)
-from fp4_moe import _fp4_decode, _split4, _ue8m0, dequant_fp4_packed  # noqa: E402
+from fp4_moe import (DOT_SCALED, _fp4_decode, _quad_dot_scaled, _split4,  # noqa: E402
+                     _ue8m0, dequant_fp4_packed)
 
 FP4_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 
@@ -80,11 +81,17 @@ def _quad_dot(x_base, xk, mask_m, w_tile_ptr, s_ptr, BN: tl.constexpr, USE_F16: 
 @triton.jit
 def _fp4_linear_kernel(X, W, S, Y, M, N, KQ,
                        stride_xm, stride_wn, stride_sn, stride_ym,
-                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, USE_F16: tl.constexpr):
+                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, USE_F16: tl.constexpr,
+                       SCALED: tl.constexpr = False):
     """Y[M, N] = X[M, K] @ W[N, K]^T; W packed [N, K/2] uint8, S [N, K/32] uint8. KQ = K/128.
 
     Row-count- and row-offset-invariant by construction (each output element is one fp32
-    accumulation over K in fixed 128-wide steps, independent of M and of the row's position).
+    accumulation over K in fixed 128-wide steps, independent of M and of the row's position) --
+    true of both arms, the 128-wide step is the same.
+
+    SCALED (DSV41_DOT_SCALED=1) swaps the software decode for tl.dot_scaled; see
+    fp4_moe._quad_dot_scaled. USE_F16 has no meaning in that arm -- dot_scaled takes the activation
+    as bf16, which is what it already is.
     """
     pid_n = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -94,14 +101,18 @@ def _fp4_linear_kernel(X, W, S, Y, M, N, KQ,
     rn_ = tl.where(n_mask, rn, 0)          # clamp: the weight tile is loaded unmasked (64-byte rows)
     m_mask = (rm < M)[:, None]
     rm_ = tl.where(rm < M, rm, 0)
-    xk = 2 * tl.arange(0, 16)[None, :]
+    xk = tl.arange(0, 128)[None, :] if SCALED else 2 * tl.arange(0, 16)[None, :]
     x_base = X + rm_[:, None] * stride_xm
     w_tile = W + rn_[:, None] * stride_wn + tl.arange(0, 64)[None, :]
     s_tile = S + rn_[:, None] * stride_sn + tl.arange(0, 4)[None, :]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for q in range(0, KQ):
-        acc += _quad_dot(x_base + q * 128, xk, m_mask, w_tile + q * 64, s_tile + q * 4,
-                         BLOCK_N, USE_F16)
+        if SCALED:  # constexpr -> only one arm is traced
+            acc = _quad_dot_scaled(x_base + q * 128, xk, m_mask, w_tile + q * 64, s_tile + q * 4,
+                                   acc, BLOCK_N)
+        else:
+            acc += _quad_dot(x_base + q * 128, xk, m_mask, w_tile + q * 64, s_tile + q * 4,
+                             BLOCK_N, USE_F16)
     tl.store(Y + rm[:, None] * stride_ym + rn[None, :], acc.to(tl.bfloat16),
              mask=m_mask & n_mask[None, :])
 
@@ -201,8 +212,9 @@ def pick_block_n(N: int, M: int, BLOCK_M: int) -> int:
 
 
 def fp4_linear(x: torch.Tensor, W: FP4Weight, use_f16: bool | None = None,
-               block_n: int | None = None, num_warps: int = 4, num_stages: int = 3) -> torch.Tensor:
-    """x bf16 [..., K] -> bf16 [..., N]."""
+               block_n: int | None = None, num_warps: int = 4, num_stages: int = 3,
+               scaled: bool | None = None) -> torch.Tensor:
+    """x bf16 [..., K] -> bf16 [..., N]. `scaled`: None = DSV41_DOT_SCALED (default off)."""
     shape = x.shape
     x2 = x.reshape(-1, W.K)
     if x2.dtype != torch.bfloat16:
@@ -217,6 +229,7 @@ def fp4_linear(x: torch.Tensor, W: FP4Weight, use_f16: bool | None = None,
                              x2.stride(0), W.w.stride(0), W.s.stride(0), y.stride(0),
                              BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
                              USE_F16=USE_F16_DEFAULT if use_f16 is None else use_f16,
+                             SCALED=DOT_SCALED if scaled is None else bool(scaled),
                              num_warps=num_warps, num_stages=num_stages)
     return y.view(*shape[:-1], W.N)
 

@@ -28,6 +28,13 @@ K-permutation trick: because a dot product is order-invariant along K, the even/
 be interleaved. The decoder returns the even K elements and the odd K elements as two [BN, 16] fp16 tiles
 (via `prmt`), and the activation tile is loaded with stride 2 to match. No layout shuffles for the weights.
 
+DSV41_DOT_SCALED=1 swaps both kernels' inner product for `tl.dot_scaled` (_quad_dot_scaled): same
+tiles, same 128-K step, but the packed nibbles and the UE8M0 bytes go to the instruction as they are
+stored -- no software decode, no K-permutation, and the scale is not applied to the [BM, BN] fp32
+partial. Measured here (engine/test_dot_scaled_moe.py, 8 random experts, median of 30): 1.42x at
+T=512 and 1.44x at T=2048, 1.27x at T=64, and 0.93-1.08x at decode sizes where the launch is
+bandwidth-bound anyway. Off by default until it has been A/B'd at the server.
+
 For decode-size calls every expert has <= BM pairs, so its weight bytes are read exactly once per launch.
 For prefill-size calls (more than BM pairs on one expert) the extra pair blocks re-read the expert (L2).
 
@@ -209,6 +216,29 @@ def _quad_dot(x_base, xk, mask_m, w_tile_ptr, s_ptr, BN: tl.constexpr):
     return acc
 
 
+@triton.jit
+def _quad_dot_scaled(x_base, xk, mask_m, w_tile_ptr, s_ptr, acc, BN: tl.constexpr):
+    """Same 128-logical-K step as _quad_dot, but handing the packed nibbles and the UE8M0 bytes to
+    `tl.dot_scaled` instead of decoding in software and scaling the [BM, BN] partial sum afterwards.
+
+    Gated by DSV41_DOT_SCALED=1 (see moe_forward); the software path stays the default.
+
+    Layout: Triton 3.7.1 wants the fp4 operand's two nibbles to be consecutive K elements with the
+    first in the LOW bits -- which is exactly how w1/w3/w2 are stored -- and the e8m0 scale as
+    [N, K//32] *untransposed*, which is exactly our s tile [BN, 4]. So nothing is repacked. The only
+    reshuffle is tl.trans on the byte tile, because rhs must be [K//2, N] while the coalesced load is
+    [N, K//2]; the tile is already in registers, so that is a layout conversion, not a second read.
+
+    What this buys, in principle: the UE8M0 factor moves off the fp32 accumulator (BM*BN multiplies
+    per 32-K group, i.e. 4*BM*BN per call here) onto the weight operand, and the activation is read
+    once in natural K order instead of twice with stride 2 for the even/odd nibble split.
+    """
+    xv = tl.load(x_base + xk, mask=mask_m, other=0.0)  # [BM, 128] bf16, natural K order
+    packed = tl.load(w_tile_ptr)  # [BN, 64] bytes = 128 logical K
+    s = tl.load(s_ptr)  # [BN, 4] UE8M0, one per 32-wide K group
+    return tl.dot_scaled(xv, None, "bf16", tl.trans(packed), s, "e2m1", acc=acc)
+
+
 # --------------------------------------------------------------------------- kernel 1: gate/up + SwiGLU
 @triton.jit
 def _moe_up_kernel(
@@ -216,7 +246,7 @@ def _moe_up_kernel(
     wgt_ptr, block_slot_ptr, block_pair_ptr,
     stride_x, stride_h, limit,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, SCALED: tl.constexpr = False,
 ):
     KB: tl.constexpr = K // 2
     SG: tl.constexpr = K // 32
@@ -236,7 +266,7 @@ def _moe_up_kernel(
     offs_q = tl.arange(0, 4)
 
     x_base = x_ptr + tok[:, None] * stride_x
-    xk = 2 * tl.arange(0, 16)[None, :]
+    xk = tl.arange(0, 128)[None, :] if SCALED else 2 * tl.arange(0, 16)[None, :]
     w1_tile = w1_ptr + slot * (N * KB) + offs_n[:, None] * KB + offs_j[None, :]
     w3_tile = w3_ptr + slot * (N * KB) + offs_n[:, None] * KB + offs_j[None, :]
     s1_tile = s1_ptr + slot * (N * SG) + offs_n[:, None] * SG + offs_q[None, :]
@@ -245,8 +275,12 @@ def _moe_up_kernel(
     acc_g = tl.zeros([BM, BN], dtype=tl.float32)
     acc_u = tl.zeros([BM, BN], dtype=tl.float32)
     for q in range(0, SG // 4):
-        acc_g += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w1_tile + q * 64, s1_tile + q * 4, BN)
-        acc_u += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w3_tile + q * 64, s3_tile + q * 4, BN)
+        if SCALED:  # constexpr -> only one arm is traced
+            acc_g = _quad_dot_scaled(x_base + q * 128, xk, mask_m[:, None], w1_tile + q * 64, s1_tile + q * 4, acc_g, BN)
+            acc_u = _quad_dot_scaled(x_base + q * 128, xk, mask_m[:, None], w3_tile + q * 64, s3_tile + q * 4, acc_u, BN)
+        else:
+            acc_g += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w1_tile + q * 64, s1_tile + q * 4, BN)
+            acc_u += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w3_tile + q * 64, s3_tile + q * 4, BN)
 
     gate = tl.minimum(acc_g, limit)
     up = tl.minimum(tl.maximum(acc_u, -limit), limit)
@@ -270,7 +304,7 @@ def _moe_down_kernel(
     block_slot_ptr, block_pair_ptr,
     stride_h, stride_y,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr, SCALED: tl.constexpr = False,
 ):
     KB: tl.constexpr = K // 2
     SG: tl.constexpr = K // 32
@@ -289,13 +323,16 @@ def _moe_down_kernel(
     offs_q = tl.arange(0, 4)
 
     h_base = h_ptr + offs_m[:, None].to(tl.int64) * stride_h  # h row = pair id
-    xk = 2 * tl.arange(0, 16)[None, :]
+    xk = tl.arange(0, 128)[None, :] if SCALED else 2 * tl.arange(0, 16)[None, :]
     w2_tile = w2_ptr + slot * (N * KB) + offs_n[:, None] * KB + offs_j[None, :]
     s2_tile = s2_ptr + slot * (N * SG) + offs_n[:, None] * SG + offs_q[None, :]
 
     acc = tl.zeros([BM, BN], dtype=tl.float32)
     for q in range(0, SG // 4):
-        acc += _quad_dot(h_base + q * 128, xk, mask_m[:, None], w2_tile + q * 64, s2_tile + q * 4, BN)
+        if SCALED:  # constexpr -> only one arm is traced
+            acc = _quad_dot_scaled(h_base + q * 128, xk, mask_m[:, None], w2_tile + q * 64, s2_tile + q * 4, acc, BN)
+        else:
+            acc += _quad_dot(h_base + q * 128, xk, mask_m[:, None], w2_tile + q * 64, s2_tile + q * 4, BN)
 
     row = ((offs_m % TOPK) * NTOK + offs_m // TOPK).to(tl.int64)
     tl.store(y_ptr + row[:, None] * stride_y + offs_n[None, :], acc, mask=mask_m[:, None])
@@ -409,6 +446,10 @@ def _pick_bm(P: int) -> int:
 _UP_CFG = {16: (256, 4, 1), 32: (128, 4, 1), 64: (64, 4, 1)}
 _DOWN_CFG = {16: (128, 8, 3), 32: (128, 4, 3), 64: (128, 8, 3)}
 
+# Off by default: the tl.dot_scaled arm ships only once it has been A/B'd on this box. Read once at
+# import so the hot path stays a constant; tests pass `scaled=` explicitly to get both arms.
+DOT_SCALED = os.environ.get("DSV41_DOT_SCALED", "0") == "1"
+
 
 def moe_forward(
     x: torch.Tensor,
@@ -419,14 +460,21 @@ def moe_forward(
     block_m: int | None = None,
     up_cfg: tuple[int, int, int] | None = None,
     down_cfg: tuple[int, int, int] | None = None,
+    scaled: bool | None = None,
 ) -> torch.Tensor:
-    """x bf16 [T, 5120], slots int32 [T, K] (arena slot per routed expert), weights fp32 [T, K] -> bf16 [T, 5120]."""
+    """x bf16 [T, 5120], slots int32 [T, K] (arena slot per routed expert), weights fp32 [T, K] -> bf16 [T, 5120].
+
+    `scaled` picks the inner product: None = DSV41_DOT_SCALED (default off, software FP4 decode +
+    tl.dot), True = tl.dot_scaled. Both arms use the same routing, the same BM/BN/warps/stages and the
+    same [TOPK, T, DIM] parts buffer, so they are a clean A/B; see _quad_dot_scaled.
+    """
     assert x.dtype == torch.bfloat16 and x.shape[1] == DIM and x.is_contiguous()
     T, K = slots.shape
     assert weights.shape == (T, K)
     P = T * K
     dev = x.device
     BM = block_m or _pick_bm(P)
+    sc = DOT_SCALED if scaled is None else bool(scaled)
     bn1, nw1, ns1 = up_cfg or _UP_CFG[BM]
     bn2, nw2, ns2 = down_cfg or _DOWN_CFG[BM]
     if P <= 64:  # decode-sized call (<= 64 pairs, <= 6 per slot < BM): pure-torch routing, see build_routing_small
@@ -443,13 +491,13 @@ def moe_forward(
         x, arena.w1, arena.s1, arena.w3, arena.s3, h,
         wgt, block_slot, block_pair,
         x.stride(0), h.stride(0), float(swiglu_limit),
-        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, num_warps=nw1, num_stages=ns1,
+        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, SCALED=sc, num_warps=nw1, num_stages=ns1,
     )
     _moe_down_kernel[(NB, DIM // bn2)](
         h, arena.w2, arena.s2, parts,
         block_slot, block_pair,
         h.stride(0), parts.stride(0),
-        TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, num_warps=nw2, num_stages=ns2,
+        TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, SCALED=sc, num_warps=nw2, num_stages=ns2,
     )
     return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
 
