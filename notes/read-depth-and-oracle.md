@@ -190,6 +190,33 @@ than v1, not less. Realizing it needs `DSV41_IO_THREADS=8` on the v2 arm, which 
 sizes that staging array. Until that is run, "105 MiB against 862 MiB" is a property of v2 as a
 standalone engine, not of anything measured.
 
+## 11. The oracle margin survives the arena scope fix (job 305)
+
+Re-run at 79 GB, engram live, against 40 GB as the tie-back:
+
+| arena | arm | steps/s | reads | GB | depth 0 |
+|---|---|---|---|---|---|
+| 79 GB | null | 2.671 / 2.698 | 1895 | 26.10 | 51.6 / 48.5 % |
+| 79 GB | oracle h=1 | **3.687 / 3.606** | 1896 | 26.12 | 33.9 / 34.7 % |
+| 40 GB | null | 2.308 / 2.323 | 2392 | 32.95 | 45.9 / 45.6 % |
+| 40 GB | oracle h=1 | 3.228 | 2393 | 32.96 | 27.7 % |
+
+Three things, in order of how much they change the picture:
+
+* **The margin holds: +36.0 % at 79 GB against +39.6 % at 40 GB.** The headline was measured at
+  half the production arena, and it did not depend on that.
+* **depth-0 RISES with the bigger arena, 45.9 % -> 51.6 %.** Predicted before the run and confirmed:
+  a better cache means fewer misses per layer, which means LESS work available to keep the device
+  busy. The pipe gets emptier as the engine gets faster.
+* Capacity does what the sweep said: reads 2392 -> 1895 (-21 %), bytes 32.95 -> 26.10 GB, null
+  2.32 -> 2.68 steps/s (+16 %).
+
+CAVEAT, from the job's own stamp. It recorded `HEAD efb184f 0 dirty`, but the 40 GB arms print an
+`evict`/`slots`/`staging` line the 79 GB arms do not -- so `0907c87` landed mid-run. That commit
+only added an EVICT env defaulting to the previously hardcoded "lru" plus print statements, so both
+halves ran the same eviction behaviour and the comparison stands. Recorded because the stamp is
+only worth having if its warnings are acted on rather than explained away.
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
