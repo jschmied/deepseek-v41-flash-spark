@@ -108,8 +108,14 @@ def warm_policy(e2, rl, routes, steps, n_layers):
     use counts through on_hit exactly as a real run would, and the frequency signal the policy
     exists to exploit is present when the measurement starts.
     """
+    # WARM FROM THE TAIL, NOT THE HEAD. The timed window always replays steps 0..STEPS-1 from a
+    # fresh prefill, so warming on those same steps pre-loads exactly the experts the measurement
+    # is about to ask for. Job 315 did that: every arm, oracle included, collapsed to 658 reads
+    # against 1895 and the oracle's demand fetches went 51 -> 666, because there was nothing left
+    # to prefetch. Warming on LATER recorded steps gives the policy real use counts over related
+    # content without handing it the answer.
     seen = 0
-    for st in range(steps):
+    for st in range(STEPS, STEPS + steps):
         for L in range(n_layers):
             u = routes.get((st, L))
             if not u:
@@ -192,7 +198,13 @@ rl.layer_a = check
 # Policy history before timing. WARM=0 reproduces job 310's flat-seeded behaviour for comparison.
 _warm = int(os.environ.get("WARM", 0))
 if _warm:
-    n = warm_policy(e2, rl, routes, min(_warm, STEPS), eng.args.n_layers)
+    have = max((k[0] for k in routes), default=-1) + 1
+    if have < STEPS + _warm:
+        raise RuntimeError(
+            f"WARM={_warm} needs routes for steps {STEPS}..{STEPS + _warm - 1} but the recording "
+            f"only has {have}. Record STEPS+WARM steps, or the warm-up would replay the timed "
+            f"window and pre-load its answer.")
+    n = warm_policy(e2, rl, routes, _warm, eng.args.n_layers)
     print(f"  warmed the policy over {n} recorded layers before timing")
 t0 = time.perf_counter()
 c = e2.decode(STEPS)
