@@ -217,6 +217,40 @@ only added an EVICT env defaulting to the previously hardcoded "lru" plus print 
 halves ran the same eviction behaviour and the comparison stands. Recorded because the stamp is
 only worth having if its warnings are acted on rather than explained away.
 
+## 12. age/(1+count) ties LRU here, and the oracle HURTS a warm cache (job 320)
+
+Warmed on recorded steps 30-59, timed on 0-29, at 79 GB with engram live:
+
+| warm | policy | arm | steps/s | demand | reads | GB |
+|---|---|---|---|---|---|---|
+| 30 | age_over_freq | null | 4.211 | 980 | 971 | 13.38 |
+| 30 | lru | null | 4.198 | 980 | 971 | 13.38 |
+| 30 | age_over_freq | oracle | **3.677** | 637 | **1911** | 26.32 |
+| 30 | lru | oracle | **3.661** | 637 | **1913** | 26.35 |
+| 0 | age_over_freq | null | 2.767 | 1942 | 1895 | 26.10 |
+| 0 | lru | null | 2.677 | 1942 | 1895 | 26.10 |
+
+**The policies tie.** Warmed, they finally differ at all -- 1911 against 1913 reads -- but that is
+2 reads in 1911. At this cache size (5,457 slots, ~37 % of all pairs) the victim choice does not
+matter, which is consistent with protection also being near-null: when the hot set fits, recency
+and frequency pick equally well. The server-level win (job 140: 2.13 against 1.85 tok/s) is not
+contradicted -- that was a full generation building its own history at a different arena size.
+
+**The oracle is a NET LOSS on a warm cache**, and this qualifies every oracle number above. With
+the cache warmed, the null arm needs 971 reads; the oracle issues **1911** and runs **3.68 against
+4.21 steps/s, -13 %**. It nearly doubles I/O to prefetch a layer ahead, because a prefetch takes a
+slot and `protected_slots` only shields the CURRENT layer -- so it evicts residents that later
+layers still want, and those come back as new misses.
+
+So the +36-38 % headline is conditional on a miss-rich cache. The mechanism that made it a win
+(an empty pipe with work to fill it) is the same one that makes it a loss when the pipe has little
+to do. Depth-zero rising with arena size (section 11) already pointed here; this is the same effect
+crossing zero.
+
+WHAT THAT DOES NOT SAY: that prefetch is worthless. It says prefetching the FULL next-layer set,
+unprotected past one layer, is worthless once the cache is warm. A prefetcher that only issues when
+read depth is low, and that cannot evict anything a near-future layer wants, was never measured.
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
