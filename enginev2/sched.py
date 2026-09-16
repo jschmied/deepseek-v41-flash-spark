@@ -412,9 +412,14 @@ class LoaderService:
         driver therefore recovers it immediately and the queue entry becomes inert.
 
         The read cost of a running one is still paid in full. Only the residency is refused.
-        -> (cancelled_queued, discarded_running, discarded_finished)
+        -> [(key, slot, gen, state)] with state in {"queued", "running", "finished"}.
+
+        PER ITEM, not three totals: the caller may need to account only a SUBSET of what it
+        cancels. Statistics and physical behaviour must be separable -- an attempt that is not
+        being scored still has to be discarded, or the experiment quietly changes the policy it is
+        measuring.
         """
-        queued = running = finished = 0
+        out = []
         with self._lk:
             for key, slot, gen in items:
                 if (slot, gen) in self._queued:
@@ -422,14 +427,14 @@ class LoaderService:
                     self._queued.discard((slot, gen))
                     # rollback: the read never started, so the displaced tenant's bytes are intact
                     self._forget.append((key, slot, gen, True))
-                    queued += 1
+                    out.append((key, slot, gen, "queued"))
                 elif self.ready.is_done(slot, gen):
                     self._forget.append((key, slot, gen, False))   # the slot WAS overwritten
-                    finished += 1
+                    out.append((key, slot, gen, "finished"))
                 else:
                     self._discard.add((slot, gen))   # in flight: collected at completion
-                    running += 1
-        return queued, running, finished
+                    out.append((key, slot, gen, "running"))
+        return out
 
     def quiesce(self, timeout: float = 60.0) -> None:
         """Wait until nothing is queued or in flight, or raise.

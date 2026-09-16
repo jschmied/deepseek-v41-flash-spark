@@ -325,6 +325,7 @@ class ModelLeaves(Leaves):
         self.bw = bw
         self.scale = scale
         self.shared_first = shared_first
+        self.start = start
         self.i = start
         # Fraction of the unattributed 78.5 % charged to the per-layer leaf; the remainder becomes
         # per-step work outside the layer loop. 1.0 reproduces the old model. See the header: this

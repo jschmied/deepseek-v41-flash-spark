@@ -53,7 +53,9 @@ class SpecAttempt:
     gen: int
     cause_id: int
     scored: bool = True
-    terminal: str | None = None      # why it ended: evicted / failed / wrong / used
+    # Why a RETIRED attempt ended, and only that: "evicted" or "failed". Attempts that reach their
+    # target are classified in place and never carry one, so this is not a general lifecycle field.
+    terminal: str | None = None
 
 
 @dataclasses.dataclass
@@ -98,8 +100,12 @@ class PrefetchStats:
     # scheduler "earliest prediction wins forever", which is the wrong policy when early death is
     # common.
     reissued: int = 0
+    # Wrong attempts that were DISCARDED PHYSICALLY but not accounted, because they were issued
+    # while scoring was off. Its only job is to prove the physical path still ran for them: the
+    # scored flag must gate counting and never behaviour.
+    discarded_unscored: int = 0
     lead_ns: int = 0         # summed (demand_ts - ready_ts) over ready hits
-    wasted: int = 0          # prefetched keys evicted or cancelled without ever being demanded
+    wasted: int = 0          # speculative reads that did not serve demand, for any reason
     # THREE STATES, kept apart because they mean different things experimentally: queued cost
     # nothing, running cost a read that was wasted, finished means the predictor was wrong AND
     # early enough to have consumed residency. Folding finished into `cancelled` contradicted its

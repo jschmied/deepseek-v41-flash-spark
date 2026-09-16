@@ -216,9 +216,20 @@ class Engine:
         self.chain.set("h", layer, ctx=ctx)            # B wrote h and pre_mix for the next layer
 
     # ------------------------------------------------------------------ prefetch bookkeeping
+    def _replay_step(self) -> int:
+        """Which decode step the REPLAY is on. layer_a has already consumed the current call, so
+        the current index is cursor-1. Falls back to the timed counter for a provider with no
+        cursor -- a real one computes its own routes and does not need this at all."""
+        cur = getattr(self.leaves, "i", None)
+        base = getattr(self.leaves, "start", None)
+        if cur is None or base is None:
+            return self.c.steps
+        return max(0, (cur - 1 - base) // N_LAYERS)
+
     def _settle_speculation(self, layer: int, uniq, ctx=None) -> None:
         """Score the predictions that were made for THIS layer, then drop the ones that missed."""
         want = {(layer, e) for e in uniq}
+        scored_wrong: dict = {}
         named = self._pred.pop(layer, None)
         if named:
             scored = {k for k, (_c, sc) in named.items() if sc}
@@ -238,7 +249,7 @@ class Engine:
         # only ever have failed to serve demand.
         for att in self._expired.pop(layer, []):
             if not att.scored:
-                continue
+                continue                          # nothing physical left to do: already retired
             if att.terminal == "failed":
                 self.pf.failed_before_use += 1
             else:
@@ -248,8 +259,10 @@ class Engine:
         for key in [k for k in self._spec if k[0] == layer]:
             att = self._spec.pop(key)
             slot, gen, cause = att.slot, att.gen, att.cause_id
-            if not att.scored:
-                continue          # issued during settlement: ran and contended, not counted
+            # `scored` GATES ACCOUNTING ONLY. Returning early here also skipped the physical
+            # discard, so a wrong prediction issued during settlement stayed RESIDENT -- settlement
+            # silently switched the discard policy it was supposed to be holding constant, and the
+            # retained expert then evicted something a later scored prediction needed.
             if key in want:
                 # RESIDENT NOW, not "was ready once". _spec is independent of residency and
                 # SlotReady keeps (slot, gen) readiness for the life of the process, so a prefetch
@@ -261,40 +274,47 @@ class Engine:
                     # The prediction may have been perfect; the I/O did not land. The driver's
                     # deferred un-map has not run yet, so the mapping still looks valid here --
                     # which is how a FAILED read was being counted as a timely hit.
-                    self.pf.failed_before_use += 1
-                    self.pf.wasted += 1
+                    if att.scored:
+                        self.pf.failed_before_use += 1
+                        self.pf.wasted += 1
                     continue
                 resident = (self.slots.lru.get(key) == slot
                             and self.slots.gen.get(slot) == gen)
                 if not resident:
-                    self.pf.evicted_before_use += 1
-                    self.pf.wasted += 1
+                    if att.scored:
+                        self.pf.evicted_before_use += 1
+                        self.pf.wasted += 1
                     if self.obs.enabled:
                         self.obs.safe_emit(Event(now_ns(), "prefetch_evicted_before_use",
                                                  ctx=ctx or NO_CTX, key=key, slot=slot, gen=gen,
                                                  cause_id=cause))
                     continue
-                self.pf.used += 1
+                if att.scored:
+                    self.pf.used += 1
                 # READY or LATE? A prefetch whose read is still in flight is a mapping hit that the
                 # consumer still blocks on; counting it with the ready ones would report a win the
                 # engine never got.
                 ready_ts = self.loader.ready.ready_ts(slot, gen) if st == "ready" else None
                 if ready_ts is not None:
-                    self.pf.ready_hit += 1
                     lead = now_ns() - ready_ts
-                    self.pf.lead_ns += lead
+                    if att.scored:
+                        self.pf.ready_hit += 1
+                        self.pf.lead_ns += lead
                     if self.obs.enabled:
                         self.obs.safe_emit(Event(now_ns(), "prefetch_ready_hit", ctx=ctx or NO_CTX,
                                                  key=key, slot=slot, gen=gen, cause_id=cause,
                                                  value=lead))
                 else:
-                    self.pf.late_hit += 1
+                    if att.scored:
+                        self.pf.late_hit += 1
                     if self.obs.enabled:
                         self.obs.safe_emit(Event(now_ns(), "prefetch_late_hit", ctx=ctx or NO_CTX,
                                                  key=key, slot=slot, gen=gen, cause_id=cause))
             else:
-                self.pf.wasted += 1
+                if att.scored:
+                    self.pf.wasted += 1
                 wrong.append((key, slot, gen))
+                scored_wrong[(slot, gen)] = att.scored
                 if self.obs.enabled:
                     self.obs.safe_emit(Event(now_ns(), "prefetch_wasted", ctx=ctx or NO_CTX,
                                              key=key, slot=slot, gen=gen, cause_id=cause))
@@ -302,14 +322,25 @@ class Engine:
             # A wrong prefetch holds a slot AND a pending write, so it blocks eviction as well as
             # occupying capacity. Cancelling recovers the slot for reads that are already known to
             # be needed. Reads already in flight are not interrupted -- that cost is real and stays.
-            q, r, f = self.loader.cancel(wrong)
-            self.pf.cancelled_queued += q
-            self.pf.discarded_running += r
-            self.pf.discarded_finished += f
+            for _k, _sl, _g, state in self.loader.cancel(wrong):
+                if not scored_wrong.get((_sl, _g), True):
+                    self.pf.discarded_unscored += 1   # discarded physically, not accounted
+                    continue
+                if state == "queued":
+                    self.pf.cancelled_queued += 1
+                elif state == "running":
+                    self.pf.discarded_running += 1
+                else:
+                    self.pf.discarded_finished += 1
 
     def _issue_speculation(self, layer: int, uniq, ctx=None) -> None:
-        self.prefetch.observe(layer, uniq, self.c.steps)
-        keys = self.prefetch.predict(layer, uniq, self.c.steps)
+        # THE REPLAY POSITION, not the timed step counter. c.steps is deliberately frozen during
+        # settlement, so once settlement crossed layer 39 -> 0 the predictor was handed the
+        # PREVIOUS step and read its future from the wrong place in the trace. Derive it from the
+        # provider's own cursor, which is the only thing that actually tracks where the replay is.
+        step = self._replay_step()
+        self.prefetch.observe(layer, uniq, step)
+        keys = self.prefetch.predict(layer, uniq, step)
         if not keys:
             return
         live = []
@@ -475,12 +506,18 @@ class Engine:
             # settle first: classify what the window issued but did not reach
             self.settle(settle_layers)
         if cancel_outstanding:
+            scored_of = {(a.slot, a.gen): a.scored for a in self._spec.values()}
             pending = [(a.key, a.slot, a.gen) for a in self._spec.values()]
             if pending:
-                q, r, f = self.loader.cancel(pending)
-                self.pf.cancelled_queued += q
-                self.pf.discarded_running += r
-                self.pf.discarded_finished += f
+                for _k, _sl, _g, state in self.loader.cancel(pending):
+                    if not scored_of.get((_sl, _g), True):
+                        continue                   # cancelled physically, not accounted
+                    if state == "queued":
+                        self.pf.cancelled_queued += 1
+                    elif state == "running":
+                        self.pf.discarded_running += 1
+                    else:
+                        self.pf.discarded_finished += 1
             # POP them: leaving cancelled entries in _spec made a second finalize_stats() account
             # the same tail twice, and a queued-cancelled item is no longer in _queued, so the
             # second pass would misclassify it as running.

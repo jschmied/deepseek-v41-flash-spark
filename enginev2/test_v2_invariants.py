@@ -946,7 +946,9 @@ def test_a_cancelled_queued_prefetch_frees_its_slot_before_the_next_reserve():
         for k, sl, _g in keys:
             assert e.slots.lru.get(k) == sl, "speculation did not become resident"
 
-        q, running, fin = e.loader.cancel(spec)
+        states = [st for _k, _sl, _g, st in e.loader.cancel(spec)]
+        q = states.count("queued")
+        running, fin = states.count("running"), states.count("finished")
         assert q == len(spec), (
             f"only {q} of {len(spec)} were treated as queued -- with one busy worker they cannot "
             f"have started (running={running}, finished={fin})")
@@ -1336,3 +1338,43 @@ def test_cancel_outstanding_works_and_every_statistic_is_cohort_scoped():
         e.close()
     print("  cohort: cancel-outstanding works, settlement counts nothing, scoring is restored, "
           "denominator is measured  OK")
+
+
+# ================================================================ 27. scored gates counting only
+def test_an_unscored_wrong_prediction_is_still_physically_discarded():
+    """Settlement holds the POLICY constant and withholds only the STATISTICS.
+
+    `if not att.scored: continue` returned before the wrong-prediction branch, so a prediction
+    issued during settlement that turned out wrong was popped from _spec and never cancelled -- it
+    stayed resident. Settlement therefore switched the discard policy it was meant to hold fixed,
+    and the retained expert could evict something a later scored prediction needed.
+
+    Test 26 could not see it: a perfect oracle produces no wrong predictions during settlement.
+    This uses a deliberately imprecise one.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+    e = Engine(V2, lru_slots=2000, transient_slots=400,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut),
+               prefetch=RecallOraclePrefetcher(calls, 4, recall=1.0, precision=0.4, start=cut))
+    try:
+        e.warm(calls, cut)
+        e.decode(3)
+        # NOTE the counters DO grow across settlement, legitimately: attempts issued BEFORE it,
+        # whose target layer falls inside it, are scored and settle there. What must be true is
+        # narrower -- an attempt issued DURING settlement, and wrong, is discarded physically and
+        # not counted. discarded_unscored exists to make exactly that observable.
+        e.settle(4)
+        assert e.pf.discarded_unscored > 0, (
+            "no wrong prediction issued during settlement was physically discarded -- either the "
+            "predictor made none, or `scored` is still short-circuiting the discard")
+        e.loader.quiesce()
+        e.loader.drain_forgets()
+
+        # nothing speculative and wrong may still hold a slot at its own generation
+        assert e.loader.stage.at_rest(), "settlement leaked a staging lease"
+        assert e.arena.violations == [], e.arena.violations[:3]
+        print(f"  settlement: {e.pf.discarded_unscored} wrong unscored predictions discarded "
+              f"physically and counted nowhere  OK")
+    finally:
+        e.close()
