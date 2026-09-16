@@ -58,8 +58,15 @@ class PrefetchStats:
     # predictor at 80 % precision whose hits are mostly `late` has not solved decode: the consumer
     # still blocks, it has merely blocked on a read that was started earlier. This is the number a
     # decision about training a head has to be made on.
-    ready_hit: int = 0       # wanted AND already resident when the layer arrived
-    late_hit: int = 0        # wanted, but its read was still in flight -- consumer blocked anyway
+    ready_hit: int = 0       # wanted, resident AND ready when the layer arrived
+    late_hit: int = 0        # wanted and still mapped, but the read was in flight -- blocked anyway
+    # Correct prediction, read completed, and then EVICTED before its target layer arrived. The
+    # prefetch saved nothing and the expert is read again as a demand miss. Distinct from a late
+    # hit (arrived too slowly) and from a wrong prediction (never wanted): this one was right and
+    # too EARLY. Counting it as a ready hit -- which the classifier did until it checked residency
+    # rather than historical readiness -- overstates used, ready_hit, timeliness, fetch precision
+    # and mean lead all at once.
+    evicted_before_use: int = 0
     lead_ns: int = 0         # summed (demand_ts - ready_ts) over ready hits
     wasted: int = 0          # prefetched keys evicted or cancelled without ever being demanded
     # THREE STATES, kept apart because they mean different things experimentally: queued cost
@@ -91,8 +98,9 @@ class PrefetchStats:
         speculation is resolved -- call Engine.finalize_stats(). Before that it holds the
         window-end value, which is an UNDERCOUNT of the I/O caused.
         """
-        n = self.started or self.issued
-        return self.used / n if n else 0.0
+        # No fallback to `issued`. Before finalize_stats() runs, `started` is 0 and silently
+        # reverting to submissions would report the very number the started counter replaced.
+        return self.used / self.started if self.started else 0.0
 
     @property
     def discarded_total(self) -> int:

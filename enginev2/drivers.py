@@ -228,6 +228,21 @@ class Engine:
         for key in [k for k in self._spec if k[0] == layer]:
             slot, gen, cause = self._spec.pop(key)
             if key in want:
+                # RESIDENT NOW, not "was ready once". _spec is independent of residency and
+                # SlotReady keeps (slot, gen) readiness for the life of the process, so a prefetch
+                # that completed and was then evicted before its target layer still looked ready --
+                # and was counted as a timely, useful hit while the engine re-read it as a demand
+                # miss. Classify against the CURRENT mapping and generation.
+                resident = (self.slots.lru.get(key) == slot
+                            and self.slots.gen.get(slot) == gen)
+                if not resident:
+                    self.pf.evicted_before_use += 1
+                    self.pf.wasted += 1
+                    if self.obs.enabled:
+                        self.obs.safe_emit(Event(now_ns(), "prefetch_evicted_before_use",
+                                                 ctx=ctx or NO_CTX, key=key, slot=slot, gen=gen,
+                                                 cause_id=cause))
+                    continue
                 self.pf.used += 1
                 # READY or LATE? A prefetch whose read is still in flight is a mapping hit that the
                 # consumer still blocks on; counting it with the ready ones would report a win the
@@ -349,6 +364,16 @@ class Engine:
             layers = getattr(self.prefetch, "horizon", 0)
         if layers <= 0:
             return 0
+        # MODEL/REPLAY ONLY. This drives decode_layer() directly, without a step's chain.reset(),
+        # engram.issue() or the final/draft/verify transition -- fine when the next route comes off
+        # a recorded trace, wrong as a runtime API. Refused on a provider that is not replaying.
+        if not hasattr(self.leaves, "calls"):
+            raise RuntimeError("settle() is a replay mechanism; it has no meaning for a provider "
+                               "that computes its own routes")
+        # Validate the replay HAS the layers before starting, rather than discovering it halfway.
+        avail = len(self.leaves.calls) - self.leaves.i
+        if avail < layers:
+            raise RuntimeError(f"settle({layers}) needs {layers} more calls, trace has {avail}")
         import copy
         saved_c = copy.copy(self.c)
         saved_pf = self.prefetch
@@ -359,13 +384,18 @@ class Engine:
                 self.decode_layer(i % N_LAYERS,
                                   OpContext(self.request_id, self.c.steps, i % N_LAYERS))
                 ran += 1
-        except Exception:
-            pass                                     # the trace can run out; settle what we can
         finally:
             self.prefetch = saved_pf
             wall, steps = self.c.wall_s, self.c.steps
             self.c = saved_c                         # timed counters are the window's, not this
             self.c.wall_s, self.c.steps = wall, steps
+        # STRICT. Swallowing exceptions here would let the anti-censoring mechanism silently
+        # reintroduce the censoring it exists to remove -- a read failure, an invariant trip or
+        # slot exhaustion would leave predictions unclassified and finalize_stats() would still
+        # return apparently valid numbers. The 99.8/99.4/99.0 -> 100 % measurement shows a handful
+        # of unclassified entries moves the metric, so partial settlement must be loud.
+        if ran != layers:
+            raise RuntimeError(f"settle ran {ran} of {layers} layers; stats are censored")
         return ran
 
     def finalize_stats(self, cancel_outstanding: bool = False, timeout: float = 60.0,

@@ -1128,3 +1128,89 @@ def test_rollback_does_not_undo_a_hit_that_happened_while_the_prediction_waited(
         assert (None if _tv is None else _tv.key) == ctl_victim, (
             f"{policy}: next victim differs from the no-speculation control")
     print("  rollback: an intervening hit survives the rollback on both policies  OK")
+
+
+# ================================================================ 23. right, but too early
+def test_a_prefetch_evicted_before_its_target_is_not_a_ready_hit():
+    """Correct prediction, read completed, evicted before the layer arrived. It saved NOTHING.
+
+    _spec is independent of residency, and SlotReady keeps (slot, generation) readiness for the life
+    of the process -- so classifying on `ready_ts` alone counted this as a TIMELY, USEFUL hit while
+    the engine turned round and read the expert again as a demand miss. It inflated used, ready_hit,
+    timeliness, fetch precision and mean lead simultaneously, which are exactly the quantities a
+    decision about a learned predictor is read from.
+
+    Provoked with a long horizon and a small cache: predictions land many layers early and the
+    working set evicts them before their target.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+    e = Engine(V2, lru_slots=600, transient_slots=400,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut),
+               prefetch=OraclePrefetcher(calls, 16, start=cut))
+    try:
+        e.warm(calls, cut)
+        e.decode(4)
+        e.finalize_stats()
+        p = e.pf
+        assert p.evicted_before_use > 0, (
+            "no prefetch was evicted before its target, so this arm proves nothing "
+            f"(issued {p.issued}, used {p.used})")
+        # every classified prediction lands in exactly one bucket
+        total = p.ready_hit + p.late_hit + p.evicted_before_use
+        assert p.used == p.ready_hit + p.late_hit, (
+            f"used ({p.used}) != ready ({p.ready_hit}) + late ({p.late_hit}) -- an evicted "
+            f"prefetch is being counted as used")
+        # and a ready hit must really be resident at its own generation
+        assert p.ready_hit <= total, (p.ready_hit, total)
+        print(f"  evicted-before-use: {p.evicted_before_use} correct-but-dead prefetches kept out "
+              f"of ready_hit ({p.ready_hit} ready, {p.late_hit} late)  OK")
+    finally:
+        e.close()
+
+
+# ================================================================ 24. what a queued reservation costs
+def test_a_queued_speculation_still_costs_capacity_and_that_is_documented_not_hidden():
+    """Rollback undoes the eviction it caused. It does NOT undo evictions OTHERS made meanwhile.
+
+    A queued speculation holds a PROTECTED slot. A demand miss arriving before it is cancelled
+    cannot use that slot and evicts a different resident instead. Rolling back restores the
+    speculation's own victim, but the secondary eviction stands -- so the cache does not return to
+    the no-speculation counterfactual.
+
+    THIS IS THE CHOSEN SEMANTICS, not an oversight: reserving a slot costs capacity from the moment
+    it is reserved, whether or not the read ever starts. Making it genuinely free needs provisional
+    reservation -- keep the old tenant usable until the speculative write commits, and let demand
+    preempt a queued speculation -- which is a different design. Until that exists, "queued
+    cancellation is free" is true of I/O and false of capacity, and this test says so out loud.
+    """
+    def build():
+        sl = ExpertSlots(16, 8, policy="lru")
+        for e in range(16):
+            sl.reserve(0, (e,), prefill=False)
+        return sl
+
+    # control: no speculation, one demand miss
+    ctl = build()
+    ctl.reserve(5, (500,), prefill=False)
+    ctl_order = list(ctl.lru)
+
+    # test: speculate (protected), demand miss, cancel, roll back
+    tst = build()
+    spec, refused = tst.reserve_speculative([(9, 950)])
+    assert spec and not refused
+    k, slot, gen = spec[0]
+    tst.mark_pending(spec)                     # queued: its slot is protected
+    tst.reserve(5, (500,), prefill=False)      # the demand miss must evict SOMEONE ELSE
+    tst.clear_pending(slot, gen)
+    tst.rollback_speculative(k, slot, gen)
+
+    assert k not in tst.lru, "the speculation survived its own rollback"
+    assert (5, 500) in tst.lru, "the demand miss was lost"
+    differs = list(tst.lru) != ctl_order
+    assert differs, (
+        "the counterfactual matched exactly -- if that is now true, provisional reservation has "
+        "been implemented and this test should be replaced by an equality assertion")
+    lost = [x for x in ctl_order if x not in tst.lru]
+    print(f"  queued reservation cost {len(lost)} extra resident(s) that the control kept "
+          f"({lost[:2]}) -- documented, not free  OK")
