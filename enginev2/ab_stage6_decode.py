@@ -15,9 +15,9 @@ WHAT IS MEASURED, all from the engines' OWN counters (never /proc/diskstats):
                    the same way in both arms, because v1's store counts uniques and the route
                    tensor has 36 positions for ~11.7 uniques, so the two are not interchangeable
 
-WHAT IS NOT MEASURED. v2 has no draft/verify: `next_block` is greedy argmax repeated across the
-block, and BOTH arms use it, so the token sequence is identical and the route sequence is identical.
-This is not v1's speculative decode and the steps/s here are not v1's serving steps/s. The A/B is
+WHAT IS NOT MEASURED. v2 has no draft/verify. The block is TEACHER-FORCED from a fixed corpus --
+identical in both arms -- so the route sequence is realistic and reproducible, but acceptance is
+not modelled and these steps/s are not v1's serving steps/s. The A/B is
 between two DRIVERS over one fixed route sequence, which is the only thing it can honestly claim.
 
     ARM=v1 python enginev2/ab_stage6_decode.py [steps]
@@ -64,9 +64,51 @@ if eng.spec:
 T = fd.ids.numel()
 
 
+# TEACHER-FORCED ON REAL TEXT, not greedy argmax.
+#
+# The greedy rule collapsed: measured token sequences went [0, 5, 223, 5180, 201, 201, 201, 201]
+# and stayed there. A repeating token re-routes to the same experts every step, so job 350 saw a
+# 98.24 % hit rate and 6.5 reads per step against production's 0.894 and ~64 -- a tenfold
+# difference. It was measuring a fixed point, not a model generating text.
+#
+# Feeding real tokens keeps the route sequence realistic AND perfectly reproducible, which the
+# oracle's recorded trace requires. The model still computes everything; only the choice of the
+# next block changes, and it changes identically in every arm.
+_CORPUS = None
+
+
+def _corpus(tokenizer, need):
+    global _CORPUS
+    if _CORPUS is None:
+        text = (
+            "The flash translation layer maps logical block addresses to physical pages, and its "
+            "garbage collector decides when to relocate live data. Under a mixed read/write "
+            "workload the collector competes with host reads for the same channels, which is why "
+            "tail latency rises sharply once the over-provisioned region is exhausted.\n\n"
+            "def merge_intervals(intervals):\n"
+            "    intervals.sort(key=lambda p: p[0])\n"
+            "    out = []\n"
+            "    for start, end in intervals:\n"
+            "        if out and start <= out[-1][1]:\n"
+            "            out[-1][1] = max(out[-1][1], end)\n"
+            "        else:\n"
+            "            out.append([start, end])\n"
+            "    return out\n\n"
+            "In a mixture-of-experts transformer each token is routed to a small subset of the "
+            "feed-forward experts, so the memory traffic of a decode step depends on the routing "
+            "distribution rather than on the parameter count alone.\n\n"
+            "Die Wettervorhersage fuer die kommende Woche zeigt einen deutlichen Temperatur"
+            "rueckgang, begleitet von anhaltenden Niederschlaegen im Alpenvorland.\n\n"
+        ) * 60
+        _CORPUS = tokenizer.encode(text, add_special_tokens=False)
+    assert len(_CORPUS) >= need, f"corpus has {len(_CORPUS)} tokens, need {need}"
+    return _CORPUS
+
+
 def next_block(lg, step):
-    """The SAME rule in both arms: greedy argmax of the last row, repeated across the block."""
-    return torch.full((T,), int(lg[-1].argmax()), dtype=torch.long, device="cuda")
+    """The SAME rule in both arms: the next T real tokens. Deterministic, and not a fixed point."""
+    c = _corpus(eng.tokenizer, (step + 2) * T)
+    return torch.tensor(c[step * T:(step + 1) * T], dtype=torch.long, device="cuda")
 
 
 block0 = next_block(logits, 0)

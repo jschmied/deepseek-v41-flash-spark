@@ -244,7 +244,8 @@ class RealLeaves(Leaves):
     # The graphs are captured PER PARITY (S % 2) because the ratio-2 compressor grouping depends on
     # it, so begin_step selects the pair for this step and captures on first sight.
 
-    def attach(self, engine, block_ids, engram_rows=None, next_block=None) -> "RealLeaves":
+    def attach(self, engine, block_ids, engram_rows=None, next_block=None, spec=False,
+               temperature=0.0, first_token=None, stop_ids=()) -> "RealLeaves":
         """Bind to a live V41Engine. The engine owns the weights, caches and captured graphs; this
         provider only replays them."""
         self.eng = engine
@@ -256,16 +257,43 @@ class RealLeaves(Leaves):
         # There is no default: a provider asked for more than one step without one is a bug, not a
         # silently-repeated block.
         self.next_block = next_block
+        # SPECULATIVE MODE. attach(spec=True) drives the engine the way the server does -- DSpark
+        # draft, verify, rollback -- instead of taking a caller-supplied block. Without it every
+        # steps/s this branch produces is a proxy: the cache advances by the whole 6 tokens (100 %
+        # acceptance) and nothing is ever committed, so there is no tokens/s to report.
+        self.spec = False
+        self.temperature = 0.0
+        self.tok = None
+        self.drafts = None
+        self.tokens_out = 0          # tokens actually COMMITTED -- what tok/s means
+        self.accepted = []           # per step, so accept_len is measured rather than assumed
+        self.stop_ids = frozenset()
         # The engram source, if one is attached. It owns the reads; this owns the dequant+H2D at
         # the consumer, because to_device() makes CUDA calls and may not run on a reader thread.
         self.engram = None
         self.engram_ablated = 0
         self._S = int(self.fd.c.len)
+        self.spec = bool(spec)
+        self.temperature = float(temperature)
+        self.stop_ids = frozenset(stop_ids)
+        if self.spec:
+            if first_token is None:
+                raise RuntimeError("spec mode needs first_token: the drafter conditions on it")
+            self.tok = int(first_token)
+            self._tv = int(self.fd.ids.numel())
         self._gA = self._gB = self._gF = None
         return self
 
     def select_block(self, step: int) -> None:
         """This step's input block. Must run before EngramSource.issue() hashes it."""
+        if self.spec:
+            # v1's order exactly: draft first, then block = [accepted token | drafts]. The
+            # drafter's graph replays here, so its ~12.8 ms and its three MTP layers are INSIDE
+            # the measurement rather than omitted from it.
+            self.drafts, _q = self.fd.draft(self.tok, int(self.fd.c.len) - 1, self.temperature)
+            self.block_ids = torch.cat(
+                [torch.tensor([self.tok], device=self.fd.dev), self.drafts])
+            return
         if step:
             if self.next_block is None:
                 raise RuntimeError("multi-step decode needs attach(next_block=...); without it "
@@ -276,6 +304,9 @@ class RealLeaves(Leaves):
         """The prologue no layer owns. Mirrors fastdecode.step() up to the layer loop."""
         import torch as _t
         fd, a = self.fd, self.fd.a
+        # READ THE POSITION FRESH. Verify rolls the cache back to pos + a + 1, so a cached _S is
+        # already wrong by the next step under speculation.
+        self._S = int(fd.c.len)
         S = self._S
         fd.ids.copy_(self.block_ids)
         fd.pos.copy_(S + _t.arange(fd.ids.numel(), device=fd.dev))
@@ -360,6 +391,25 @@ class RealLeaves(Leaves):
                 fd.c.pending[L] = None
         fd.c.len = S + T
         self._S = fd.c.len
+        if not self.spec:
+            return
+        # VERIFY, as v41_engine does it: greedy accept over the leading drafts, one 7-wide D2H,
+        # then roll the cache back to what was actually committed. This is where steps stop being
+        # free -- a step commits a + 1 tokens, not T.
+        am = fd.logits.argmax(-1)
+        acc = am[:self._tv - 1].eq(self.drafts).to(torch.int32).cumprod(0)
+        a_n = int(acc.sum())
+        cand = am.tolist()
+        new_toks, bonus = cand[:a_n], cand[a_n]
+        for j, t in enumerate(new_toks):
+            if t in self.stop_ids:
+                a_n, new_toks, bonus = j + 1, new_toks[:j + 1], None
+                break
+        fd.c.rollback(S + a_n + 1)
+        self._S = int(fd.c.len)
+        self.accepted.append(a_n)
+        self.tokens_out += a_n + (1 if bonus is not None else 0)
+        self.tok = bonus if bonus is not None else (new_toks[-1] if new_toks else self.tok)
 
 
 class RealEngramSource:

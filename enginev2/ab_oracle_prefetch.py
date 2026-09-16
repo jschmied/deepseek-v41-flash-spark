@@ -163,7 +163,54 @@ def prefill():
 
 lg = prefill()
 T = fd.ids.numel()
-nb = lambda l, s: torch.full((T,), int(l[-1].argmax()), dtype=torch.long, device="cuda")
+# TEACHER-FORCED ON REAL TEXT, not greedy argmax.
+#
+# The greedy rule collapsed: measured token sequences went [0, 5, 223, 5180, 201, 201, 201, 201]
+# and stayed there. A repeating token re-routes to the same experts every step, so job 350 saw a
+# 98.24 % hit rate and 6.5 reads per step against production's 0.894 and ~64 -- a tenfold
+# difference. It was measuring a fixed point, not a model generating text.
+#
+# Feeding real tokens keeps the route sequence realistic AND perfectly reproducible, which the
+# oracle's recorded trace requires. The model still computes everything; only the choice of the
+# next block changes, and it changes identically in every arm.
+_CORPUS = None
+
+
+def _corpus(tokenizer, need):
+    global _CORPUS
+    if _CORPUS is None:
+        text = (
+            "The flash translation layer maps logical block addresses to physical pages, and its "
+            "garbage collector decides when to relocate live data. Under a mixed read/write "
+            "workload the collector competes with host reads for the same channels, which is why "
+            "tail latency rises sharply once the over-provisioned region is exhausted.\n\n"
+            "def merge_intervals(intervals):\n"
+            "    intervals.sort(key=lambda p: p[0])\n"
+            "    out = []\n"
+            "    for start, end in intervals:\n"
+            "        if out and start <= out[-1][1]:\n"
+            "            out[-1][1] = max(out[-1][1], end)\n"
+            "        else:\n"
+            "            out.append([start, end])\n"
+            "    return out\n\n"
+            "In a mixture-of-experts transformer each token is routed to a small subset of the "
+            "feed-forward experts, so the memory traffic of a decode step depends on the routing "
+            "distribution rather than on the parameter count alone.\n\n"
+            "Die Wettervorhersage fuer die kommende Woche zeigt einen deutlichen Temperatur"
+            "rueckgang, begleitet von anhaltenden Niederschlaegen im Alpenvorland.\n\n"
+        ) * 60
+        _CORPUS = tokenizer.encode(text, add_special_tokens=False)
+    assert len(_CORPUS) >= need, f"corpus has {len(_CORPUS)} tokens, need {need}"
+    return _CORPUS
+
+
+def next_block(lg, step):
+    """The SAME rule in both arms: the next T real tokens. Deterministic, and not a fixed point."""
+    c = _corpus(eng.tokenizer, (step + 2) * T)
+    return torch.tensor(c[step * T:(step + 1) * T], dtype=torch.long, device="cuda")
+
+
+nb = next_block
 
 if PASS == "rec":
     # ---- record the true routes and exit. Untimed; its only output is the route table.
