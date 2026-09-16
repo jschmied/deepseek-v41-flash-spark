@@ -988,12 +988,13 @@ def test_rollback_restores_the_exact_eviction_state_under_both_policies():
         for e in range(16):
             sl.reserve(0, (e,), prefill=False)
         if policy == "age_over_freq":
-            v0 = sl.evict.victim(sl.lru, frozenset(), sl._clock)
+            v0 = sl.evict.victim(sl.lru, frozenset(), sl._clock).key
             c0 = sl.evict._use_count.get(v0, 0)
             assert len(sl.evict._buckets[c0]) > 1, (
                 f"fixture is degenerate: victim {v0} is alone in bucket {c0}")
         before_order = list(sl.lru)
-        before_victim = sl.evict.victim(sl.lru, frozenset(), sl._clock)
+        _bv = sl.evict.victim(sl.lru, frozenset(), sl._clock)
+        before_victim = None if _bv is None else _bv.key
         assert before_victim is not None, policy
 
         spec, refused = sl.reserve_speculative([(9, 900)])
@@ -1005,7 +1006,8 @@ def test_rollback_restores_the_exact_eviction_state_under_both_policies():
         assert list(sl.lru) == before_order, (
             f"{policy}: rollback changed LRU order\n  before {before_order[:5]}\n  "
             f"after  {list(sl.lru)[:5]}")
-        after_victim = sl.evict.victim(sl.lru, frozenset(), sl._clock)
+        _av = sl.evict.victim(sl.lru, frozenset(), sl._clock)
+        after_victim = None if _av is None else _av.key
         assert after_victim == before_victim, (
             f"{policy}: the next victim changed across an undone eviction: "
             f"{before_victim} -> {after_victim}")
@@ -1032,7 +1034,8 @@ def test_rollback_restores_the_exact_eviction_state_under_both_policies():
         # protect the first few slots exactly as a live reserve() would
         head = [sl.lru[k] for k in before_order[:3]]
         protected = frozenset(head)
-        victim = sl.evict.victim(sl.lru, protected, sl._clock)
+        _v = sl.evict.victim(sl.lru, protected, sl._clock)
+        victim = None if _v is None else _v.key
         assert victim is not None and victim not in before_order[:3], (
             f"{policy}: fixture did not protect ahead of the victim")
 
@@ -1064,10 +1067,64 @@ def test_rollback_restores_the_exact_eviction_state_under_both_policies():
             assert after_buckets == before_buckets, (
                 f"{policy}: rollback changed bucket order\n  before {before_buckets}\n"
                 f"  after  {after_buckets}")
-        after_victim = sl.evict.victim(sl.lru, protected, sl._clock)
+        _av2 = sl.evict.victim(sl.lru, protected, sl._clock)
+        after_victim = None if _av2 is None else _av2.key
         assert after_victim == victim, (
             f"{policy}: protected-prefix rollback changed the next victim: "
             f"{victim} -> {after_victim}")
 
     print("  rollback: same victim and order, with and without a protected prefix, both "
           "policies; displaced bounded by slots  OK")
+
+
+# ================================================================ 22. rollback vs a real access
+def test_rollback_does_not_undo_a_hit_that_happened_while_the_prediction_waited():
+    """A queued prediction lives for LAYERS. What happens to the cache meanwhile is real.
+
+    The saved `skipped` prefix records where a victim sat AT EVICTION TIME. If one of those
+    predecessors is legitimately HIT before the prediction is settled, restoring it to its saved
+    position undoes that access -- reconstructing a cache state that never existed. And the skipped
+    prefix is exactly the protected/in-use keys, which are the ones most likely to be used next.
+
+    Control-vs-test, which is the only construction that can see it: the same store with and
+    without a speculation that is rolled back. After the rollback the two must be identical.
+    """
+    def build(policy):
+        sl = ExpertSlots(16, 8, policy=policy)
+        for e in range(16):
+            sl.reserve(0, (e,), prefill=False)
+        return sl
+
+    for policy in ("lru", "age_over_freq"):
+        # --- control: no speculation at all, just the intervening hit
+        ctl = build(policy)
+        order = list(ctl.lru)
+        touched = order[0]                       # a key the victim search would skip over
+        ctl.reserve(touched[0], (touched[1],), prefill=False)
+        ctl_order = list(ctl.lru)
+        _cv = ctl.evict.victim(ctl.lru, frozenset(), ctl._clock)
+        ctl_victim = None if _cv is None else _cv.key
+
+        # --- test: speculate (evicting past `touched`), take the same hit, then roll back
+        tst = build(policy)
+        head = [tst.lru[k] for k in list(tst.lru)[:3]]
+        fake = [((99, i), sl_, tst.gen.get(sl_, 0) + 1) for i, sl_ in enumerate(head)]
+        for _k, sl_, g in fake:
+            tst.gen[sl_] = g
+        tst.mark_pending(fake)                   # makes the first three slots protected
+        spec, refused = tst.reserve_speculative([(9, 950)])
+        assert spec and not refused, f"{policy}: speculation refused"
+        k, slot, gen = spec[0]
+        tst.reserve(touched[0], (touched[1],), prefill=False)   # THE INTERVENING HIT
+        for _k, sl_, g in fake:
+            tst.clear_pending(sl_, g)
+        tst.rollback_speculative(k, slot, gen)
+
+        if tst.evict.uses_lru_order:
+            assert list(tst.lru) == ctl_order, (
+                f"{policy}: rollback undid an access that really happened\n"
+                f"  control {ctl_order[:6]}\n  after   {list(tst.lru)[:6]}")
+        _tv = tst.evict.victim(tst.lru, frozenset(), tst._clock)
+        assert (None if _tv is None else _tv.key) == ctl_victim, (
+            f"{policy}: next victim differs from the no-speculation control")
+    print("  rollback: an intervening hit survives the rollback on both policies  OK")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import dataclasses
 import threading
 
 from .observe import NO_CTX, Event, NullObserver, WaitReason, next_span, now_ns
@@ -33,6 +34,19 @@ N_EXPERTS = 384
 # to know which, only that it may not touch them.
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class VictimChoice:
+    """What victim() decided, and everything needed to undo it.
+
+    `restore_token` is opaque to the store: each policy decides what it needs to put a tenant back
+    exactly. Returning it beats leaving it on the policy as `last_skipped`, which was a side channel
+    valid only until the next victim() call and gave a new policy nowhere to put richer state.
+    """
+
+    key: tuple
+    restore_token: object = None
+
+
 class EvictionPolicy:
     """Bookkeeping for one cache region. All hooks are called with the store's lock held."""
 
@@ -40,10 +54,7 @@ class EvictionPolicy:
     # Does this policy read the global LRU ORDER? Only then must a rollback restore the victim's
     # exact position in it; otherwise placing it anywhere is invisible.
     uses_lru_order = False
-    # Keys victim() passed over because their slots were protected. The chosen victim is the first
-    # UNPROTECTED candidate, not the head -- so restoring it at the head is wrong by exactly this
-    # prefix, and under lookahead protected slots are common rather than rare.
-    last_skipped: tuple = ()
+
 
     def on_hit(self, key: tuple, slot: int, clock: int) -> None:
         """A resident was used. `clock` is the store's logical time (decode resolves only)."""
@@ -73,7 +84,8 @@ class EvictionPolicy:
         """A key stopped being resident (evicted, or un-mapped after a torn read)."""
 
     def victim(self, residents: "collections.OrderedDict", protected: frozenset,
-               clock: int) -> tuple | None:
+               clock: int) -> "VictimChoice | None":
+        """-> VictimChoice, or None when nothing is evictable."""
         raise NotImplementedError
 
 
@@ -87,10 +99,8 @@ class LRUPolicy(EvictionPolicy):
         skipped = []
         for k, slot in residents.items():
             if slot not in protected:
-                self.last_skipped = tuple(skipped)
-                return k
+                return VictimChoice(k, tuple(skipped))
             skipped.append(k)
-        self.last_skipped = ()
         return None
 
 
@@ -189,8 +199,7 @@ class AgeOverFreqPolicy(EvictionPolicy):
                 if best_key is None or rank > best_key:
                     best_key, best, best_skipped = rank, k, tuple(skipped)
                 break                 # only the first UNPROTECTED entry of each bucket can win
-        self.last_skipped = best_skipped or ()
-        return best
+        return None if best is None else VictimChoice(best, best_skipped or ())
 
 
 EVICT_POLICIES = {"lru": LRUPolicy, "age_over_freq": AgeOverFreqPolicy}
@@ -489,6 +498,14 @@ class ExpertSlots:
         # is bounded by lru_slots instead of growing with every speculative fetch for the life of
         # the process. rollback_speculative() checks the generation matches.
         self._displaced: dict[int, tuple] = {}
+        # ORDERING VERSION per key, bumped whenever that key's recency changes (a hit that moves it,
+        # or a fresh insert). A queued prediction can live for several layers before its target is
+        # reached, and during those layers a skipped predecessor can legitimately be HIT. Restoring
+        # it to its saved position would then undo a real access -- the rollback would be putting
+        # the cache back to a state that never existed. Versions make the restore conditional:
+        # a skipped key goes back only if nothing touched it in the meantime.
+        self._order_ver: dict[tuple, int] = {}
+        self._ver_clock = 0
         self._pending_lk = threading.Lock()
 
         # age/(1+count). Both dicts survive eviction ON PURPOSE, exactly as the offline replay's
@@ -530,11 +547,13 @@ class ExpertSlots:
         if self.free_lru:
             slot = self.free_lru.pop()
         else:
-            victim = self.evict.victim(self.lru, used, self._clock)
-            # What the policy passed over to reach this victim. Needed to put it back exactly, and
-            # captured here because last_skipped is only valid until the next victim() call.
+            choice = self.evict.victim(self.lru, used, self._clock)
+            victim = None if choice is None else choice.key
             self._last_victim = victim
-            self._last_skipped = self.evict.last_skipped
+            # The skipped prefix WITH each key's ordering version at eviction time. The version is
+            # what makes a later restore honest: see _order_ver.
+            _sk = () if choice is None else (choice.restore_token or ())
+            self._last_skipped = tuple((k, self._order_ver.get(k, 0)) for k in _sk)
             if victim is None:
                 raise RuntimeError(
                     "no evictable LRU slot: every resident is in use by this call or has a write "
@@ -543,6 +562,8 @@ class ExpertSlots:
             self.slot_key.pop(slot, None)
             self.evict.on_drop(victim)
         self.lru[key] = slot
+        self._ver_clock += 1
+        self._order_ver[key] = self._ver_clock
         self.slot_key[slot] = key
         if touch:
             self.evict.on_insert(key, slot, self._clock)
@@ -585,6 +606,8 @@ class ExpertSlots:
                 s = self.transient_map.get(key)
             else:
                 self.lru.move_to_end(key)
+                self._ver_clock += 1
+                self._order_ver[key] = self._ver_clock
                 if not prefill:
                     # DECODE hits only. A prefill chunk touches nearly every expert of a layer, so
                     # letting it write the counter would push every resident up by one per chunk
@@ -684,11 +707,15 @@ class ExpertSlots:
         # protected slots are common. Only policies that READ the order need this.
         self.lru.move_to_end(victim, last=False)
         if self.evict.uses_lru_order:
-            for k in reversed(skipped):
-                if k in self.lru:
+            for k, ver in reversed(skipped):
+                # Only if NOTHING touched it since. A skipped key that was hit while the prediction
+                # sat in the queue has moved for a real reason, and dragging it back would undo
+                # that access -- reconstructing a cache state that never existed.
+                if k in self.lru and self._order_ver.get(k, 0) == ver:
                     self.lru.move_to_end(k, last=False)
         self.slot_key[slot] = victim
-        self.evict.on_restore(victim, slot, skipped)
+        self.evict.on_restore(victim, slot, tuple(
+            k for k, ver in skipped if self._order_ver.get(k, 0) == ver))
         self.restored += 1
         return True
 

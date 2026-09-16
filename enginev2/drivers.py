@@ -332,7 +332,44 @@ class Engine:
             self.c.device_busy_s = bw.busy_s
         return self.c
 
-    def finalize_stats(self, cancel_outstanding: bool = False, timeout: float = 60.0) -> None:
+    def settle(self, layers: int | None = None) -> int:
+        """Run extra layers UNTIMED with prediction OFF, so predictions already issued for targets
+        past the timed window get CLASSIFIED instead of censored.
+
+        Without this the tail is right-censored and the censoring is horizon-dependent: a horizon-4
+        predictor has four layers' worth of useful predictions that the window stopped before
+        consuming, while horizon 1 has one. `started` grows, ready_hit/late_hit/wasted cannot, and
+        the longer horizon is penalised for nothing but where the benchmark ended. That is a bias
+        in favour of short horizons in exactly the sweep meant to choose a horizon.
+
+        Nothing new is predicted during settlement, so it adds no tail of its own. The timed
+        counters are restored afterwards -- only the prefetch classification is allowed to move.
+        """
+        if layers is None:
+            layers = getattr(self.prefetch, "horizon", 0)
+        if layers <= 0:
+            return 0
+        import copy
+        saved_c = copy.copy(self.c)
+        saved_pf = self.prefetch
+        self.prefetch = Prefetcher()                 # issue nothing new
+        ran = 0
+        try:
+            for i in range(layers):
+                self.decode_layer(i % N_LAYERS,
+                                  OpContext(self.request_id, self.c.steps, i % N_LAYERS))
+                ran += 1
+        except Exception:
+            pass                                     # the trace can run out; settle what we can
+        finally:
+            self.prefetch = saved_pf
+            wall, steps = self.c.wall_s, self.c.steps
+            self.c = saved_c                         # timed counters are the window's, not this
+            self.c.wall_s, self.c.steps = wall, steps
+        return ran
+
+    def finalize_stats(self, cancel_outstanding: bool = False, timeout: float = 60.0,
+                       settle_layers: int | None = None) -> None:
         """Settle the asynchronous counters. Call before reading pf for an experiment.
 
         Speculation outstanding when the timed window closed still causes real I/O, and reading
@@ -341,6 +378,9 @@ class Engine:
         predictor would cause if the request ended here). Default is the former, because it is the
         one that answers "what did this prediction window cost".
         """
+        if settle_layers is not None or cancel_outstanding is False:
+            # settle first: classify what the window issued but did not reach
+            self.settle(settle_layers)
         if cancel_outstanding:
             pending = [(k, sl, g) for k, (sl, g, _c) in self._spec.items()]
             if pending:
@@ -348,6 +388,11 @@ class Engine:
                 self.pf.cancelled_queued += q
                 self.pf.discarded_running += r
                 self.pf.discarded_finished += f
+            # POP them: leaving cancelled entries in _spec made a second finalize_stats() account
+            # the same tail twice, and a queued-cancelled item is no longer in _queued, so the
+            # second pass would misclassify it as running.
+            for k, _sl, _g in pending:
+                self._spec.pop(k, None)
         self.loader.quiesce(timeout)
         self.loader.drain_forgets()
         self.pf.started = self.loader.started_spec
