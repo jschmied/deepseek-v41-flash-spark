@@ -390,6 +390,88 @@ directly in the tok/s.
 
 SHIPPABLE TODAY: `DSV41_EVICT_POLICY=age_over_freq` is an env var production does not set.
 
+## 17. The scheduler review, items 1-10: what was worth doing and what the measurement killed
+
+The review proposed ten simplifications to the loader. Job 370 measured the premise behind most of
+them and came back a NULL: removing ~1080 host-side lock acquisitions per step moved real tokens by
+0.08 %, against within-arm spreads of 2.7 % and 1.9 %. Python synchronisation is not material in a
+~0.46 s step. That result is load-bearing for everything below -- it is the reason several items are
+now declined ON EVIDENCE rather than deferred.
+
+The distinction that survives it: a LOCK is overhead, and overhead is 0.08 %. A BLOCKED OBSERVER is
+a scheduling bubble, and a bubble holds a physical resource closed. Item 7 was the only item of the
+ten on the second side of that line.
+
+### Item 7 -- the completer retired copies in submission order (done, 470c161)
+
+One thread called `handle.synchronize()` on each completion in the order workers queued it. The
+copies run on per-worker streams and finish OUT of order, so a finished copy could sit behind a
+running one -- and `_complete_h2d` is what releases the pinned staging buffer and the h2d permit.
+With `h2d_inflight=2` that halves the effective copy depth in the worst case.
+
+The loop now drains everything the queue holds before deciding anything, retires whatever `query()`
+says has landed, and polls at 200 us when copies are outstanding but none is ready. It never blocks
+on one specific event.
+
+My first attempt reproduced the same defect one step along: it took ONE item, found it unfinished,
+and parked in `synchronize()` on it -- without looking at the queue, where a finished copy was
+already waiting. The new test caught that on the first run. It is worth saying why the existing 38
+tests could not have: every fake provider in the suite returns `None` from `h2d()`, so the whole
+suite exercises the no-event path and passes identically against the old in-order loop.
+
+Measured by job 375, with `DSV41_COMPLETER_INORDER=1` restoring the old loop in the SAME binary --
+and with a test asserting that arm really does block on the older event, so the A/B cannot return a
+null by construction. Four earlier scheduler verdicts went wrong exactly that way.
+
+**RESULT: a null.** 600 steps after a 150-step warm-up, 79 GB, engram live, real committed tokens:
+
+| arm | rep 1 | rep 2 | mean |
+|---|---|---|---|
+| out of order (new) | 6.33 | 6.46 | 6.395 |
+| in order (old) | 6.36 | 6.38 | 6.370 |
+
++0.4 %, against a within-arm spread of 2.1 % in the new arm. That is the pre-registered `< 1 %`
+branch: **stop looking for wins in the completer.**
+
+SCOPE, because the mechanism was real and the effect is not. Head-of-line blocking can only cost
+what it actually blocks, and here it blocked almost nothing: `staging peak 8` against
+`h2d_inflight=2`, and an expert READ takes ~13.6 ms while its H2D is a small fraction of that. The
+completer was therefore idle most of the time and the in-order wait usually had nothing queued
+behind it. The defect was genuine -- the test proves the old arm does block -- it simply sat on a
+resource that was never scarce. Keep the new code: it is simpler, it has tests, and it removes a
+failure mode that WOULD bite at higher h2d depth. Do not claim a speed-up for it.
+
+TAKEN TOGETHER WITH JOB 370, this closes the loader-scheduler family by elimination. 370 removed
+~1080 host locks per step: 0.08 %. 375 removed the one scheduling bubble in the same machinery:
+0.4 %. Whatever the ~69 ms/step of section 14 is made of, it is not in the loader.
+
+### Item 6 -- the loader lock, split three ways (two done, one declined)
+
+- DONE: an immutable `LoadTicket`. The queue payload was `(ctx, cause_id, speculative, scored) +
+  tuple(item)` spliced into a 4-tuple, read positionally in `_worker` as `entry[2]`/`entry[3]`, with
+  the demand flag carried twice (`entry[3]` was `prio == 0`, which is `not speculative`, which is
+  already inside `entry[2]`).
+- DONE: two deques replacing the PriorityQueue. Demand ahead of speculation, FIFO within each, is
+  all the PriorityQueue was doing -- and the `_seq` counter existed ONLY to break priority ties
+  before Python compared the payloads, which meant taking the service lock to generate it. The
+  shutdown sentinel also stops being a magic priority of -1 and simply goes to the front.
+- DECLINED: per-thread statistics counters. This would remove ~270 lock acquisitions per step. Job
+  370 priced ~1080 at 0.08 %, so this is worth about 0.02 %, and it costs a `threading.local`, a
+  registry and two summing properties. That is complexity bought with a measured non-effect. (The
+  same change IS in `real.py`, where the counters sit in the read path and the contention is real --
+  the difference is the measurement, not the pattern.)
+- DECLINED: driver-owned cancellation. `_queued`/`_cancelled`/`_discard` is the genuinely intricate
+  part of this file, but rewriting it changes WHEN a speculative read stops being cancellable. That
+  is a semantic change to the one feature v2 exists for, for no measured gain.
+
+### What is left, and it is not in the scheduler
+
+Items 1-5 and 8-10 are done or subsumed. The remaining term is the one job 370 pointed at on its way
+past: keeping the NVMe pipe occupied. Decode runs 44 % cold and 84 % warm at depth 0, misses are
+capacity misses (76-83 %), and expert IDENTITY is unpredictable (sections 8-9). The levers that
+survive all of that are arena capacity, concurrency, and computing the resident experts while the
+misses load -- review item 3, the only proposal that attacks the term that sets step time.
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
