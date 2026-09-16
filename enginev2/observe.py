@@ -97,6 +97,11 @@ class Event:
     gen: int = -1
     span: int = 0            # identifies ONE WAIT: pairs a start with its own end
     cause_id: int = 0        # identifies WHAT CAUSED this work: one prediction batch, end to end
+    # Is this inside the MEASURED window? Settlement runs real work under real contention and is
+    # deliberately excluded from the statistics -- but only Counters was being restored, so an
+    # aggregate observer still folded settlement waits and loader work into its totals, and unlike
+    # Counters it cannot undo an increment. Trace observers keep everything; aggregates skip it.
+    scored: bool = True
     value: float = 0.0
     aux: object = None
 
@@ -120,6 +125,13 @@ class Observer:
 
     enabled = True
     failed: BaseException | None = None
+    # Is a MEASUREMENT in progress? Settlement runs real work under real contention and is excluded
+    # from the statistics. Per-event `scored` covers what the driver and loader emit, but the
+    # ownership-point abstractions -- Chain, SlotReady, StagingPool -- emit the most important
+    # waits and do not know about cohorts, and threading a scoring flag through all of them would
+    # put experiment bookkeeping inside the primitives. One flag on the sink instead: aggregates
+    # stop counting, trace observers keep everything for diagnostics.
+    measurement_active = True
 
     def emit(self, event: Event) -> None:
         raise NotImplementedError
@@ -186,6 +198,8 @@ class CounterObserver(Observer):
         self._lk = threading.Lock()
 
     def emit(self, event: Event) -> None:
+        if not (event.scored and self.measurement_active):
+            return                       # settlement: real work, not part of the measurement
         k = event.kind
         with self._lk:
             self.counts[k] += 1

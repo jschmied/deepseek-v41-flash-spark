@@ -260,7 +260,8 @@ class LoaderService:
             # the caller knows when it was queued, began and ended, so measurement semantics stay
             # put when the provider is swapped.
             if self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "nvme_start", ctx=ctx, cause_id=cause_id, key=key, slot=slot, gen=gen))
+                self.obs.safe_emit(Event(now_ns(), "nvme_start", ctx=ctx, cause_id=cause_id, key=key, slot=slot, gen=gen,
+                                         scored=scored))
             # Counted HERE, not at dequeue: a worker blocked on admission has not started a read,
             # and an injected failure never reaches the device at all. The counter is the
             # denominator of fetch precision, so "committed to read" is not good enough.
@@ -273,7 +274,8 @@ class LoaderService:
                     self.started_demand += 1
             staged = self.leaves.read(key, self.stage, ctx)
             if self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "nvme_end", ctx=ctx, cause_id=cause_id, key=key, slot=slot, gen=gen))
+                self.obs.safe_emit(Event(now_ns(), "nvme_end", ctx=ctx, cause_id=cause_id, key=key, slot=slot, gen=gen,
+                                         scored=scored))
             if not self.policy.lease_until_completion:
                 # D2 OFF: give the ADMISSION back now. Another read may enter the device while this
                 # expert's buffer waits on its copy. The buffer itself stays ours until H2D done.
@@ -287,7 +289,7 @@ class LoaderService:
             sp = next_span()
             if self.obs.enabled:
                 self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, key=key, slot=slot,
-                                         gen=gen, span=sp, aux=reason))
+                                         gen=gen, span=sp, aux=reason, scored=scored))
             try:
                 if self.policy.compute_barrier_global:
                     self.compute.wait_idle()          # D1 ON: wait for ALL compute
@@ -296,7 +298,7 @@ class LoaderService:
             finally:
                 if self.obs.enabled:
                     self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, key=key, slot=slot,
-                                             gen=gen, span=sp, aux=reason))
+                                             gen=gen, span=sp, aux=reason, scored=scored))
             if self.obs.enabled and not self.h2d_sem.acquire(blocking=False):
                 sp = next_span()
                 self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, key=key, slot=slot, gen=gen, span=sp,
@@ -309,14 +311,16 @@ class LoaderService:
             try:
                 with self.arena.writing(slot, key):
                     if self.obs.enabled:
-                        self.obs.safe_emit(Event(now_ns(), "h2d_start", ctx=ctx, cause_id=cause_id, key=key,
-                                                 slot=slot, gen=gen))
+                        self.obs.safe_emit(Event(now_ns(), "h2d_start", ctx=ctx,
+                                                 cause_id=cause_id, key=key, slot=slot, gen=gen,
+                                                 scored=scored))
                     t0 = time.perf_counter()
                     self.leaves.h2d(slot, key, staged)
                     dt = time.perf_counter() - t0
                     if self.obs.enabled:
-                        self.obs.safe_emit(Event(now_ns(), "h2d_end", ctx=ctx, cause_id=cause_id, key=key, slot=slot,
-                                                 gen=gen, value=dt))
+                        self.obs.safe_emit(Event(now_ns(), "h2d_end", ctx=ctx, cause_id=cause_id,
+                                                 key=key, slot=slot, gen=gen, value=dt,
+                                                 scored=scored))
             finally:
                 self.h2d_sem.release()
             with self._lk:
@@ -377,7 +381,7 @@ class LoaderService:
         if self.obs.enabled:
             for key, slot, gen in to_load:
                 self.obs.safe_emit(Event(now_ns(), "load_queued", ctx=ctx, key=key, slot=slot,
-                                         gen=gen, cause_id=cause_id,
+                                         gen=gen, cause_id=cause_id, scored=scored,
                                          aux="spec" if speculative else "demand"))
         prio = 1 if speculative else 0
         with self._inflight_cv:
@@ -394,7 +398,7 @@ class LoaderService:
                 self.q.put((prio, self._seq, (ctx, cause_id, speculative, scored) + tuple(item),
                             prio == 0))
 
-    def cancel(self, items) -> tuple:
+    def cancel(self, items) -> list:
         """Discard wrong speculation in whichever of its three states it is in.
 
         An earlier version only cancelled QUEUED work and let a running or finished wrong prefetch

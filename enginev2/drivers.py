@@ -137,14 +137,14 @@ class Engine:
 
         e = self.obs.enabled
         if e:
-            self.obs.safe_emit(Event(now_ns(), "layer_a_start", ctx=ctx))
+            self.obs.safe_emit(Event(now_ns(), "layer_a_start", ctx=ctx, scored=self._scoring))
         self.obs.safe_gpu_begin("layer_a", ctx)
         route = self._compute(lambda: self.leaves.layer_a(layer))
         self.obs.safe_gpu_end("layer_a", ctx)
         uniq = route.uniq
         if e:
-            self.obs.safe_emit(Event(now_ns(), "layer_a_end", ctx=ctx))
-            self.obs.safe_emit(Event(now_ns(), "route_ready", ctx=ctx, value=len(uniq), aux=uniq))
+            self.obs.safe_emit(Event(now_ns(), "layer_a_end", ctx=ctx, scored=self._scoring))
+            self.obs.safe_emit(Event(now_ns(), "route_ready", ctx=ctx, value=len(uniq), aux=uniq, scored=self._scoring))
         # EDGE 2 and 6: A wrote y / route_idx / route_w, and the KV buffers this layer's
         # bookkeeping will clone.
         self.chain.set("y", layer, ctx=ctx)
@@ -161,14 +161,15 @@ class Engine:
         slot_of, to_load, to_wait = self.slots.reserve(layer, uniq, prefill=False)
         if e:
             for k, sl, g in to_load:
-                self.obs.safe_emit(Event(now_ns(), "cache_miss", ctx=ctx, key=k, slot=sl, gen=g))
+                self.obs.safe_emit(Event(now_ns(), "cache_miss", ctx=ctx, key=k, slot=sl, gen=g, scored=self._scoring))
             # A resident key whose write is still in flight is a MAPPING hit, not a ready one --
             # reserve() puts it in to_wait and the consumer blocks. Reporting them together
             # overstates the cache.
             self.obs.safe_emit(Event(now_ns(), "cache_ready_hit", ctx=ctx,
-                                     value=len(uniq) - len(to_load) - len(to_wait)))
+                                     value=len(uniq) - len(to_load) - len(to_wait), scored=self._scoring))
             if to_wait:
-                self.obs.safe_emit(Event(now_ns(), "cache_pending_hit", ctx=ctx, value=len(to_wait)))
+                self.obs.safe_emit(Event(now_ns(), "cache_pending_hit", ctx=ctx, value=len(to_wait),
+                                         scored=self._scoring))
         self.c.fetches += len(to_load)
         self.loader.submit(to_load, ctx=ctx)
         # A prefetch that has not landed yet is waited on exactly like a demand read. It is not
@@ -204,7 +205,7 @@ class Engine:
         # ordering and multiplicity that moe_fn needs.
         reads = sorted(set(slot_of.values()))
         if e:
-            self.obs.safe_emit(Event(now_ns(), "layer_b_start", ctx=ctx))
+            self.obs.safe_emit(Event(now_ns(), "layer_b_start", ctx=ctx, scored=self._scoring))
         self.obs.safe_gpu_begin("layer_b", ctx)
         # EDGE 3 and 4 are already enforced above: the ids came out of A, and _wait covers both the
         # `slots` mapping and the expert bytes being resident.
@@ -212,7 +213,7 @@ class Engine:
         self._compute(lambda: self.leaves.layer_b(layer, route), slots=reads)
         self.obs.safe_gpu_end("layer_b", ctx)
         if e:
-            self.obs.safe_emit(Event(now_ns(), "layer_b_end", ctx=ctx))
+            self.obs.safe_emit(Event(now_ns(), "layer_b_end", ctx=ctx, scored=self._scoring))
         self.chain.set("h", layer, ctx=ctx)            # B wrote h and pre_mix for the next layer
 
     # ------------------------------------------------------------------ prefetch bookkeeping
@@ -243,13 +244,21 @@ class Engine:
                 for k in hit:
                     if k not in self._spec:
                         self.obs.safe_emit(Event(now_ns(), "prediction_resident_hit",
-                                                 ctx=ctx or NO_CTX, key=k, cause_id=named[k][0]))
+                                                 ctx=ctx or NO_CTX, key=k, cause_id=named[k][0], scored=self._scoring))
         wrong = []
         # Attempts retired earlier for this layer: the read happened, so it counts, but it can
         # only ever have failed to serve demand.
         for att in self._expired.pop(layer, []):
             if not att.scored:
                 continue                          # nothing physical left to do: already retired
+            # BOTH dimensions. evicted_before_use means "right, but too early"; labelling a retired
+            # attempt that way without checking whether the layer wanted it turned a plain false
+            # positive into a timing failure and made the failure-mode breakdown say the wrong
+            # thing about WHY prediction fails. The fetch-precision denominator is unaffected --
+            # that is measured at the read leaf -- but the diagnosis is not.
+            if att.key not in want:
+                self.pf.wasted += 1               # simply wrong; its read is in started_cohort
+                continue
             if att.terminal == "failed":
                 self.pf.failed_before_use += 1
             else:
@@ -287,7 +296,7 @@ class Engine:
                     if self.obs.enabled:
                         self.obs.safe_emit(Event(now_ns(), "prefetch_evicted_before_use",
                                                  ctx=ctx or NO_CTX, key=key, slot=slot, gen=gen,
-                                                 cause_id=cause))
+                                                 cause_id=cause, scored=self._scoring))
                     continue
                 if att.scored:
                     self.pf.used += 1
@@ -303,13 +312,13 @@ class Engine:
                     if self.obs.enabled:
                         self.obs.safe_emit(Event(now_ns(), "prefetch_ready_hit", ctx=ctx or NO_CTX,
                                                  key=key, slot=slot, gen=gen, cause_id=cause,
-                                                 value=lead))
+                                                 value=lead, scored=self._scoring))
                 else:
                     if att.scored:
                         self.pf.late_hit += 1
                     if self.obs.enabled:
                         self.obs.safe_emit(Event(now_ns(), "prefetch_late_hit", ctx=ctx or NO_CTX,
-                                                 key=key, slot=slot, gen=gen, cause_id=cause))
+                                                 key=key, slot=slot, gen=gen, cause_id=cause, scored=self._scoring))
             else:
                 if att.scored:
                     self.pf.wasted += 1
@@ -317,7 +326,7 @@ class Engine:
                 scored_wrong[(slot, gen)] = att.scored
                 if self.obs.enabled:
                     self.obs.safe_emit(Event(now_ns(), "prefetch_wasted", ctx=ctx or NO_CTX,
-                                             key=key, slot=slot, gen=gen, cause_id=cause))
+                                             key=key, slot=slot, gen=gen, cause_id=cause, scored=self._scoring))
         if wrong and self.discard_wrong_asap:
             # A wrong prefetch holds a slot AND a pending write, so it blocks eviction as well as
             # occupying capacity. Cancelling recovers the slot for reads that are already known to
@@ -369,18 +378,31 @@ class Engine:
         # the schema did not have it.
         pred_id = next_span()
         for k in keys:
-            # the scored bit travels with the PREDICTION too: a resident-correct prediction never
-            # becomes a fetch, so a fetch-sequence cutoff could never have gated it.
-            self._pred.setdefault(k[0], {})[k] = (pred_id, self._scoring)
+            # The scored bit travels with the PREDICTION too: a resident-correct prediction never
+            # becomes a fetch, so a fetch cutoff could never have gated it.
+            #
+            # MERGE, NEVER OVERWRITE. One record per (target, key), and an unscored settlement
+            # prediction must not downgrade a scored one. The oracle re-predicts the same target
+            # every layer inside its horizon, and a RESIDENT correct prediction has no _spec entry
+            # to suppress the duplicate -- so a prediction genuinely issued in the timed window
+            # vanished from pred_hit/pred_miss simply because settlement named the same target
+            # again. Scoring is a property of "was this ever predicted while measuring", so it is
+            # a logical OR and the cause of record stays with the scored emission.
+            tgt = self._pred.setdefault(k[0], {})
+            prev = tgt.get(k)
+            if prev is None:
+                tgt[k] = (pred_id, self._scoring)
+            elif self._scoring and not prev[1]:
+                tgt[k] = (pred_id, True)          # upgrade; never the reverse
         to_load, refused = self.slots.reserve_speculative(keys)
         if self._scoring:
             self.pf.refused += refused
         if self.obs.enabled:
             self.obs.safe_emit(Event(now_ns(), "prediction", ctx=ctx or NO_CTX, cause_id=pred_id,
-                                     value=len(keys), aux=self.prefetch.name))
+                                     value=len(keys), aux=self.prefetch.name, scored=self._scoring))
             if refused:
                 self.obs.safe_emit(Event(now_ns(), "refused", ctx=ctx or NO_CTX, cause_id=pred_id,
-                                         value=refused))
+                                         value=refused, scored=self._scoring))
         if not to_load:
             return
         for key, slot, gen in to_load:
@@ -393,7 +415,8 @@ class Engine:
                 # readable without inferring it from timestamps.
                 self.obs.safe_emit(Event(now_ns(), "prefetch_issued", ctx=ctx or NO_CTX, key=k,
                                          slot=sl, gen=g, cause_id=pred_id,
-                                         aux=(layer, self.prefetch.horizon, self.prefetch.name)))
+                                         aux=(layer, self.prefetch.horizon, self.prefetch.name),
+                                         scored=self._scoring))
         self.loader.submit(to_load, speculative=True, ctx=ctx or NO_CTX, cause_id=pred_id,
                            scored=self._scoring)
 
@@ -416,10 +439,14 @@ class Engine:
             # Per-step GPU work outside the layer loop (head, draft). Zero unless the provider was
             # told that part of the unattributed 78.5 % lives here rather than in a layer.
             if self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "final_start", ctx=OpContext(self.request_id, step, -1)))
+                self.obs.safe_emit(Event(now_ns(), "final_start",
+                                         ctx=OpContext(self.request_id, step, -1),
+                                         scored=self._scoring))
             self._compute(self.leaves.step_other)
             if self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "final_end", ctx=OpContext(self.request_id, step, -1)))
+                self.obs.safe_emit(Event(now_ns(), "final_end",
+                                         ctx=OpContext(self.request_id, step, -1),
+                                         scored=self._scoring))
             self.chain.set("logits", step)
             self.c.steps += 1
         self.c.wall_s = time.perf_counter() - t0
@@ -469,6 +496,7 @@ class Engine:
         import copy
         saved_c = copy.copy(self.c)
         self._scoring = False                        # run and contend, but do not count
+        self.obs.measurement_active = False          # ...including at the ownership points
         ran = 0
         try:
             for _ in range(layers):
@@ -480,6 +508,7 @@ class Engine:
                 ran += 1
         finally:
             self._scoring = True                     # restored: a later decode is scored again
+            self.obs.measurement_active = True
             wall, steps = self.c.wall_s, self.c.steps
             self.c = saved_c                         # timed counters are the window's, not this
             self.c.wall_s, self.c.steps = wall, steps

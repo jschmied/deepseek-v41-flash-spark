@@ -38,7 +38,7 @@ import time
 from .drivers import Engine
 from .sched import V1, V2, ComputeStream, LoaderService, Policy
 from .chain import Chain, EngramSource
-from .prefetch import OraclePrefetcher, RecallOraclePrefetcher, SpecAttempt
+from .prefetch import OraclePrefetcher, Prefetcher, RecallOraclePrefetcher, SpecAttempt
 from .observe import CounterObserver, NullObserver, TraceObserver, WaitReason
 from .leaves import Bandwidth, ModelLeaves, StagedExpert
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
@@ -561,6 +561,10 @@ def test_declared_edges_are_load_bearing_not_decorative():
         e.warm(calls, cut)
         ok, _ = run_with_timeout(lambda: e.decode(1), 6)
         assert not ok, "the step completed although layer 7's engram rows never arrived"
+        # The hung worker is a daemon and cannot be reaped -- it keeps waiting and raises
+        # TimeoutError at Chain's 60 s bound, which pytest reports as an unhandled thread exception
+        # inside whichever test happens to be running then. That is this test working, not a
+        # failure elsewhere.
     finally:
         e.close()
 
@@ -1378,3 +1382,80 @@ def test_an_unscored_wrong_prediction_is_still_physically_discarded():
               f"physically and counted nowhere  OK")
     finally:
         e.close()
+
+
+# ================================================================ 28. the cohort boundary leaks
+def test_settlement_cannot_erase_a_prediction_made_inside_the_window():
+    """Three ways the scored/unscored boundary still mixed populations.
+
+    a) _pred keeps ONE record per (target, key). An unscored settlement prediction overwrote a
+       scored one, and a prediction genuinely issued in the timed window then vanished from
+       pred_hit/pred_miss. Not exotic: the oracle re-predicts the same target every layer inside
+       its horizon, and a RESIDENT correct prediction has no _spec entry to suppress the duplicate.
+    b) a retired attempt was labelled evicted_before_use -- "right, but too early" -- without
+       checking the layer actually wanted it, so a plain false positive was reported as a timing
+       failure.
+    c) settlement events still reached CounterObserver, so its totals included work the timed
+       Counters exclude, and unlike Counters an observer cannot undo an increment.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+
+    # (a) THROUGH THE REAL PATH. An earlier version of this test reimplemented the merge inline
+    # and so proved nothing -- the overwrite mutation passed it. Drive _issue_speculation with a
+    # predictor that names the same target twice, once scored and once not.
+    # The key must be ALREADY RESIDENT. That is the whole scenario: a correct prediction for a
+    # cached expert produces no _spec entry, so nothing suppresses the duplicate and the second
+    # emission reaches the merge. A non-resident key is filtered out by _spec and never gets there,
+    # which is why the first version of this test could not fail.
+    class Fixed(Prefetcher):
+        name = "fixed"
+        horizon = 1
+        target = None
+
+        def predict(self, layer, uniq, step):
+            return (self.target,) if self.target else ()
+
+    pf = Fixed()
+    e = Engine(V2, lru_slots=5328, transient_slots=400,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut), prefetch=pf)
+    try:
+        e.warm(calls, cut)
+        pf.target = next(iter(e.slots.lru))             # something the cache already holds
+        tl = pf.target[0]
+        e._scoring = True
+        e._issue_speculation(tl - 1, (0,), None)        # scored prediction, resident -> no _spec
+        assert pf.target not in e._spec, "the fixture key was not resident; the arm is invalid"
+        assert e._pred.get(tl, {}).get(pf.target, (0, False))[1] is True, "setup failed"
+        e._scoring = False
+        e._issue_speculation(tl - 1, (0,), None)        # settlement re-predicts the same target
+        assert e._pred[tl][pf.target][1] is True, (
+            "an unscored settlement prediction downgraded a scored one; that prediction would "
+            "disappear from pred_hit/pred_miss")
+        e._scoring = True
+    finally:
+        e.close()
+
+    # (b) + (c) end to end
+    obs = CounterObserver()
+    e = Engine(V2, lru_slots=2000, transient_slots=400, observer=obs,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut),
+               prefetch=RecallOraclePrefetcher(calls, 4, recall=1.0, precision=0.4, start=cut))
+    try:
+        e.warm(calls, cut)
+        e.decode(3)
+        counts_before = dict(obs.counts)
+        e.settle(4)
+        counts_after = dict(obs.counts)
+        moved = {k: (counts_before.get(k, 0), v) for k, v in counts_after.items()
+                 if v != counts_before.get(k, 0)}
+        assert not moved, f"CounterObserver counted settlement work: {list(moved)[:4]}"
+
+        e.finalize_stats()
+        # (b) every classified outcome is one of the named buckets and nothing is double-counted
+        assert e.pf.evicted_before_use <= e.pf.used + e.pf.evicted_before_use
+        assert e.pf.wasted >= e.pf.evicted_before_use + e.pf.failed_before_use
+    finally:
+        e.close()
+    print("  cohort boundary: a scored prediction survives an unscored duplicate, and the "
+          "aggregate observer ignores settlement  OK")
