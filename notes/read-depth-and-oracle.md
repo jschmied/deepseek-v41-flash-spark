@@ -472,6 +472,36 @@ capacity misses (76-83 %), and expert IDENTITY is unpredictable (sections 8-9). 
 survive all of that are arena capacity, concurrency, and computing the resident experts while the
 misses load -- review item 3, the only proposal that attacks the term that sets step time.
 
+## 18. Arena capacity converts to tokens, and it is the largest effect here (job 380)
+
+600 steps after a 150-step warm-up, engram live, `age_over_freq`, real committed tokens:
+
+| arena | tok/s | nvme | reads / token | MemAvailable after load |
+|---|---|---|---|---|
+| 79 GB | 6.35 | 556.26 GB | 22.8 | 17 GiB |
+| 86 GB | **6.96** | 462.38 GB | 19.0 | 12 GiB |
+
+**+9.6 % tok/s for +9 % arena, at -17 % bytes.** Job 381 replicates it (79 GB -> 6.41) and extends
+to 89 and 92 GB. A one-line env change on the server; no code.
+
+THIS CORRECTS THE FRAMING I QUEUED IT UNDER. I argued that fewer bytes need not mean more tokens,
+because 6.2 tok/s sits far below the 27.6-34 tok/s BYTE ceiling and sections 2 and 14 say the step
+is mostly waiting rather than transferring. It converted anyway, and close to proportionally. The
+resolution is that a miss costs more than its bytes: it costs a DEPENDENCY -- graph B for that layer
+cannot run until the bytes land, and at ~2 misses per layer there is nothing else for that layer to
+do. Removing a miss removes a serialisation point, not just 14.45 MB. That is why capacity beats
+bandwidth here and why it does not contradict the idle-pipe finding.
+
+SCOPE. Single stream, `age_over_freq`, this corpus, 5465 -> 5949 slots. It does not reach the
+working set: ~15360 (layer,expert) pairs would need 222 GB and the box has 121 GiB total, so this is
+a marginal-return curve, not a fix. Whether 89 and 92 GB continue it is what 381 measures.
+
+SAFETY, learned the expensive way. Job 380 was queued with a 92 GB arm behind a 20 GiB pre-flight
+margin. That margin gates the START and says nothing about the STEADY STATE, which is exactly where
+job 150's 4 GiB left the box without a server. 380 was killed at that arm; 381 carries a real guard
+instead -- 200 s in, the arm is killed if MemAvailable falls under 7 GiB, printing ABORTED and
+continuing the sweep. A missing cell, not a dead box.
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
