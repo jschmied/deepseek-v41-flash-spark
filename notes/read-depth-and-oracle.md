@@ -94,6 +94,24 @@ This does not invalidate the A/B comparisons in sections 2-4 -- both arms of eac
 identically -- but it does mean the absolute steps/s are not the server's, and the engram stream's
 ~144 rows per step of small reads were absent from the device contention those sections measure.
 
+## 7. Every v2 steps/s on this page assumes full acceptance
+
+`RealLeaves.end_step` advances the cache by the whole block (`fd.c.len = S + T`, T = 6). The real
+engine drafts with DSpark, verifies, and rolls back to `pos + a + 1`; measured `accept_len` on this
+box is **2.66-3.72**, so a real step yields ~3.4 tokens where these harnesses behave as if all 6
+were accepted.
+
+Consequences, stated separately because they are not equally serious:
+
+* **The A/B comparisons are unaffected.** Reads per step are set by the route, not by acceptance,
+  and every arm shares the same block sequence. Depth-zero fractions and the oracle's margin stand.
+* **The absolute steps/s does NOT convert to tokens/s.** Nothing on this page may be multiplied by
+  6, or by 3.4, to get a serving rate: the KV also grows ~1.8x faster than it really would, so the
+  route sequence past the first few steps is not the sequence a served request would walk.
+
+Fixing this means real draft + verify + rollback in v2, not just the MTP head -- a head without
+verification still advances the cache by the full block.
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
