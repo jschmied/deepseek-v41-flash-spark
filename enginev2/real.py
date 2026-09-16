@@ -129,11 +129,13 @@ class PinnedStagingPool:
 class RealLeaves(Leaves):
     """CB3 on NVMe for the I/O half. Graph A/B land in stage 4.
 
-    `shared_first` stays False: engine/fastdecode.py captures the shared expert inside graph B, and
-    claiming otherwise would be claiming a second capture that does not exist.
+    `shared_first` FOLLOWS THE CAPTURE. engine/fastdecode.py puts the shared expert inside graph B
+    unless DSV41_SHARED_FIRST=1, in which case it captures a third graph per layer that reads only
+    `y`. Declaring shared_first without that capture would be claiming a fork that does not exist,
+    which is why this mirrors the engine's own flag instead of being set independently.
     """
 
-    shared_first = False
+    shared_first = os.environ.get("DSV41_SHARED_FIRST") == "1"
     # layer_b records a CUDA event and h2d waits on it per slot, so the DEVICE orders slot reuse
     # and the host-side ComputeStream is redundant here -- see Leaves.device_orders_slot_reuse.
     device_orders_slot_reuse = True
@@ -377,6 +379,14 @@ class RealLeaves(Leaves):
             fd.capture(parity)
             fd.prepare_pending_buffers()   # capture's warm-up overwrites the buffers
         self._gA, self._gB, self._gF = fd.graphs[parity][0], fd.graphs[parity][1], fd.graphs[parity][2]
+        self._gS = fd.graphs_shared.get(parity) if self.shared_first else None
+        if self.shared_first and not self._gS:
+            raise RuntimeError(
+                "shared_first is on but engine/fastdecode.py captured no shared-expert graphs. "
+                "DSV41_SHARED_FIRST must be set for BOTH -- the engine reads it at import time, so "
+                "setting it after the module is loaded silently gives graph B the unsplit path "
+                "while the driver skips the shared expert entirely, which is wrong output, not a "
+                "slow one.")
 
     def layer_a(self, layer: int) -> RouteResult:
         """Graph A: attention + HC + router. The expert ids come OUT of it.
@@ -394,6 +404,15 @@ class RealLeaves(Leaves):
         idx = self.fd.route_idx
         flat = idx.flatten().tolist()          # the one unavoidable D2H: the cache lookup is on the host
         return RouteResult(uniq=tuple(sorted(set(flat))), opaque=idx, flat_cpu=flat)
+
+    def shared(self, layer: int) -> None:
+        """Graph S: the shared expert, into fastdecode's sh_out buffer.
+
+        Called by the driver AFTER the route is resolved and the reads are submitted, but BEFORE it
+        waits on them -- which is the whole point: this is the only compute in the layer that does
+        not depend on the expert bytes, so it is the only thing that can fill the wait.
+        """
+        self._gS[layer].replay()
 
     def bind_slots(self, route: RouteResult, slot_of: dict) -> None:
         """Give graph B its route-aligned slot tensor. This is v1's `self.slots.copy_(slots)`, with
