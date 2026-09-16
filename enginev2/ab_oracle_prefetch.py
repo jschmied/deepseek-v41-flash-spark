@@ -190,6 +190,9 @@ rl.attach(eng, nb(lg, 0), next_block=nb)
 # something else. Checked, not assumed: the first run of this harness reported pred_miss 11145
 # against pred_hit 2837, which for a trace-reading oracle is impossible and was the tell.
 agree = [0, 0]
+# Base 0 during the warm-up (which really is recorded steps 0.._warm-1); rebased to _warm once the
+# timed window starts. Defined HERE because the check runs inside the warm decode too.
+ROUTE_BASE = 0
 _la2 = rl.layer_a
 def check(L, _f=_la2):
     r = _f(L)
@@ -218,10 +221,17 @@ if _warm:
     e2.decode(_warm)
     e2.prefetch, e2._scoring = saved_pf, True
     e2.c = type(e2.c)()                      # the warm-up's counters are not the measurement's
+    print(f"  warmed with {_warm} REAL decode steps ({e2.loader.started_demand} reads issued), "
+          f"routes reproduced {agree[0]}/{agree[0] + agree[1]}")
+    if agree[1]:
+        raise SystemExit(f"ABORT: {agree[1]} route divergences during the WARM-UP itself")
     ROUTE_BASE = _warm
-    print(f"  warmed with {_warm} REAL decode steps ({e2.loader.started_demand} reads issued)")
-else:
-    ROUTE_BASE = 0
+    agree[0] = agree[1] = 0                  # the timed window is scored on its own
+# The observer's drain() is a SNAPSHOT, not a drain, so the warm-up's events are still in the ring
+# and would be counted in both the wall-window read count and the depth histogram -- the first run
+# of the repaired warm-up reported 2369 reads and a 9.61 s depth span against a 5.55 s wall.
+# Everything is therefore filtered to events at or after this mark.
+t0_ns = time.perf_counter_ns()
 t0 = time.perf_counter()
 c = e2.decode(STEPS)
 wall = time.perf_counter() - t0
@@ -256,7 +266,8 @@ e2.close(); rl.close()
 # rings, not a drain, so the later call already contains the earlier one and adding them counted
 # every read twice. That produced a causal count of exactly 2x the window count, identical across
 # arms -- arithmetic, not measurement. Caught 2026-09-16 by the count being suspiciously round.
-causal_reads = sum(1 for e in ev_causal if e.kind == "nvme_start" and e.scored)
+causal_reads = sum(1 for e in ev_causal
+                   if e.kind == "nvme_start" and e.scored and e.ts_ns >= t0_ns)
 # The rings are finite. If they wrapped, the earliest events are gone and the causal count is a
 # silent undercount, which is worse than no number at all -- so say so.
 ring_full = len(ev_causal) >= obs.effective_capacity
@@ -265,7 +276,7 @@ if ring_full:
           f"the causal count is truncated and must not be compared across arms")
 
 marks = sorted((e.ts_ns, +1 if e.kind == "nvme_start" else -1)
-               for e in ev if e.kind in ("nvme_start", "nvme_end"))
+               for e in ev if e.kind in ("nvme_start", "nvme_end") and e.ts_ns >= t0_ns)
 depth, dur, prev = 0, collections.Counter(), (marks[0][0] if marks else 0)
 for t, d in marks:
     dur[depth] += t - prev
