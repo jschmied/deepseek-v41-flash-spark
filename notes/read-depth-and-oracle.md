@@ -134,10 +134,26 @@ This is NOT a short-prompt artifact: the predictor evaluation in section 7's com
 scored only the LAST 40 % of the trace, already in the converged regime. And longer context makes
 it worse, not better -- at 10x the tokens the per-layer distinct count approaches 384.
 
-Job 102 had already measured the reason identity prediction cannot work and it was not connected to
-this until now: **routing entropy 8.52 of 8.58 bits**, near-uniform. One number explains the 6 %
-fetch precision of co-occurrence, the 3 % of the transition table, the closed prediction-head
-result, and job 300's DSpark result below.
+**CORRECTION (same day).** An earlier revision of this section said routing was "near-uniform",
+quoting job 102's entropy of 8.52 of 8.58 bits. That is the wrong reading and the wrong
+distribution. Measured directly on the realized ACCESSES:
+
+| | route-decode | route-decode-code |
+|---|---|---|
+| entropy of accesses | **6.89 bits** (uniform over 384 = 8.58) | 7.12 |
+| experts holding half the accesses | **30 of 384 (8 %)** | 29 |
+| top-139 (36 %, 0xBakeer's keep) | **93.3 %** of accesses | 89.6 % |
+| top-169 (44 %, our keep) | 96.3 % | 93.7 % |
+
+The distribution is heavily skewed, which is exactly why published pruning profiles at keep ~0.36
+work. Entropy is also a poor skew detector over a 384-alphabet: a top-36 % holding 60 % of the mass
+still scores ~8.42, so 8.52 never established uniformity in the first place.
+
+What actually survives: **LRU already captures the skew.** The production arena at ~82 GB holds
+5,679 pairs, about 37 % of all pairs -- essentially the hot set the pruning profiles identify. The
+hot experts are therefore resident by construction, and what is left to predict is the warm TAIL
+beyond them, where the distribution is flat. That is the honest reason co-occurrence scores 6 % and
+DSpark 0.5 %: not that routing is uniform, but that the predictable part is already in cache.
 
 ## 9. DSpark carries no signal about backbone misses either (job 300)
 
@@ -149,7 +165,7 @@ the backbone's per-layer miss ids:
 Below the baseline. The lead-time argument -- that a weak predictor 40 layers early beats a better
 one a layer early -- does not get to apply, because there is no predictor.
 
-## 10. A scope error in everything above
+## 10. Three scope errors in everything above
 
 Every v2 experiment on this page ran at `ARENA_GB=40`. Production auto-sizes to ~82 GB, where the
 measured hit rate is 0.894 against the 0.829 these runs saw, and decode is 6.26 tok/s against the
@@ -160,6 +176,19 @@ The arena sweep is also the largest measured lever on this whole page:
 
   56.75 GB  3.71 tok/s  hit 0.796      79 GB  6.00 tok/s  hit 0.890
   68 GB     4.89 tok/s  hit 0.869      auto   6.26 tok/s  hit 0.894
+
+**Second: every v2 run used `evict="lru"`, hardcoded.** The box has already measured
+age/(1+count) ahead of it -- decode 1.88/2.13/2.14 tok/s against LRU's 1.74/1.85/1.86 (job 140),
+and offline 94.07 % hit with 52.3 fetches per step against 92.67 % and 64.6 (phase 1). A fair A/B
+at the worse operating point. The policy is now an env choice and is printed.
+
+**Third: v1 and v2 were never compared at the memory each can actually afford.** Both arms ran a
+FIXED 40 GB arena, so v2's smaller staging footprint -- 8 buffers against v1's 48 -- was never
+converted into slots. Worse, in the current harness it is not even realized: v2 rides on a
+V41Engine, whose ExpertStore allocates its own 48 pinned buffers regardless, so v2 today pins MORE
+than v1, not less. Realizing it needs `DSV41_IO_THREADS=8` on the v2 arm, which is the knob that
+sizes that staging array. Until that is run, "105 MiB against 862 MiB" is a property of v2 as a
+standalone engine, not of anything measured.
 
 ## What this closes and what it leaves
 

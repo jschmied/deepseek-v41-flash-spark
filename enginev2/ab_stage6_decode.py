@@ -40,6 +40,11 @@ if "ENGRAM" not in os.environ:
         "set ENGRAM=1 (the production model) or ENGRAM=0 (ablated) explicitly -- this benchmark "
         "measured the ablated model for a whole day because zeroed eg_rows were the quiet default")
 ENGRAM = os.environ["ENGRAM"] == "1"
+# EVICTION POLICY IS A CHOICE, NOT A DEFAULT. Every v2 measurement so far hardcoded "lru", and the
+# box has already measured age/(1+count) ahead of it: decode 1.88/2.13/2.14 tok/s against LRU's
+# 1.74/1.85/1.86 (job 140), and offline 94.07 % hit / 52.3 fetches per step against 92.67 % / 64.6
+# (phase 1). Running the A/B on the worse policy is a fair comparison at the wrong operating point.
+EVICT = os.environ.get("EVICT", "lru")
 ARM = os.environ.get("ARM", "v2")
 STEPS = int(sys.argv[1]) if len(sys.argv) > 1 else 30
 RECORD = 13_774_848
@@ -113,7 +118,7 @@ else:
     # Policy() is V1: all four barriers ON. That arm isolates the driver rewrite from the policy
     # change and is the control, NOT the v2 arm. POLICY=v2 releases them.
     pol = Policy() if os.environ.get("POLICY", "v1") == "v1" else Policy(False, False, False, False)
-    e2 = v2drivers.Engine(pol, evict="lru",
+    e2 = v2drivers.Engine(pol, evict=EVICT,
                           lru_slots=eng.store.n_slots - 8, transient_slots=8,
                           n_workers=int(os.environ.get("V2_WORKERS", 8)), staging=staging,
                           expert_read_qd=int(os.environ.get("V2_QD", 8)),
@@ -147,7 +152,8 @@ if ARM != "v1":
           f"compute_barrier_global={pol.compute_barrier_global} "
           f"lease_until_completion={pol.lease_until_completion} "
           f"global_barrier={pol.global_barrier}")
-print(f"  engram {'LIVE' if ENGRAM else 'ABLATED'}")
+print(f"  engram {'LIVE' if ENGRAM else 'ABLATED'}  evict {EVICT}  "
+      f"arena slots {eng.store.n_slots}  v1 staging {eng.store.io_threads} buffers")
 print(f"ARM {ARM}  steps {STEPS}  wall {wall:.2f}s  {STEPS / wall:.3f} steps/s")
 print(f"  experts read {reads}  {gb:.2f} GB  read_s {read_s:.2f}  "
       f"per-read {gb / read_s if read_s else 0:.2f} GB/s  "

@@ -67,6 +67,11 @@ if "ENGRAM" not in os.environ:
         "7.717 in the logits -- and it went unnoticed for a whole day precisely because it was the "
         "quiet fallback.")
 ENGRAM = os.environ["ENGRAM"] == "1"
+# EVICTION POLICY IS A CHOICE, NOT A DEFAULT. Every v2 measurement so far hardcoded "lru", and the
+# box has already measured age/(1+count) ahead of it: decode 1.88/2.13/2.14 tok/s against LRU's
+# 1.74/1.85/1.86 (job 140), and offline 94.07 % hit / 52.3 fetches per step against 92.67 % / 64.6
+# (phase 1). Running the A/B on the worse policy is a fair comparison at the wrong operating point.
+EVICT = os.environ.get("EVICT", "lru")
 
 
 def build(eng, obs=None, prefetch=None):
@@ -78,7 +83,7 @@ def build(eng, obs=None, prefetch=None):
     # 50bfdf2, so it stays available for a like-for-like comparison and is never the silent state.
     src = RealEngramSource(eng, rl) if ENGRAM else None
     rl.engram = src
-    e2 = v2drivers.Engine(Policy(), evict="lru", lru_slots=eng.store.n_slots - 8,
+    e2 = v2drivers.Engine(Policy(), evict=EVICT, lru_slots=eng.store.n_slots - 8,
                           transient_slots=8, n_workers=8, staging=8, expert_read_qd=8,
                           h2d_inflight=2, leaves=rl, observer=obs, prefetch=prefetch,
                           engram=src)
@@ -212,6 +217,8 @@ span = sum(dur.values()) / 1e9
 idle = dur[0] / 1e9
 busy = span - idle
 reads = len(marks) // 2
+print(f"  evict {EVICT}  lru_slots {eng.store.n_slots - 8}  "
+      f"v1 staging {eng.store.io_threads} buffers")
 print(f"  engram {'LIVE' if ENGRAM else 'ABLATED'}"
       + (f", rows {sum(t.stats['rows'] for t in eng.tables.values())}" if ENGRAM else
          f", zeroed-layer fills {rl.engram_ablated}"))
