@@ -47,13 +47,19 @@ class PinnedStagingPool:
     """
 
     def __init__(self, n: int, record: int, device: str = "cuda"):
-        import threading
+        import queue
         self.n = n
         self.record = record
         self.nbytes = record + ALIGN
-        self._sem = threading.Semaphore(n)
-        self._lk = threading.Lock()
-        self.free = list(range(n))
+        # ONE ownership transfer per read. A semaphore AND a lock-guarded free list were doing a
+        # single job: hand out a buffer id, take it back. A queue is that job. get() blocks exactly
+        # as the semaphore did, and the id IS the permit, so the two can no longer disagree.
+        # This is the one place where real ownership synchronisation remains -- a pinned buffer
+        # cannot be reused until its H2D has read it -- so it keeps a real primitive, just one.
+        self._free: "queue.SimpleQueue[int]" = queue.SimpleQueue()
+        for i in range(n):
+            self._free.put(i)
+        self._out = 0                  # outstanding, for peak_in_use only; see the note below
         self.peak_in_use = 0
         self._leased: set[int] = set()
         self._buf: list = []
@@ -67,20 +73,23 @@ class PinnedStagingPool:
 
     # --- the skeleton's StagingPool surface -------------------------------------------------
     def acquire(self, ctx=None, scored: bool = True) -> int:
-        self._sem.acquire()
-        with self._lk:
-            sid = self.free.pop()
-            self._leased.add(sid)
-            self.peak_in_use = max(self.peak_in_use, self.n - len(self.free))
-            return sid
+        sid = self._free.get()         # blocks until a buffer is returned, as the semaphore did
+        self._leased.add(sid)          # set.add/discard are atomic under the GIL
+        self._out += 1                 # statistics only: a lost race costs one sample of a peak
+        self.peak_in_use = max(self.peak_in_use, self._out)
+        return sid
 
     def release(self, sid: int) -> None:
-        with self._lk:
-            if sid not in self._leased:
-                raise RuntimeError(f"staging buffer {sid} released twice")
-            self._leased.discard(sid)
-            self.free.append(sid)
-        self._sem.release()
+        if sid not in self._leased:
+            raise RuntimeError(f"staging buffer {sid} released twice")
+        self._leased.discard(sid)
+        self._out -= 1
+        self._free.put(sid)
+
+    @property
+    def free(self) -> int:
+        """Count, not a list: the queue owns the ids now. Used only in assertion messages."""
+        return self._free.qsize()
 
     def buffer(self, sid: int) -> torch.Tensor:
         if sid not in self._leased:
@@ -100,17 +109,18 @@ class PinnedStagingPool:
             return False
 
     def in_use(self, sid: int) -> bool:
-        with self._lk:
-            return sid in self._leased
+        return sid in self._leased
 
     def at_rest(self) -> bool:
-        with self._lk:
-            return len(self.free) == self.n and self._sem._value == self.n and \
-                len(set(self.free)) == self.n
+        """Every buffer back, nothing leased. With one queue there is no second structure to
+        disagree with the first -- the old form checked the free list, the semaphore count AND the
+        list for duplicates, three things that could only diverge because they were three things."""
+        return self._free.qsize() == self.n and not self._leased
 
     @property
     def sem_value(self) -> int:
-        return self._sem._value
+        """Available buffers. Kept under the old name so the tests read the same quantity."""
+        return self._free.qsize()
 
     def aligned(self, sid: int) -> bool:
         return self._view[sid].data_ptr() % ALIGN == 0
@@ -141,7 +151,12 @@ class RealLeaves(Leaves):
 
     def __init__(self, cb3_path: str, arena, device: str = "cuda"):
         import threading
-        self._ctr = threading.Lock()
+        # Per-worker counters. read_bytes/read_s are statistics, and a lock around them serialises
+        # the I/O workers over something no decision reads. Each worker accumulates in its own
+        # thread-local slot; the reporting properties sum them.
+        self._stats_tls = threading.local()
+        self._stats_all: list = []
+        self._stats_lk = threading.Lock()     # taken ONCE per worker, at first use
         self._tls = threading.local()
         # PER-SLOT READER LIFETIME, on the device. ComputeStream.run(slots) models a slot as being
         # read for the lifetime of the Python call, which is true for a modelled leaf and FALSE
@@ -153,7 +168,13 @@ class RealLeaves(Leaves):
         # Initialised HERE, not in attach(): h2d() reads it, and the I/O half of this provider is
         # used without a graph half at all (test_real_leaves drives read/h2d directly). Putting it
         # in attach() made that path raise AttributeError -- caught by that test, 2026-09-16.
-        self._last_reader: dict = {}
+        # ONE writer (layer_b), many readers (h2d). A slot cannot be targeted by a new H2D before
+        # its reader event is stored: the driver protects the current layer's slots via
+        # _layer_slots until graph B has been issued, and layer_b records the event as part of
+        # issuing it. So there is no legal interleaving where a reader sees a stale entry for a
+        # slot it is about to overwrite, and a plain list read under the GIL is enough.
+        # _copy_event is the opposite case -- many writers, one drainer -- and keeps its lock.
+        self._last_reader: list = []
         # Copies ENQUEUED but not yet complete: slot -> the event recorded after the H2D. The
         # driver drains these through await_copies() before the graph that reads those slots, so
         # completion becomes a GPU dependency instead of a host block. Written by loader threads
@@ -168,13 +189,21 @@ class RealLeaves(Leaves):
         from engine.cb3_cache import CB3Cache
         self.cache = CB3Cache(cb3_path, device)
         self.arena = arena
+        self._arena_slots = int(getattr(arena, "slots", 0) or 0)
         self.record = self.cache.record
         # PROVIDER counters, the counterpart of v1's ExpertStore.stats. The engine's own numbers,
         # not /proc/diskstats: a byte counted here is a byte this provider asked the device for.
-        self.read_bytes = 0
-        self.read_s = 0.0
+        # read_bytes / read_s are now properties summing the per-worker counters below.
         # h2d timing is the LOADER's to measure now: the provider only enqueues, so a duration
         # taken here would be the enqueue cost, not the copy's.
+
+    @property
+    def read_bytes(self) -> int:
+        return sum(c[0] for c in self._stats_all)
+
+    @property
+    def read_s(self) -> float:
+        return sum(c[1] for c in self._stats_all)
 
     def close(self):
         self.cache.close()
@@ -195,9 +224,13 @@ class RealLeaves(Leaves):
             t0 = time.perf_counter()
             self.cache.read_into(memoryview(view.numpy()), layer, expert)
             dt = time.perf_counter() - t0
-            with self._ctr:
-                self.read_bytes += self.record
-                self.read_s += dt
+            c = getattr(self._stats_tls, "c", None)
+            if c is None:
+                c = self._stats_tls.c = [0, 0.0]
+                with self._stats_lk:
+                    self._stats_all.append(c)
+            c[0] += self.record
+            c[1] += dt
         except BaseException:
             pool.release(sid)
             raise
@@ -232,8 +265,8 @@ class RealLeaves(Leaves):
         # read began, which is the defect v1 carries (experts.py records its event inside the sink,
         # after the ~5 ms read). This waits for ONE event: the last graph that actually read this
         # slot.
-        with self._reader_lk:
-            ev_prev = self._last_reader.get(slot)
+        lr = self._last_reader
+        ev_prev = lr[slot] if slot < len(lr) else None
         if ev_prev is not None:
             st.wait_event(ev_prev)
             self.reader_waits += 1
@@ -402,9 +435,10 @@ class RealLeaves(Leaves):
         self._gB[layer].replay()
         ev = torch.cuda.Event()
         ev.record(torch.cuda.current_stream())
-        with self._reader_lk:
-            for sl in self._bound_slots:
-                self._last_reader[sl] = ev
+        if len(self._last_reader) < self._arena_slots:
+            self._last_reader = [None] * self._arena_slots
+        for sl in self._bound_slots:
+            self._last_reader[sl] = ev          # single writer; see __init__
 
     def step_other(self) -> None:
         """The final head graph."""

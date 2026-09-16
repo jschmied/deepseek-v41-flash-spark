@@ -11,7 +11,9 @@ and h2d waits on exactly that event before touching the slot.
 
 Needs torch; does not need the model, the box's NVMe, or an engine.
 """
+import inspect
 import os
+import re
 import sys
 
 import pytest
@@ -48,7 +50,11 @@ class _Bare(RealLeaves):
         self._tls = threading.local()
         self.engram = None
         self.engram_ablated = 0
-        self._last_reader = {}
+        self._arena_slots = 64
+        self._last_reader = [None] * self._arena_slots
+        self._stats_tls = threading.local()
+        self._stats_all = []
+        self._stats_lk = threading.Lock()
         # Mirrors RealLeaves.__init__. This fixture reimplements that constructor, so it drifts
         # whenever state is added -- it has now broken twice that way. Anything new there belongs
         # here too, or the test stops covering the code it names.
@@ -66,7 +72,9 @@ def test_every_bound_slot_carries_the_event_recorded_after_its_replay():
     rl = _Bare()
     rl._bound_slots = frozenset({3, 7, 11})
     rl.layer_b(0, RouteResult(uniq=(1,)))
-    assert set(rl._last_reader) == {3, 7, 11}
+    # A LIST indexed by slot, not a dict: one writer (layer_b) and many readers (h2d), so under
+    # the GIL a plain list needs no lock. Slots nobody bound stay None.
+    assert [i for i, e in enumerate(rl._last_reader) if e is not None] == [3, 7, 11]
     ev0 = rl._last_reader[3]
     assert rl._last_reader[7] is ev0 and rl._last_reader[11] is ev0, \
         "one event per layer is the design; per-slot events are thousands of objects for nothing"
@@ -126,3 +134,23 @@ def test_h2d_waits_on_the_last_reader_of_that_slot_and_no_other():
         assert rl.reader_waits == 1
     finally:
         torch.cuda.Stream.wait_event = orig_wait
+
+
+def test_the_bare_fixture_has_not_drifted_from_RealLeaves():
+    """_Bare reimplements RealLeaves.__init__, and that has broken three separate times -- once
+    for the reader table, once for the copy-event table, once for the arena slot count. Each time
+    the symptom was an AttributeError inside an unrelated test, which says nothing about what to
+    add.
+
+    This compares the two directly, so drift fails HERE and names the missing attribute. Fields
+    that need a CB3 file or a live arena are excluded: avoiding those is why the fixture exists.
+    """
+    src = inspect.getsource(RealLeaves.__init__)
+    assigned = {m.strip().removeprefix("self.").split(":")[0].split("=")[0].strip()
+                for m in re.findall(r"^\s+(self\.\w+)\s*(?::[^=]+)?=", src, re.M)}
+    provider_owned = {"cache", "arena", "record", "_arena_slots"}
+    bare = _Bare()
+    missing = sorted(a for a in assigned - provider_owned if not hasattr(bare, a))
+    assert not missing, (
+        f"_Bare is missing state RealLeaves.__init__ sets: {missing}. Add it to the fixture, or "
+        f"these tests silently stop covering the code paths that use it.")
