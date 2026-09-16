@@ -234,7 +234,7 @@ def test_wait_completes_even_when_a_load_raises():
         except IOError as exc:
             err = exc
         assert err is not None, "a raising load did not surface"
-        assert e.loader.q.unfinished_tasks == 0, "pending left populated after the wait"
+        assert e.loader.q.outstanding == 0, "pending left populated after the wait"
         # The invariant is not "un-mapped at this instant" -- it is "never counted as a HIT by a
         # later reserve". Un-mapping moved to the driver's drain (cache mutation happens on one
         # thread), so assert the property through the public path instead of the internal dict.

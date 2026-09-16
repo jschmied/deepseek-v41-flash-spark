@@ -48,6 +48,77 @@ from .observe import NO_CTX, Event, NullObserver, WaitReason, next_span, now_ns
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class LoadTicket:
+    """One queued expert read. Immutable, because it crosses a thread boundary and is read on the
+    other side: nothing may edit a ticket after submit().
+
+    It replaces `(prio, seq, (ctx, cause_id, speculative, scored) + tuple(item), prio == 0)` -- a
+    tuple spliced from two sources, indexed positionally in _worker (entry[2], entry[3]), and
+    carrying the demand flag twice (entry[3] was `prio == 0`, which is `not speculative`, which is
+    already inside entry[2]). Two of those four fields existed only to make the tuple sortable.
+    """
+    ctx: object
+    cause_id: int
+    speculative: bool
+    scored: bool
+    key: tuple
+    slot: int
+    gen: int
+
+    @property
+    def demand(self) -> bool:
+        return not self.speculative
+
+
+class _WorkQueue:
+    """Demand reads ahead of speculative ones, FIFO within each class.
+
+    That is exactly what the PriorityQueue expressed, at the cost of a monotonic `_seq` whose only
+    job was to break priority ties before Python compared the payloads -- and `_seq` had to be
+    generated under the service lock. Two deques carry the same policy with no counter, no tuple
+    ordering, and no magic priority for the shutdown sentinel, which now simply goes to the front.
+
+    `outstanding` keeps queue.Queue's unfinished_tasks semantics (put +1, done -1), because the
+    invariant tests assert that nothing is left pending after a wait -- and a queue that is empty
+    while a worker is still inside a read is not at rest.
+    """
+
+    def __init__(self):
+        self._cv = threading.Condition(threading.Lock())
+        self._demand: collections.deque = collections.deque()
+        self._spec: collections.deque = collections.deque()
+        self.outstanding = 0
+
+    def put(self, ticket) -> None:
+        with self._cv:
+            (self._demand if ticket is None or ticket.demand else self._spec).append(ticket)
+            self.outstanding += 1
+            self._cv.notify()
+
+    def put_front(self, ticket) -> None:
+        """Shutdown sentinels only: they must overtake queued work, not wait behind it."""
+        with self._cv:
+            self._demand.appendleft(ticket)
+            self.outstanding += 1
+            self._cv.notify()
+
+    def get(self):
+        with self._cv:
+            while not self._demand and not self._spec:
+                self._cv.wait()
+            return (self._demand or self._spec).popleft()
+
+    def task_done(self) -> None:
+        with self._cv:
+            self.outstanding -= 1
+            self._cv.notify_all()
+
+    def __len__(self) -> int:
+        with self._cv:
+            return len(self._demand) + len(self._spec)
+
+
 class _Nothing:
     """Sentinel for "the queue was empty this pass", distinct from the None shutdown sentinel."""
 
@@ -199,8 +270,7 @@ class LoaderService:
         # Deferred H2D completions. A provider that returns a device event from h2d() puts the
         # completion here instead of blocking its worker on it.
         self._completions: queue.Queue = queue.Queue()
-        self.q: queue.PriorityQueue = queue.PriorityQueue()
-        self._seq = 0
+        self.q = _WorkQueue()
         self._cancelled: set = set()
         # What is still IN the queue. cancel() used to count every request as a cancellation even
         # when the read was already running -- inflating the discard statistics -- and its marker
@@ -530,15 +600,17 @@ class LoaderService:
 
     def _worker(self) -> None:
         while True:
-            entry = self.q.get()
+            t = self.q.get()
             try:
-                if entry is None or entry[2] is None:
+                if t is None:
                     return
                 deferred = False
                 try:
-                    deferred = bool(self._load_one(*entry[2], is_demand=bool(entry[3])))
+                    deferred = bool(self._load_one(
+                        t.ctx, t.cause_id, t.speculative, t.scored, t.key, t.slot, t.gen,
+                        is_demand=t.demand))
                 finally:
-                    if entry[3] and not deferred:
+                    if t.demand and not deferred:
                         with self._demand_cv:
                             self._demand -= 1
                             self._demand_cv.notify_all()
@@ -561,20 +633,17 @@ class LoaderService:
                 self.obs.safe_emit(Event(now_ns(), "load_queued", ctx=ctx, key=key, slot=slot,
                                          gen=gen, cause_id=cause_id, scored=scored,
                                          aux="spec" if speculative else "demand"))
-        prio = 1 if speculative else 0
         with self._inflight_cv:
             self._inflight += len(to_load)
         if not speculative:
             with self._demand_cv:
                 self._demand += len(to_load)
         with self._lk:
-            for item in to_load:
-                self._seq += 1
-                self._queued.add((item[1], item[2]))
+            for key, slot, gen in to_load:
+                self._queued.add((slot, gen))
                 # the context travels WITH the work: a completion on a worker thread must still
                 # know which request and step asked for it.
-                self.q.put((prio, self._seq, (ctx, cause_id, speculative, scored) + tuple(item),
-                            prio == 0))
+                self.q.put(LoadTicket(ctx, cause_id, speculative, scored, key, slot, gen))
 
     def cancel(self, items) -> list:
         """Discard wrong speculation in whichever of its three states it is in.
@@ -702,8 +771,7 @@ class LoaderService:
             except TimeoutError:
                 pass
         for _ in self.workers:
-            self._seq += 1
-            self.q.put((-1, self._seq, None, False))
+            self.q.put_front(None)
         for w in self.workers:
             w.join(timeout=5)
         # The completer stops LAST. quiesce() above already waited for every completion (that is

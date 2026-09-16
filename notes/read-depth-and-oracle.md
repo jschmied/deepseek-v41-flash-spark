@@ -494,7 +494,24 @@ bandwidth here and why it does not contradict the idle-pipe finding.
 
 SCOPE. Single stream, `age_over_freq`, this corpus, 5465 -> 5949 slots. It does not reach the
 working set: ~15360 (layer,expert) pairs would need 222 GB and the box has 121 GiB total, so this is
-a marginal-return curve, not a fix. Whether 89 and 92 GB continue it is what 381 measures.
+a marginal-return curve, not a fix.
+
+**JOB 381 REPLICATES IT AND FINDS THE CEILING.** Two reps each:
+
+| arena | rep 1 | rep 2 | mean |
+|---|---|---|---|
+| 79 GB | 6.41 | 6.31 | 6.36 |
+| 86 GB | 7.07 | 6.93 | **7.00** |
+| 89 GB | refused | refused | -- |
+| 92 GB | refused | refused | -- |
+
+**+10.1 %, and 86 GB is the maximum the engine accepts.** 89 and 92 never started: `V41Engine`
+refuses them in its own pre-flight at `engine/v41_engine.py:507`. So the ceiling is set by the
+engine's host-memory reservation (~20.5 GiB) and not by my job's guard, which never had to fire.
+
+That reservation is inconsistent with the auto-sizer's ~9 GB -- a known open item -- and raising it
+is exactly the change that once left the box at 4 GiB under sustained load with no server. Not
+touched here. `ARENA_GB=86` is shippable as it stands: one env var, no code, +10.1 %.
 
 SAFETY, learned the expensive way. Job 380 was queued with a 92 GB arm behind a 20 GiB pre-flight
 margin. That margin gates the START and says nothing about the STEADY STATE, which is exactly where

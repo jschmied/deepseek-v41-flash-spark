@@ -21,6 +21,84 @@ from .trace import N_LAYERS
 
 
 @dataclasses.dataclass
+class HostPhases:
+    """Wall time per driver phase, on the host, accumulated across steps.
+
+    This measures WALL, not device time, and that is deliberate: the term being hunted is time in
+    which neither the GPU nor the NVMe device is doing anything, so a device-time instrument cannot
+    see it by construction. A phase that ends in a synchronous D2H therefore shows up as expensive
+    HERE and cheap in a kernel trace -- which is exactly the signature being tested for.
+
+    Off unless DSV41_HOST_PROFILE=1. Enabled it costs ~200 perf_counter calls per step (~10 us
+    against a 203 ms step); disabled, `__call__` returns a shared no-op context manager.
+    """
+
+    class _Span:
+        """Reusable only because the driver is single-threaded and these never nest with the same
+        name; a fresh object per phase per layer would be 200 allocations per step."""
+
+        __slots__ = ("p", "name", "t0")
+
+        def __init__(self, parent, name):
+            self.p, self.name, self.t0 = parent, name, 0.0
+
+        def __enter__(self):
+            self.t0 = time.perf_counter()
+            return self
+
+        def __exit__(self, *a):
+            self.p.t[self.name] += time.perf_counter() - self.t0
+            self.p.n[self.name] += 1
+            return False
+
+    class _Off:
+        def __enter__(self): return None
+        def __exit__(self, *a): return False
+
+    _OFF = _Off()
+
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self.t: dict = {}
+        self.n: dict = {}
+        self._open: dict = {}
+        self._spans: dict = {}
+
+    def __call__(self, name: str):
+        if not self.enabled:
+            return self._OFF
+        sp = self._spans.get(name)
+        if sp is None:
+            sp = self._spans[name] = self._Span(self, name)
+            self.t.setdefault(name, 0.0)
+            self.n.setdefault(name, 0)
+        return sp
+
+    def enter(self, name: str) -> None:
+        """For a span that does not nest cleanly in a `with` -- see the resolve block."""
+        if self.enabled:
+            self._open[name] = time.perf_counter()
+            self.t.setdefault(name, 0.0)
+            self.n.setdefault(name, 0)
+
+    def exit(self, name: str) -> None:
+        if self.enabled and name in self._open:
+            self.t[name] += time.perf_counter() - self._open.pop(name)
+            self.n[name] += 1
+
+    def report(self, steps: int) -> str:
+        if not self.enabled or not steps:
+            return ""
+        rows = sorted(self.t.items(), key=lambda kv: -kv[1])
+        tot = sum(self.t.values())
+        out = [f"  host phases over {steps} steps (wall, per step):"]
+        for k, v in rows:
+            out.append(f"    {k:<14} {v / steps * 1e3:7.2f} ms  x{self.n[k] / steps:6.1f}"
+                       f"  {v / tot * 100:5.1f}% of instrumented")
+        out.append(f"    {'INSTRUMENTED':<14} {tot / steps * 1e3:7.2f} ms")
+        return "\n".join(out)
+
+
 class Counters:
     steps: int = 0
     wall_s: float = 0.0
@@ -97,6 +175,7 @@ class Engine:
         # these -- see ExpertSlots.reserve_speculative's protected_slots.
         self._layer_slots: frozenset = frozenset()
         self.c = Counters()
+        self.hostprof = HostPhases(os.environ.get("DSV41_HOST_PROFILE") == "1")
 
     def close(self):
         self.loader.shutdown()
@@ -159,16 +238,26 @@ class Engine:
         # EDGE 1: graph A reads h and pre_mix, which graph B of the PREVIOUS layer wrote. Both
         # stages write the same single `h` buffer, so this is also why A(L+1) cannot simply be run
         # early: it would clobber what B(L) still needs.
-        self.chain.wait("h", layer - 1, ctx=ctx, scored=self._scoring)
+        with self.hostprof("wait_h"):
+            self.chain.wait("h", layer - 1, ctx=ctx, scored=self._scoring)
         # EDGE 5: eg_rows[L] comes off a second async NVMe stream and is read by graph A. The
         # source signals per layer; the driver only waits.
-        self.chain.wait("engram", layer, ctx=ctx, scored=self._scoring)
+        #
+        # INSTRUMENTED DELIBERATELY: 288 engram rows per step arrive as 575 buffered preads on a
+        # separate pool, and the open question is whether the driver ever BLOCKS on them. Two
+        # engram layers (1 and 14) means two waits per step, so a large number here would be a
+        # small number of very long waits -- which is what an IOPS queue behind the expert reads
+        # would look like.
+        with self.hostprof("wait_engram"):
+            self.chain.wait("engram", layer, ctx=ctx, scored=self._scoring)
 
         e = self.obs.enabled
+        hp = self.hostprof
         if e:
             self.obs.safe_emit(Event(now_ns(), "layer_a_start", ctx=ctx, scored=self._scoring))
         self.obs.safe_gpu_begin("layer_a", ctx)
-        route = self._compute(lambda: self.leaves.layer_a(layer))
+        with hp("layer_a"):     # graph A replay PLUS the synchronous D2H of route_idx at its end
+            route = self._compute(lambda: self.leaves.layer_a(layer))
         self.obs.safe_gpu_end("layer_a", ctx)
         uniq = route.uniq
         if e:
@@ -182,6 +271,7 @@ class Engine:
 
         # What did speculation actually buy, and what did it cost? Settled BEFORE reserve(), while
         # the previous prediction for this layer is still distinguishable from a real residency.
+        hp.enter("resolve")
         self._settle_speculation(layer, uniq, ctx)
 
         # Apply anything the loader asked to un-map (discarded speculation, torn reads) HERE, on
@@ -218,21 +308,25 @@ class Engine:
         # Speculation is queued AFTER this layer's demand reads, at lower priority, so a demand
         # miss never sits behind a prefetch for a layer we have not reached.
         self._issue_speculation(layer, uniq, ctx)
+        hp.exit("resolve")      # everything from the route ids to the slot tensor, all host work
 
         if self.policy.resolve_blocks:
             # v1: resolve() ends in list(pool.map(...)). Nothing issues work except a call that
             # immediately blocks on it, which is why the device cannot be kept busy at any thread
             # count. Everything after this point runs with the loader already drained.
-            self._wait(to_load, ctx, scored=self._scoring)
+            with hp("wait_reads"):
+                self._wait(to_load, ctx, scored=self._scoring)
 
         # The shared expert is expert-INdependent, so a provider that captured it outside graph B
         # can run it here, while the reads fly. One that did not has it inside layer_b, where it
         # cannot overlap anything -- see leaves.Leaves.shared_first.
         if self.leaves.shared_first:
-            self._compute(lambda: self.leaves.shared(layer))
+            with hp("shared"):
+                self._compute(lambda: self.leaves.shared(layer))
 
         if not self.policy.resolve_blocks:
-            self._wait(to_load, ctx, scored=self._scoring)
+            with hp("wait_reads"):
+                self._wait(to_load, ctx, scored=self._scoring)
 
         # Graph B. `route` carries the FUNCTIONAL input -- the provider's route-aligned slot tensor,
         # built by bind_slots above. `reads` is safety bookkeeping only: which arena slots this
@@ -243,14 +337,16 @@ class Engine:
         # The loader reported these ready as soon as their copies were ENQUEUED, so the bytes may
         # still be in flight. Put those copies on the compute stream before the graph reads them;
         # from here the device orders it. A provider without this seam never gets early readiness.
-        self.c.copies_awaited += self.leaves.await_copies(reads)
+        with hp("await_copies"):
+            self.c.copies_awaited += self.leaves.await_copies(reads)
         if e:
             self.obs.safe_emit(Event(now_ns(), "layer_b_start", ctx=ctx, scored=self._scoring))
         self.obs.safe_gpu_begin("layer_b", ctx)
         # EDGE 3 and 4 are already enforced above: the ids came out of A, and _wait covers both the
         # `slots` mapping and the expert bytes being resident.
         self.chain.wait("y", layer, ctx=ctx, scored=self._scoring)
-        self._compute(lambda: self.leaves.layer_b(layer, route), slots=reads)
+        with hp("layer_b"):     # ENQUEUE only; the device work lands in the next sync
+            self._compute(lambda: self.leaves.layer_b(layer, route), slots=reads)
         self.obs.safe_gpu_end("layer_b", ctx)
         if e:
             self.obs.safe_emit(Event(now_ns(), "layer_b_end", ctx=ctx, scored=self._scoring))
@@ -487,7 +583,8 @@ class Engine:
             self._compute(lambda: self.leaves.select_block(step))
             self.engram.issue(range(N_LAYERS), step, self.chain, ctx=ctx, scored=self._scoring)
             # The step's own prologue, before any layer: see Leaves.begin_step.
-            self._compute(lambda: self.leaves.begin_step(step))
+            with self.hostprof("begin_step"):
+                self._compute(lambda: self.leaves.begin_step(step))
             for layer in range(N_LAYERS):
                 self.decode_layer(layer, ctx.at(layer))
             self.chain.wait("h", N_LAYERS - 1, ctx=ctx, scored=self._scoring)      # EDGE 7: gF replays after the last layer
@@ -497,8 +594,10 @@ class Engine:
                 self.obs.safe_emit(Event(now_ns(), "final_start",
                                          ctx=OpContext(self.request_id, step, -1),
                                          scored=self._scoring))
-            self._compute(self.leaves.step_other)
-            self._compute(lambda: self.leaves.end_step(step))
+            with self.hostprof("step_other"):
+                self._compute(self.leaves.step_other)
+            with self.hostprof("end_step"):   # draft, verify, rollback -- all host, all synchronous
+                self._compute(lambda: self.leaves.end_step(step))
             if self.obs.enabled:
                 self.obs.safe_emit(Event(now_ns(), "final_end",
                                          ctx=OpContext(self.request_id, step, -1),

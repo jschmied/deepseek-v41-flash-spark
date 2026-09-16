@@ -85,6 +85,14 @@ toks = rl.tokens_out - t_out0
 gb = (rl.read_bytes - reads0) / 1e9
 acc = rl.accepted[acc0:]
 print(f"  {STEPS} steps, wall {wall:.2f}s")
+# DSV41_HOST_PROFILE=1 only. The interesting quantity is not any single row but
+# (wall/step - INSTRUMENTED): whatever is left is time the driver spends outside every phase, and
+# if that is near zero the ~69 ms/step of section 14 is inside one of these rows.
+hp = e2.hostprof.report(STEPS)
+if hp:
+    print(hp)
+    print(f"    {'wall/step':<14} {wall / STEPS * 1e3:7.2f} ms  "
+          f"({(wall / STEPS - sum(e2.hostprof.t.values()) / STEPS) * 1e3:+.2f} ms unattributed)")
 print(f"  TOKENS {toks}  ->  {toks / wall:.2f} tok/s          <- the number")
 print(f"  steps/s {STEPS / wall:.3f}   accept_len_mean {st.mean(acc) + 1:.2f}  "
       f"(tokens per step {toks / STEPS:.2f})")
