@@ -242,8 +242,13 @@ if _warm:
 # of the repaired warm-up reported 2369 reads and a 9.61 s depth span against a 5.55 s wall.
 # Everything is therefore filtered to events at or after this mark.
 t0_ns = time.perf_counter_ns()
+# NVTX marks the TIMED window so a profile can be restricted to it. Without this a trace of this
+# script covers the 65 s engine load, the warm start and the warm-up decode as well, and any
+# "GPU busy %" computed over that is about the wrong thing entirely.
+torch.cuda.nvtx.range_push("timed_decode")
 t0 = time.perf_counter()
 c = e2.decode(STEPS)
+torch.cuda.nvtx.range_pop()
 wall = time.perf_counter() - t0
 # TWO DIFFERENT QUESTIONS, two drains.
 #
