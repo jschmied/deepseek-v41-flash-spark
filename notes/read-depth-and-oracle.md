@@ -112,10 +112,63 @@ Consequences, stated separately because they are not equally serious:
 Fixing this means real draft + verify + rollback in v2, not just the MTP head -- a head without
 verification still advances the cache by the full block.
 
+## 8. The misses are CAPACITY misses, and the router is near-uniform
+
+Prompted by a question worth recording: if 20k tokens of agentic work stay on one topic, shouldn't
+early expert activations predict later ones -- and were the short prompts simply too small to show
+signal? Measured on the two decode traces (548 and 443 steps):
+
+| | route-decode | route-decode-code |
+|---|---|---|
+| new (layer,expert) pairs/step, Q1 -> Q4 | 63.2 -> 3.1 | 83.2 -> 3.7 |
+| misses/step, Q1 -> Q4 | 80.9 -> 66.0 | 123.9 -> 127.2 |
+| working set (pairs) | 11,087 | 11,879 |
+| distinct experts at the median layer | **276 of 384** | **296 of 384** |
+| misses that are CAPACITY (seen, evicted, wanted again) | **76.4 %** | **83.0 %** |
+
+So activations do repeat and the working set does converge -- but it converges to 72-77 % of the
+whole model, not to a topic-sized set, and the arena holds 23-25 % of it. Misses persist because
+the cache is ~4x too small, not because the model keeps finding new experts.
+
+This is NOT a short-prompt artifact: the predictor evaluation in section 7's companion (8419ade)
+scored only the LAST 40 % of the trace, already in the converged regime. And longer context makes
+it worse, not better -- at 10x the tokens the per-layer distinct count approaches 384.
+
+Job 102 had already measured the reason identity prediction cannot work and it was not connected to
+this until now: **routing entropy 8.52 of 8.58 bits**, near-uniform. One number explains the 6 %
+fetch precision of co-occurrence, the 3 % of the transition table, the closed prediction-head
+result, and job 300's DSpark result below.
+
+## 9. DSpark carries no signal about backbone misses either (job 300)
+
+600 steps of the real draft/verify/rollback loop, the drafter's own 3 x 128 routing scored against
+the backbone's per-layer miss ids:
+
+  dspark -> miss, top-1:  miss-recall 0.4 %, fetch precision 0.5 %  (popularity baseline 6.2 %)
+
+Below the baseline. The lead-time argument -- that a weak predictor 40 layers early beats a better
+one a layer early -- does not get to apply, because there is no predictor.
+
+## 10. A scope error in everything above
+
+Every v2 experiment on this page ran at `ARENA_GB=40`. Production auto-sizes to ~82 GB, where the
+measured hit rate is 0.894 against the 0.829 these runs saw, and decode is 6.26 tok/s against the
+3.71 measured at 56.75 GB. The A/B comparisons hold -- both arms share the arena -- but 44 %
+depth-zero and +37.8 % are at an operating point with roughly twice the miss rate of the real one.
+
+The arena sweep is also the largest measured lever on this whole page:
+
+  56.75 GB  3.71 tok/s  hit 0.796      79 GB  6.00 tok/s  hit 0.890
+  68 GB     4.89 tok/s  hit 0.869      auto   6.26 tok/s  hit 0.894
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
 - Bounded here: every compute/IO overlap project, at 3.8 % combined. NOT every scheduler toggle --
   see the correction in section 1; an NVMe/H2D overlap lever is outside that arithmetic.
-- Live: read depth. The oracle needs information no predictor has, and the transition table is
-  negative on this instrument (job 265: every arm below its oracle, fetch precision 2.8-3.7 %).
+- Closed by sections 8-9: prediction of expert IDENTITY, by any of co-occurrence, recurrence, or
+  the DSpark drafter. Routing entropy 8.52/8.58 says there is almost nothing to infer.
+- Live, and non-predictive: CONCURRENCY. More requests in flight means more misses per layer to
+  issue, which raises read depth without knowing anything about the future -- the one lever left
+  that the entropy result does not touch.
+- Live, and already the biggest measured effect: arena capacity.
