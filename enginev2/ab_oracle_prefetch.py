@@ -26,7 +26,7 @@ os.chdir(V1)
 from engine.v41_engine import V41Engine              # noqa: E402
 from enginev2.observe import TraceObserver           # noqa: E402
 from enginev2.prefetch import Prefetcher             # noqa: E402
-from enginev2.real import RealLeaves                 # noqa: E402
+from enginev2.real import RealEngramSource, RealLeaves   # noqa: E402
 from enginev2.sched import Policy                    # noqa: E402
 
 # ONE PASS PER PROCESS. The in-process rewind (c.rollback(0) + begin_prompt) restores decode
@@ -60,13 +60,22 @@ class TraceOracle(Prefetcher):
         return tuple((L, int(e)) for e in ids) if ids else ()
 
 
+ENGRAM = os.environ.get("ENGRAM", "0") == "1"
+
+
 def build(eng, obs=None, prefetch=None):
     from enginev2 import drivers as v2drivers
     v2drivers.N_LAYERS = eng.args.n_layers
     rl = RealLeaves(os.path.expanduser("~/dsv41-cb3/experts-cb3-s3.bin"), eng.arena)
+    # ENGRAM=0 ZEROES eg_rows, which is engram_ablate -- a different model, not a neutral default
+    # (mutation-checked at 7.717 in the logits). It is also how every arm was measured before
+    # 50bfdf2, so it stays available for a like-for-like comparison and is never the silent state.
+    src = RealEngramSource(eng, rl) if ENGRAM else None
+    rl.engram = src
     e2 = v2drivers.Engine(Policy(), evict="lru", lru_slots=eng.store.n_slots - 8,
                           transient_slots=8, n_workers=8, staging=8, expert_read_qd=8,
-                          h2d_inflight=2, leaves=rl, observer=obs, prefetch=prefetch)
+                          h2d_inflight=2, leaves=rl, observer=obs, prefetch=prefetch,
+                          engram=src)
     for k, slot in eng.store.lru.items():
         e2.slots.lru[k] = slot
         e2.slots.slot_key[slot] = k
@@ -171,6 +180,9 @@ span = sum(dur.values()) / 1e9
 idle = dur[0] / 1e9
 busy = span - idle
 reads = len(marks) // 2
+print(f"  engram {'LIVE' if ENGRAM else 'ABLATED'}"
+      + (f", rows {sum(t.stats['rows'] for t in eng.tables.values())}" if ENGRAM else
+         f", zeroed-layer fills {rl.engram_ablated}"))
 print(f"  route sequence reproduced: {agree[0]} layers match, {agree[1]} differ")
 print(f"ARM {ARM} horizon {HORIZON}  {STEPS} steps  wall {wall:.2f}s  {STEPS / wall:.3f} steps/s")
 print(f"  demand fetches {c.fetches}  reads issued {reads}  "
