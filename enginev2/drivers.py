@@ -99,14 +99,18 @@ class Engine:
         self.c.compute_s += time.perf_counter() - t0
         return r
 
-    def _wait(self, to_load, ctx=NO_CTX):
+    def _wait(self, to_load, ctx=NO_CTX, scored: bool = True):
         """The consumer's own context goes in, not the producer's: for a speculative read these
-        differ, and the wait belongs to whoever is blocked."""
+        differ, and the wait belongs to whoever is blocked.
+
+        `scored` is a PARAMETER, not a read of self._scoring, so the cohort of a wait is decided by
+        the caller that owns it and cannot drift with engine state.
+        """
         t0 = time.perf_counter()
         try:
             if self.policy.global_barrier:
-                self.loader.wait_all(ctx=ctx)
-            self.loader.wait_slots(to_load, ctx=ctx)
+                self.loader.wait_all(ctx=ctx, scored=scored)
+            self.loader.wait_slots(to_load, ctx=ctx, scored=scored)
         finally:
             self.c.blocked_s += time.perf_counter() - t0
 
@@ -171,7 +175,11 @@ class Engine:
                 self.obs.safe_emit(Event(now_ns(), "cache_pending_hit", ctx=ctx, value=len(to_wait),
                                          scored=self._scoring))
         self.c.fetches += len(to_load)
-        self.loader.submit(to_load, ctx=ctx)
+        # DEMAND work carries the cohort too. Settlement generates real demand misses, and submit
+        # and _wait defaulted to scored=True -- so a settlement load_queued / nvme / staging /
+        # EXPERT_DATA chain was labelled measured. Test 28 cannot see it: it compares the aggregate
+        # against the trace on Event.scored, and if BOTH receive a wrongly-scored event they agree.
+        self.loader.submit(to_load, ctx=ctx, scored=self._scoring)
         # A prefetch that has not landed yet is waited on exactly like a demand read. It is not
         # counted as a fetch -- it was already counted when it was issued.
         to_load = to_load + to_wait
@@ -187,7 +195,7 @@ class Engine:
             # v1: resolve() ends in list(pool.map(...)). Nothing issues work except a call that
             # immediately blocks on it, which is why the device cannot be kept busy at any thread
             # count. Everything after this point runs with the loader already drained.
-            self._wait(to_load, ctx)
+            self._wait(to_load, ctx, scored=self._scoring)
 
         # The shared expert is expert-INdependent, so a provider that captured it outside graph B
         # can run it here, while the reads fly. One that did not has it inside layer_b, where it
@@ -196,7 +204,7 @@ class Engine:
             self._compute(lambda: self.leaves.shared(layer))
 
         if not self.policy.resolve_blocks:
-            self._wait(to_load, ctx)
+            self._wait(to_load, ctx, scored=self._scoring)
 
         # Graph B. `route` carries the FUNCTIONAL input -- the provider's route-aligned slot tensor,
         # built by bind_slots above. `reads` is safety bookkeeping only: which arena slots this
@@ -599,7 +607,7 @@ class Engine:
             # SUBMIT ONLY THE NEW READS. `to_wait` is already in flight from an earlier chunk;
             # extending before the submit queued those a second time, so one expert could be read
             # twice into the same slot. Wait on the union, submit only the difference.
-            self.loader.submit(to_load, ctx=ctx)
+            self.loader.submit(to_load, ctx=ctx, scored=self._scoring)
             waits = to_load + to_wait
             pending.extend(waits)
             per_chunk.append((waits, sorted(set(slot_of.values()))))
@@ -607,5 +615,6 @@ class Engine:
 
         for to_load, reads in per_chunk:
             # D3 ON: this chunk's FFN waits for EVERY chunk's reads. OFF: only its own.
-            self._wait(pending if self.policy.global_barrier else to_load, ctx)
+            self._wait(pending if self.policy.global_barrier else to_load, ctx,
+                       scored=self._scoring)
             self._compute(lambda r=reads: self.leaves.prefill_moe(layer, r), slots=reads)

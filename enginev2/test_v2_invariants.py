@@ -39,7 +39,7 @@ from .drivers import Engine
 from .sched import V1, V2, ComputeStream, LoaderService, Policy
 from .chain import Chain, EngramSource
 from .prefetch import OraclePrefetcher, Prefetcher, RecallOraclePrefetcher, SpecAttempt
-from .observe import CounterObserver, NullObserver, TraceObserver, WaitReason
+from .observe import CounterObserver, NullObserver, TraceObserver, WaitReason, now_ns
 from .leaves import Bandwidth, ModelLeaves, StagedExpert
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
 from .trace import N_LAYERS, load_decode, warmup_cut
@@ -1518,3 +1518,42 @@ def test_a_retired_attempt_the_layer_never_wanted_is_not_a_timing_failure():
     finally:
         e.close()
     print("  retired: wanted+evicted is a timing failure, unwanted is just wrong  OK")
+
+
+# ================================================================ 30. settlement demand work
+def test_demand_work_during_settlement_is_not_labelled_measured():
+    """Settlement generates REAL demand misses, and the demand path defaulted to scored=True.
+
+    So a settlement load_queued / NVME_ADMISSION / nvme / STAGING_BUFFER / slot_ready /
+    EXPERT_DATA / h2d chain could be labelled part of the measured cohort. Test 28 is blind to it
+    by construction: it compares CounterObserver against TraceObserver on Event.scored, and if BOTH
+    receive a wrongly-scored event they agree and it passes.
+
+    Bracketed by timestamp instead: every loader event emitted between settle()'s first and last
+    instruction must be unscored, demand or speculative alike.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+    obs = TraceObserver(capacity=1 << 21, max_rings=8)
+    e = Engine(V2, lru_slots=900, transient_slots=400, observer=obs,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut))
+    try:
+        e.warm(calls, cut)
+        e.decode(2)
+        t0 = now_ns()
+        e.settle(8)                      # small cache: these layers really do miss
+        t1 = now_ns()
+        e.loader.quiesce()
+        assert obs.dropped == 0, f"trace wrapped ({obs.dropped}); the window is partial"
+
+        window = [x for x in obs.drain() if t0 <= x.ts_ns <= t1]
+        demand = [x for x in window if x.kind == "load_queued" and x.aux == "demand"]
+        assert demand, "settlement issued no demand reads; the arm proves nothing"
+        mislabelled = [x for x in window if x.scored]
+        assert not mislabelled, (
+            f"{len(mislabelled)} settlement events labelled measured, e.g. "
+            f"{[(x.kind, x.aux) for x in mislabelled[:4]]}")
+        print(f"  settlement: {len(demand)} demand reads and {len(window)} events in the window, "
+              f"none labelled measured  OK")
+    finally:
+        e.close()
