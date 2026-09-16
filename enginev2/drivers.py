@@ -86,6 +86,15 @@ class HostPhases:
             self.t[name] += time.perf_counter() - self._open.pop(name)
             self.n[name] += 1
 
+    def reset(self) -> None:
+        """Drop everything accumulated so far. The caller must do this after a warm-up, or the
+        warm-up's phases are divided by the timed step count and every row is scaled by
+        (warm + timed) / timed."""
+        self.t.clear()
+        self.n.clear()
+        self._open.clear()
+        self._spans.clear()
+
     def report(self, steps: int) -> str:
         if not self.enabled or not steps:
             return ""

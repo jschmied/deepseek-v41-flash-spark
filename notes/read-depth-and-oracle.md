@@ -519,11 +519,86 @@ job 150's 4 GiB left the box without a server. 380 was killed at that arm; 381 c
 instead -- 200 s in, the arm is killed if MemAvailable falls under 7 GiB, printing ABORTED and
 continuing the sweep. A missing cell, not a dead box.
 
+## 19. The step, attributed at last (job 385)
+
+Wall time per driver phase, on the host, `DSV41_HOST_PROFILE=1`. 600 steps after a 150-step warm-up,
+engram live, `age_over_freq`. **Every figure below is the raw row divided by 1.25** -- see the bug
+note at the end of this section.
+
+| phase | 79 GB | 86 GB | what it is |
+|---|---|---|---|
+| `wait_reads` | 328.9 ms | **292.8 ms** | the driver blocked on this layer's expert misses |
+| `layer_a` | 122.4 ms | 122.1 ms | graph A replay + the synchronous D2H of `route_idx` |
+| `resolve` | 26.0 ms | 22.3 ms | settle, drain, reserve, submit, bind_slots, speculate |
+| `end_step` | 6.2 ms | 6.2 ms | draft, verify, rollback |
+| `await_copies` | 2.6 ms | 2.5 ms | putting copy events on the compute stream |
+| `layer_b` | 2.2 ms | 2.2 ms | ENQUEUE only; the device work lands in the next sync |
+| `wait_engram` | 0.9 ms | 1.9 ms | |
+| `wait_h` | 0.04 ms | 0.03 ms | |
+| INSTRUMENTED | 491.6 ms | 451.7 ms | |
+| wall/step | 489.8 ms | 448.0 ms | residual -1.8 ms / -3.7 ms |
+
+**THE DRIVER'S TIME IS FULLY ACCOUNTED FOR.** The residual is under 1 %, so there is no hidden term:
+the step is read wait, graph A, and host resolve, in that order, and nothing else is material.
+
+**1. `wait_reads` is ~65 % of the step, and it is where the arena win lands.** 79 -> 86 GB moves
+`wait_reads` by -36.1 ms while `layer_a` moves by -0.3 ms. That was the pre-registered test of note
+18's claim that a miss costs a DEPENDENCY rather than its bytes, and it passes: extra capacity buys
+time in exactly one phase, the one that blocks.
+
+**2. The engram stream does not block the driver.** 1.9 ms per step, 0.4 %, against 288 rows
+arriving as 575 buffered preads. The IOPS concern is answered: the engram reads cost device time
+(7.3 % of wall in `read_s`) but the driver is essentially never waiting on them.
+
+**3. NOTHING OVERLAPS, and the instrument shows it by omission.** There is no `shared` row in the
+table at all, because `RealLeaves.shared_first = False` -- `engine/fastdecode.py` captures the shared
+expert inside graph B, so the driver's shared-expert fork is inert on the real provider.
+
+**4. THE PRIZE, from measured phases rather than a model.** `layer_a` carries essentially all the
+GPU work (~102 ms/step by job 355's node trace, plus launch and sync latency) and it is STRICTLY
+SERIAL against the 293 ms of read wait: A(L) -> wait(L) -> B(L) -> A(L+1), with the host blocked in
+between. Perfect overlap of compute with the read wait would give
+
+    max(293, 122) + 22 + 13 = 328 ms   against 448 ms today   = +37 %
+
+That supersedes the "every compute/IO overlap project, bounded at 3.8 % combined" line in the
+closing section, which came from the loader-overlap family on a modelled provider. The 3.8 % bound
+was real for what it measured and is not the bound on THIS.
+
+What can actually be overlapped is limited by what is knowable: layer L+1's expert ids do not exist
+until A(L+1) runs, which needs B(L). So the only compute available to hide under layer L's read wait
+is layer L's OWN work -- the shared expert, and the routed MoE over the experts that are already
+resident (~83-85 % of the 6 per token). Realising it needs graph B split, per-expert output buffers,
+and a fixed-order reduction to keep the result bitwise identical.
+
+### The instrument had a divisor bug, and printed the evidence itself
+
+`HostPhases` accumulated across `decode(WARM)` and `decode(STEPS)` while `report()` divided by
+`STEPS` alone, so every row was scaled by (150 + 600) / 600 = 1.25. It was caught immediately
+because the report prints the residual and `INSTRUMENTED` came out 125 ms ABOVE `wall/step` -- a
+negative residual, which is impossible. Two rows name the same bug independently: `begin_step x1.2`
+where it must be x1.0, and `layer_a x50.0` where there are 40 layers.
+
+Fixed by `HostPhases.reset()`, called after the warm-up. The corrected figures above are the raw
+rows divided by 1.25, which is exact, not an estimate -- and the corrected residual falls to under
+1 %, which is the check that the correction is the right one.
+
+### Scope
+
+Single stream, this corpus, `age_over_freq`, block 6, accept_len 2.95. The probe costs 1.3 %
+(86 GB: 6.58 profiled against 6.67 unprofiled), so the absolute ms are ~1 % high and the proportions
+are unaffected. Cross-JOB absolutes are not comparable: 385's 86 GB arms ran at 6.58-6.67 against
+381's 7.00 for the same configuration, and the counters say why -- engram cost 112 us per row here
+against 62 us in job 380, i.e. the device was in the slow mode of section 5. Within-job, the arena
+effect replicates: **+9.3 % in 385 against +10.1 % in 381.**
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
 - Bounded here: every compute/IO overlap project, at 3.8 % combined. NOT every scheduler toggle --
   see the correction in section 1; an NVMe/H2D overlap lever is outside that arithmetic.
+  **SUPERSEDED for the real engine by section 19**: that 3.8 % came from the loader-overlap family on
+  a modelled provider. Measured phases on the real one put compute/read-wait overlap at +37 %.
 - Closed by sections 8-9: prediction of expert IDENTITY, by any of co-occurrence, recurrence, or
   the DSpark drafter. Routing entropy 8.52/8.58 says there is almost nothing to infer.
 - Live, and non-predictive: CONCURRENCY. More requests in flight means more misses per layer to

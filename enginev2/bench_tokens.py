@@ -75,6 +75,9 @@ t_out0, reads0, acc0 = rl.tokens_out, rl.read_bytes, len(rl.accepted)
 eg0 = {L: dict(t.stats) for L, t in eng.tables.items()}
 
 torch.cuda.synchronize()
+# The host profile must cover the TIMED window only. Without this the warm-up's phases are divided
+# by STEPS and every row is scaled by (WARM + STEPS) / STEPS.
+e2.hostprof.reset()
 t0 = time.perf_counter()
 c = e2.decode(STEPS)
 torch.cuda.synchronize()
