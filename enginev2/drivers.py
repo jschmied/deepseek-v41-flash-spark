@@ -8,6 +8,7 @@ and only a chunked driver can exercise it -- see the note on `decode_step`.
 from __future__ import annotations
 
 import dataclasses
+import os
 import time
 
 from .chain import Chain, EngramSource
@@ -54,6 +55,13 @@ class Engine:
         # methods against engine/fastdecode.py's two graphs and engine/experts.py's `_read_leased`.
         self.leaves = leaves if leaves is not None else ModelLeaves(
             calls, Bandwidth(scale=scale), scale=scale)
+        # FAST PATH, decided once and BEFORE anything that depends on it. The provider says whether
+        # the DEVICE orders a slot's reuse against its previous reader; when it does, the host-side
+        # ComputeStream, its per-slot wait, the synthetic SlotArena's write bookkeeping and all but
+        # the engram edge of the Chain are verification machinery rather than synchronisation.
+        # CHECK_INVARIANTS=1 forces every one of them back on.
+        self._dev_orders = (getattr(self.leaves, "device_orders_slot_reuse", False)
+                            and os.environ.get("CHECK_INVARIANTS") != "1")
         self.loader = LoaderService(self.arena, self.slots, self.compute, policy,
                                     leaves=self.leaves, n_workers=n_workers, staging=staging,
                                     expert_read_qd=expert_read_qd, h2d_inflight=h2d_inflight,
@@ -68,7 +76,7 @@ class Engine:
         # Every real happens-before edge of a step, named and waited on even where the for-loop
         # would have provided it. An edge that is only implicit is invisible to a plugged-in
         # component -- see chain.py.
-        self.chain = Chain(observer=self.obs)
+        self.chain = Chain(observer=self.obs, fast=self._dev_orders)
         self.engram = engram if engram is not None else EngramSource()
         self._spec: dict[tuple, SpecAttempt] = {}      # key -> the attempt in flight for it
         # Attempts that DIED before their target and were retired so the key could be predicted
@@ -94,11 +102,24 @@ class Engine:
 
     # ------------------------------------------------------------------ compute helpers
     def _compute(self, fn, slots=()):
-        """Run one compute leaf inside the compute stream. `slots` are the arena slots it READS --
-        that is what lets the loader honour a per-slot ordering instead of a global barrier."""
+        """Run one compute leaf. `slots` are the arena slots it READS.
+
+        ComputeStream is host-side bookkeeping that lets the loader order a slot's next writer
+        against its previous reader. For a MODELLED leaf that is the only mechanism there is. For a
+        real one it is both redundant and WRONG in the unsafe direction: layer_b() queues a CUDA
+        graph and returns, so run() would declare the reader finished while the GPU is still
+        reading. RealLeaves records an event after the graph and h2d waits on it per slot, which is
+        the actual ordering -- see Leaves.device_orders_slot_reuse.
+
+        There are ~84 _compute() calls per step (A and B over 40 layers plus the step's own), each
+        a pair of condition-lock sections with Counter updates and notify_all.
+        """
         t0 = time.perf_counter()
-        with self.compute.run(slots):
+        if self._dev_orders:
             r = fn()
+        else:
+            with self.compute.run(slots):
+                r = fn()
         self.c.compute_s += time.perf_counter() - t0
         return r
 

@@ -38,6 +38,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import os
 import queue
 import threading
 import time
@@ -45,6 +46,20 @@ import time
 from .leaves import Bandwidth, ModelLeaves
 from .observe import NO_CTX, Event, NullObserver, WaitReason, next_span, now_ns
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
+
+
+class _NullWrite:
+    """The synthetic SlotArena exists to catch modelled read/write violations; the real bytes live
+    in RealLeaves' own arena. Each h2d was paying two of its locks for bookkeeping nothing reads."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_NULL_WRITE = _NullWrite()
 
 
 def _default_leaves(scale: float):
@@ -135,6 +150,12 @@ class LoaderService:
         # modelled device and exists only for statistics -- a real provider has none, so every
         # reader of it must tolerate None.
         self.leaves = leaves if leaves is not None else _default_leaves(scale)
+        # Same decision the driver makes: when the provider orders slot reuse on the DEVICE, the
+        # host-side wait and the synthetic SlotArena's write tracking are verification, not
+        # synchronisation. ~67 expert reads per step were each taking a compute-stream wait plus
+        # two SlotArena locks for bookkeeping the real arena does not use.
+        self._dev_orders = (getattr(self.leaves, "device_orders_slot_reuse", False)
+                            and os.environ.get("CHECK_INVARIANTS") != "1")
         self.bw = getattr(self.leaves, "bw", None)
         self.stage = self.leaves.make_staging(staging, observer=self.obs)
         self.ready = SlotReady(observer=self.obs)
@@ -290,6 +311,9 @@ class LoaderService:
             # D1 ON is a COMPUTE barrier; D3's wait_all is the global READ barrier. Tagging both
             # GLOBAL_BARRIER made one wait appear under another's name -- the double-counting the
             # ownership-point rule exists to prevent.
+            if self._dev_orders:
+                # The copy stream already waits on this slot's last reader event inside h2d.
+                pass
             reason = (WaitReason.COMPUTE_BARRIER if self.policy.compute_barrier_global
                       else WaitReason.SLOT_READER)
             sp = next_span()
@@ -297,7 +321,9 @@ class LoaderService:
                 self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, key=key, slot=slot,
                                          gen=gen, span=sp, aux=reason, scored=scored))
             try:
-                if self.policy.compute_barrier_global:
+                if self._dev_orders:
+                    pass                               # the device orders it; see _dev_orders
+                elif self.policy.compute_barrier_global:
                     self.compute.wait_idle()          # D1 ON: wait for ALL compute
                 else:
                     self.compute.wait_slot_free(slot)  # D1 OFF: only this slot's previous reader
@@ -319,7 +345,7 @@ class LoaderService:
             # ENQUEUED the copy: the worker must not sit on it, because waiting for its own copy is
             # a buffer-lifetime dependency, not a compute dependency, and it keeps a thread that
             # could be issuing the next NVMe read parked on a device event instead.
-            wctx = self.arena.writing(slot, key)
+            wctx = _NULL_WRITE if self._dev_orders else self.arena.writing(slot, key)
             wctx.__enter__()
             if self.obs.enabled:
                 self.obs.safe_emit(Event(now_ns(), "h2d_start", ctx=ctx,

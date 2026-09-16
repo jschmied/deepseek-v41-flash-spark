@@ -279,6 +279,14 @@ class Leaves:
     # PARITY (the ratio-2 compressor grouping depends on S % 2), and capturing them the first time
     # a parity is seen. It ends with per-layer KV `pending` clones and advancing the cache length.
     # A provider that cannot express those is not an engine, so they are part of the contract.
+    # Does the PROVIDER enforce read-after-write ordering on the device itself? A modelled leaf
+    # does not -- its "compute" is a sleep, so the host-side ComputeStream is the only thing
+    # sequencing a slot's reader against its next writer. A real one records a CUDA event after the
+    # graph that read the slot and makes the copy stream wait on it, which is both stronger and the
+    # only correct answer: layer_b() QUEUES a graph and returns, so ComputeStream would declare the
+    # reader finished while the GPU is still reading.
+    device_orders_slot_reuse = False
+
     def make_staging(self, n: int, observer=None):
         """The staging pool is the PROVIDER's, because its buffers are the provider's medium: the
         modelled one hands out plain memoryviews, a real one hands out page-locked, ALIGN-aligned

@@ -547,6 +547,19 @@ class ExpertSlots:
         with self._pending_lk:
             return frozenset(self._pending)
 
+    def pending_snapshot(self) -> dict:
+        """One lock for a whole reserve() call instead of one per resident expert.
+
+        reserve() called pending_gen() inside its per-expert loop and pending_slots() after it --
+        with ~12 unique experts over 40 layers that is ~480 acquisitions per decode step just to
+        read pending state. A completion racing the snapshot only makes it CONSERVATIVELY stale: a
+        slot that has just finished still looks pending, so a consumer waits or the allocator
+        protects a slot it need not have. Both are harmless. New pending entries cannot appear
+        behind the driver's back, because reservation and submission are both driver-owned.
+        """
+        with self._pending_lk:
+            return dict(self._pending)
+
     def pending_gen(self, slot: int):
         with self._pending_lk:
             return self._pending.get(slot)
@@ -610,6 +623,7 @@ class ExpertSlots:
         to_load: list = []
         to_wait: list = []
         used: set[int] = set()
+        _pend = self.pending_snapshot()          # ONE lock for this call; see pending_snapshot
         for e in uniq:
             key = (layer, e)
             s = self.lru.get(key)
@@ -634,13 +648,13 @@ class ExpertSlots:
                 # like a hit here. Waiting on nothing would compute against a half-written slot --
                 # the same silent-wrong-data failure as a torn read counted as a HIT. Anything with
                 # a write outstanding goes on the wait list even though it is not a new fetch.
-                g = self.pending_gen(s)
+                g = _pend.get(s)
                 if g is not None:
                     to_wait.append((key, s, g))
         # Slots with a write in flight from an EARLIER call are protected exactly as slots promised
         # within this call are. Read once: a slot can only leave this set (a completion), and losing
         # that race costs one extra protected slot for one call, never a mid-write reassignment.
-        inflight = self.pending_slots()
+        inflight = frozenset(_pend)
         for e in uniq:
             if e in slot_of:
                 continue

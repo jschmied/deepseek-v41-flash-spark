@@ -37,12 +37,23 @@ a plugged-in component cannot forget them, which is the point of the file.
 
 from __future__ import annotations
 
+import os
 import threading
 
 from .observe import NO_CTX, Event, NullObserver, WaitReason, next_span, now_ns
 
 
 class Chain:
+    # FAST MODE. Every edge except engram is enforced STRUCTURALLY by the single driver thread:
+    # A(L) cannot run before B(L-1) returned, B(L) cannot run before A(L), the head cannot run
+    # before the last B, and a step cannot start before the previous one's logits exist. The chain
+    # records and waits on them anyway so that a plugged-in component sees a real edge rather than
+    # an implicit one -- which is why its own block count is ZERO on a healthy run.
+    #
+    # That costs roughly 300 condition-lock operations per step (7 per layer plus engram's 40
+    # signals), all of it validation. fast=True keeps only the edge that is genuinely asynchronous,
+    # engram, and makes the rest no-ops. CHECK_INVARIANTS=1 restores the full chain.
+    FAST_KEEP = ("engram",)
     """Named happens-before edges, keyed by (name, index). One-shot, monotonic within a step.
 
     `index` is the layer for per-layer edges and the STEP NUMBER for step-level ones. Step-level
@@ -54,7 +65,10 @@ class Chain:
     which is not a special case worth branching on at the call site.
     """
 
-    def __init__(self, observer=None):
+    def __init__(self, observer=None, fast: bool = False):
+        # fast=True keeps only FAST_KEEP's edges; the rest are structurally enforced by the single
+        # driver thread and their locks are pure validation. Never fast under CHECK_INVARIANTS=1.
+        self.fast = bool(fast) and os.environ.get("CHECK_INVARIANTS") != "1"
         self._lk = threading.Lock()
         self._cv = threading.Condition(self._lk)
         self._done: set = set()
@@ -78,6 +92,8 @@ class Chain:
             self._cv.notify_all()
 
     def set(self, name: str, index: int = -1, ctx=NO_CTX, scored: bool = True) -> None:
+        if self.fast and name not in self.FAST_KEEP:
+            return
         with self._lk:
             self._done.add((name, index))
             self._cv.notify_all()
@@ -87,6 +103,8 @@ class Chain:
 
     def wait(self, name: str, index: int = -1, timeout: float = 60.0, ctx=NO_CTX,
              scored: bool = True) -> None:
+        if self.fast and name not in self.FAST_KEEP:
+            return
         if index < 0 and name in _PER_LAYER:
             return                     # no predecessor: layer 0
         with self._lk:

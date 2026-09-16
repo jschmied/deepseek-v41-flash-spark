@@ -124,6 +124,9 @@ class RealLeaves(Leaves):
     """
 
     shared_first = False
+    # layer_b records a CUDA event and h2d waits on it per slot, so the DEVICE orders slot reuse
+    # and the host-side ComputeStream is redundant here -- see Leaves.device_orders_slot_reuse.
+    device_orders_slot_reuse = True
 
     V1 = os.path.expanduser("~/git/deepseek-v41-flash-spark")
 
