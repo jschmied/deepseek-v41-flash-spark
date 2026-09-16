@@ -309,6 +309,55 @@ So "the pipe is empty" means two different things cold and warm. Cold: the devic
 work it could be doing. Warm: the device has little to do, and what little there is sits directly
 on the critical path. Prefetch helps in both, for different reasons.
 
+## 14. The decode GPU budget, measured at last (job 355)
+
+Node-traced (`--cuda-graph-trace=node`) inside an NVTX range around the timed window only, so the
+65 s engine load, the warm start and the warm-up are excluded. With node tracing the graph nodes
+appear as ordinary kernel rows -- 247k of them -- which is why GRAPH_TRACE reads 0 here and why the
+union equals the kernel table. That is the correct behaviour, and the opposite of job 175's
+capture, where the nodes were invisible.
+
+| | span | GPU busy | GPU idle | per step |
+|---|---|---|---|---|
+| warm | 6.09 s | **3.03 s = 49.8 %** | 50.2 % | 101 ms |
+| cold | 11.94 s | **3.09 s = 25.9 %** | 74.1 % | 103 ms |
+
+**GPU busy per step is ~102 ms in BOTH regimes** -- the same work, as it must be. What changes is
+the wait around it:
+
+    warm step 203 ms = 102 GPU + ~101 wait
+    cold step 398 ms = 102 GPU + ~296 wait
+    warm + oracle 152 ms = 102 GPU + ~50 wait
+
+So the hypothesis that a warm cache leaves the GPU running without pause is **false**: it is idle
+half the time even when the NVMe pipe is nearly empty. And the earlier constant was wrong by more
+than the 8x already corrected -- job 175's 16.7 ms/step against a measured **102 ms/step**.
+
+THE CEILING THIS SETS. If every wait were removed, the step would be 102 ms = **9.8 steps/s**,
+against 5.46 warm and 6.6 warm-with-oracle. So perfect overlap is worth +80 % from the warm
+baseline, and the oracle already captures about half of the available wait.
+
+Caveat: under nsys the warm null arm ran 6.09 s against 5.46 s unprofiled, so the percentages carry
+profiler overhead and should be read as approximate.
+
+## 15. v1 and v2 are the same engine at steady state (job 350)
+
+300 steps, engram live on both sides, 79 GB, two reps. Every earlier v1/v2 comparison ran 30 steps,
+which sits entirely inside the transient.
+
+| arm | steps/s | reads | GB | h2d_s | staging |
+|---|---|---|---|---|---|
+| v1 | 8.097 / 8.130 | 1900 | 26.17 | 9.50 | 48 buffers |
+| v2 | 8.174 / 8.107 | 1952 | 26.89 | 3.37 / 4.10 | 8 buffers |
+
+**A tie: 8.11 against 8.14.** v2's earlier +5.8 % and +9.6 % were transient-window artifacts. Hit
+rate at steady state is 98.24 %, against the 82-89 % the short runs saw, and throughput is 8.1
+steps/s against ~2.3 -- so the 30-step numbers were measuring a cache filling up, not an engine
+serving.
+
+What v2 does keep: a third of the H2D time and 8 pinned staging buffers against 48. It reads
+slightly MORE (1952 against 1900) from different eviction timing.
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
