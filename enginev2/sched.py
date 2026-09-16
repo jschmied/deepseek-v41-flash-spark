@@ -48,6 +48,13 @@ from .observe import NO_CTX, Event, NullObserver, WaitReason, next_span, now_ns
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
 
 
+class _Nothing:
+    """Sentinel for "the queue was empty this pass", distinct from the None shutdown sentinel."""
+
+
+_NOTHING = _Nothing()
+
+
 class _NullWrite:
     """The synthetic SlotArena exists to catch modelled read/write violations; the real bytes live
     in RealLeaves' own arena. Each h2d was paying two of its locks for bookkeeping nothing reads."""
@@ -456,19 +463,70 @@ class LoaderService:
                     self._inflight -= 1
                     self._inflight_cv.notify_all()
 
+    # How long the completer sleeps when copies are outstanding but none has finished. Copies are
+    # milliseconds, so this retires within a fraction of one and costs a few thousand wakeups per
+    # second at most. It is a queue.get() timeout, not a sleep, so a new submission wakes it early.
+    _COMPLETER_POLL_S = 2e-4
+    _completer_in_order = os.environ.get("DSV41_COMPLETER_INORDER") == "1"
+
     def _completer(self) -> None:
-        """One thread, waiting on device events in issue order. It is not a bottleneck: the copies
-        still overlap on the GPU, this only OBSERVES them, and the depth it has to keep up with is
-        `h2d_inflight`, not the number of workers."""
+        """Retire copies in the order they FINISH, not the order they were issued.
+
+        The previous version called handle.synchronize() on each item in submission order. The
+        copies run on per-worker streams and finish out of order, so if copy #1 was slow while #2
+        was already done, the completer sat on #1 and released neither #2's staging buffer nor its
+        H2D permit. With h2d_inflight=2 that can halve the effective copy depth -- a scheduling
+        bubble, not Python overhead, which is why it is worth fixing even though the lock-shaving
+        A/B (job 370) came back a null.
+
+        The first attempt at this fix reproduced the same defect one step along: it took ONE item,
+        found it unfinished, and parked in synchronize() on it -- without looking at the queue,
+        where a finished copy was already waiting. So the rule is: take everything the queue has
+        before deciding anything, and never block on a specific event. `pending` is bounded by
+        h2d_inflight, so the scan is over two or three items.
+        """
+        pending: list = []
         while True:
-            item = self._completions.get()
-            if item is None:
-                self._completions.task_done()
-                return
             try:
-                self._complete_h2d(*item)
-            finally:
-                self._completions.task_done()
+                item = self._completions.get(
+                    timeout=None if not pending else self._COMPLETER_POLL_S)
+            except queue.Empty:
+                item = _NOTHING
+            shutdown = False
+            while item is not _NOTHING:                 # drain the burst, do not sip
+                if item is None:
+                    shutdown = True
+                    self._completions.task_done()
+                else:
+                    pending.append(item)
+                try:
+                    item = self._completions.get_nowait()
+                except queue.Empty:
+                    break
+            if self._completer_in_order and pending:
+                # MEASUREMENT ARM ONLY (DSV41_COMPLETER_INORDER=1): the pre-2026-09-16 behaviour,
+                # kept so the out-of-order change has a counterfactual rather than a before/after
+                # across two builds. Retire strictly in submission order, blocking on each.
+                it = pending.pop(0)
+                if it[0] is not None:
+                    it[0].synchronize()
+                try:
+                    self._complete_h2d(*it)
+                finally:
+                    self._completions.task_done()
+            for it in [it for it in pending if it[0] is None or it[0].query()]:
+                pending.remove(it)
+                try:
+                    self._complete_h2d(*it)
+                finally:
+                    self._completions.task_done()
+            if shutdown:
+                for it in pending:                      # nothing may be dropped on the way out:
+                    if it[0] is not None:               # _complete_h2d releases the staging buffer
+                        it[0].synchronize()             # and the H2D permit
+                    self._complete_h2d(*it)
+                    self._completions.task_done()
+                return
 
     def _worker(self) -> None:
         while True:

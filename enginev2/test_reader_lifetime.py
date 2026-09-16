@@ -15,6 +15,7 @@ import inspect
 import os
 import re
 import sys
+import time
 
 import pytest
 
@@ -154,3 +155,130 @@ def test_the_bare_fixture_has_not_drifted_from_RealLeaves():
     assert not missing, (
         f"_Bare is missing state RealLeaves.__init__ sets: {missing}. Add it to the fixture, or "
         f"these tests silently stop covering the code paths that use it.")
+
+
+# ----------------------------------------------------------------------------------------------
+# The completer retires copies in the order they FINISH.
+#
+# Every fake provider in the suite returns None from h2d(), so the whole suite exercises the
+# completer's trivial path (no event -> retire at once) and would pass just as well with the old
+# in-order synchronize(). This drives the loop directly with stub events instead.
+# ----------------------------------------------------------------------------------------------
+
+class _StubEvent:
+    """A device event whose completion we control. synchronize() is a *failure* here: the point of
+    the change is that a ready copy is retired without blocking on an unready older one."""
+
+    def __init__(self, name, done=False):
+        self.name, self.done, self.synchronized = name, done, False
+        self.queries = 0
+
+    def query(self):
+        self.queries += 1
+        return self.done
+
+    def synchronize(self):
+        self.synchronized = True
+        self.done = True
+
+
+class _StubLoader:
+    """Only what LoaderService._completer touches. The poll interval is TAKEN from the real class
+    rather than copied, so the timing assertions below stay honest if it is ever retuned."""
+
+    from enginev2.sched import LoaderService as _LS
+    _COMPLETER_POLL_S = _LS._COMPLETER_POLL_S
+    _completer_in_order = False
+    del _LS
+
+    def __init__(self):
+        import queue as _q
+        self._completions = _q.Queue()
+        self.retired = []
+
+    def _complete_h2d(self, handle, *rest):
+        self.retired.append(handle.name if handle is not None else None)
+
+
+def _run_completer(loader):
+    import threading
+    from enginev2.sched import LoaderService
+    t = threading.Thread(target=LoaderService._completer, args=(loader,), daemon=True)
+    t.start()
+    return t
+
+
+def test_a_finished_copy_is_not_held_behind_a_running_one():
+    slow, fast = _StubEvent("slow", done=False), _StubEvent("fast", done=True)
+    ld = _StubLoader()
+    ld._completions.put((slow,))
+    ld._completions.put((fast,))
+    t = _run_completer(ld)
+    # The fast copy must come out while the slow one is still running. Give the thread a moment;
+    # it has to observe an empty queue before it polls, which is one non-blocking get.
+    for _ in range(200):
+        if ld.retired:
+            break
+        time.sleep(0.005)
+    assert ld.retired == ["fast"], (
+        f"expected the finished copy first, got {ld.retired} -- the completer is still retiring "
+        f"in submission order, so a done copy waits on a running one")
+    assert not slow.synchronized, "the completer must never block on one specific event"
+    slow.done = True
+    ld._completions.put(None)
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert ld.retired == ["fast", "slow"]
+
+
+def test_the_completer_drains_pending_work_before_it_exits():
+    """Shutdown must not drop a copy that is still in `pending`: its staging buffer and its H2D
+    permit are released by _complete_h2d, and a caller may be waiting on the queue to join."""
+    ev = _StubEvent("late", done=False)
+    ld = _StubLoader()
+    ld._completions.put((ev,))
+    t = _run_completer(ld)
+    time.sleep(0.05)
+    ld._completions.put(None)
+    ev.done = True
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert ld.retired == ["late"]
+    ld._completions.join()          # every get() was matched by exactly one task_done()
+
+
+def test_the_completer_does_not_spin_when_nothing_is_ready():
+    """With one unfinished copy outstanding the loop must poll at a bounded rate, not as fast as
+    the CPU allows -- otherwise every copy in flight burns a core for its whole duration."""
+    ev = _StubEvent("only", done=False)
+    ld = _StubLoader()
+    ld._completions.put((ev,))
+    t = _run_completer(ld)
+    time.sleep(0.2)
+    assert ld.retired == []
+    assert not ev.synchronized, "the completer must never block on one specific event"
+    # 0.2 s at the 200 us poll is ~1000 passes. A busy loop would be six orders of magnitude more.
+    assert ev.queries < 20000, f"{ev.queries} query() calls in 0.2 s -- the completer is spinning"
+    ev.done = True
+    ld._completions.put(None)
+    t.join(timeout=5)
+    assert ld.retired == ["only"]
+
+
+def test_the_in_order_measurement_arm_still_reproduces_the_old_behaviour():
+    """The A/B arm has to be the DEFECT, not a second copy of the fix -- otherwise the measurement
+    compares the change against itself and returns a null by construction."""
+    slow, fast = _StubEvent("slow", done=False), _StubEvent("fast", done=True)
+    ld = _StubLoader()
+    ld._completer_in_order = True
+    ld._completions.put((slow,))
+    ld._completions.put((fast,))
+    t = _run_completer(ld)
+    for _ in range(200):
+        if len(ld.retired) == 2:
+            break
+        time.sleep(0.005)
+    assert ld.retired == ["slow", "fast"], ld.retired
+    assert slow.synchronized, "the in-order arm must block on the older event -- that is the defect"
+    ld._completions.put(None)
+    t.join(timeout=5)
