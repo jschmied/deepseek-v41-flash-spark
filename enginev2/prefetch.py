@@ -67,6 +67,14 @@ class PrefetchStats:
     # rather than historical readiness -- overstates used, ready_hit, timeliness, fetch precision
     # and mean lead all at once.
     evicted_before_use: int = 0
+    # Speculative read that FAILED. Distinct from every other state: the prediction may have been
+    # perfect and the I/O simply did not land.
+    failed_before_use: int = 0
+    # A key predicted again, closer to its target, after an earlier attempt died. The earlier read
+    # still counts in the denominator -- it happened -- but suppressing the retry made the
+    # scheduler "earliest prediction wins forever", which is the wrong policy when early death is
+    # common.
+    reissued: int = 0
     lead_ns: int = 0         # summed (demand_ts - ready_ts) over ready hits
     wasted: int = 0          # prefetched keys evicted or cancelled without ever being demanded
     # THREE STATES, kept apart because they mean different things experimentally: queued cost
@@ -86,8 +94,20 @@ class PrefetchStats:
     refused: int = 0         # predictions the store had no free slot for
 
     @property
+    def started_cohort(self) -> int:
+        """Reads that started AND belong to the scored cohort.
+
+        `started` is the loader's raw count and includes reads issued during settlement, which are
+        deliberately not scored. Dividing cohort hits by a whole-run denominator understates
+        precision by exactly the settlement tail -- 264 vs 248 on one arm. Every classified outcome
+        that involved a real read, and nothing else.
+        """
+        return (self.ready_hit + self.late_hit + self.evicted_before_use
+                + self.failed_before_use + self.discarded_running + self.discarded_finished)
+
+    @property
     def precision(self) -> float:
-        """Over FETCHES THAT HAPPENED: of the reads speculation actually caused, how many were used.
+        """Over FETCHES THAT HAPPENED, within the scored cohort.
 
         `issued` counts SUBMISSIONS, and a queued cancellation means the submission never became a
         read -- which is the entire point of cancelling it. Dividing by `issued` therefore charged
@@ -98,9 +118,10 @@ class PrefetchStats:
         speculation is resolved -- call Engine.finalize_stats(). Before that it holds the
         window-end value, which is an UNDERCOUNT of the I/O caused.
         """
-        # No fallback to `issued`. Before finalize_stats() runs, `started` is 0 and silently
-        # reverting to submissions would report the very number the started counter replaced.
-        return self.used / self.started if self.started else 0.0
+        # No fallback to `issued`: before finalize_stats() runs, reverting to submissions would
+        # report the very number the started counter was introduced to replace.
+        n = self.started_cohort
+        return self.used / n if n else 0.0
 
     @property
     def discarded_total(self) -> int:

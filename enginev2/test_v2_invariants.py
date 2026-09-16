@@ -1214,3 +1214,63 @@ def test_a_queued_speculation_still_costs_capacity_and_that_is_documented_not_hi
     lost = [x for x in ctl_order if x not in tst.lru]
     print(f"  queued reservation cost {len(lost)} extra resident(s) that the control kept "
           f"({lost[:2]}) -- documented, not free  OK")
+
+
+# ================================================================ 25. retry, cohort, failure
+def test_a_dead_prediction_does_not_block_a_closer_one_and_a_failed_read_is_not_a_hit():
+    """Three ways the classifier could still flatter or starve a predictor.
+
+    a) _spec survives cache eviction, so once a prediction died early the same key could never be
+       predicted again closer to its target -- "earliest prediction wins forever", which is the
+       worst possible policy exactly when early death is common. A dead attempt is now retired
+       (still counted, it really read) and the nearer prediction is allowed through.
+    b) a FAILED speculative read still has a completion timestamp -- set() records one even on
+       error -- and its mapping survives until the driver's deferred un-map. Classifying on the
+       timestamp counted it a timely hit, then the un-map ran and the expert became a demand miss.
+    c) the scored cohort needs a denominator of its own: `started` includes reads issued during
+       settlement, which are deliberately unscored.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+
+    # (a) heavy pressure + long horizon: early death is common, retries must recover some of it
+    e = Engine(V2, lru_slots=600, transient_slots=400,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut),
+               prefetch=OraclePrefetcher(calls, 16, start=cut))
+    try:
+        e.warm(calls, cut)
+        e.decode(3)
+        e.finalize_stats()
+        p = e.pf
+        assert p.evicted_before_use > 0, "no early death; this arm proves nothing"
+        assert p.reissued > 0, (
+            "a key that died early was never predicted again -- the scheduler is still "
+            "'earliest prediction wins forever'")
+        # (c) the cohort denominator is a real subset of the raw count
+        assert 0 < p.started_cohort <= p.started, (p.started_cohort, p.started)
+        assert p.precision == p.used / p.started_cohort
+    finally:
+        e.close()
+
+    # (b) a failing read must not be counted ready. Force one on a speculative key.
+    e = Engine(V2, lru_slots=64, transient_slots=8, n_workers=2, staging=8,
+               expert_read_qd=2, h2d_inflight=2,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut))
+    try:
+        spec, refused = e.slots.reserve_speculative([(9, 700)])
+        assert spec and not refused
+        key, slot, gen = spec[0]
+        e.loader.fail.add(key)
+        e._spec[key] = (slot, gen, 1, 1)
+        e.loader.submit(spec, speculative=True)
+        e.loader.quiesce()
+        assert e.loader.ready.state(slot, gen) == "error", "the read did not fail"
+        # settle BEFORE drain_forgets, which is the window the bug lived in
+        e._settle_speculation(9, (700,), None)
+        assert e.pf.failed_before_use == 1, (
+            f"a failed speculative read was classified as something else "
+            f"(ready {e.pf.ready_hit}, late {e.pf.late_hit}, used {e.pf.used})")
+        assert e.pf.ready_hit == 0 and e.pf.used == 0
+    finally:
+        e.close()
+    print("  retry: dead predictions are retired and re-predicted; a failed read is not a hit  OK")

@@ -70,7 +70,16 @@ class Engine:
         # component -- see chain.py.
         self.chain = Chain(observer=self.obs)
         self.engram = engram if engram is not None else EngramSource()
-        self._spec: dict[tuple, tuple] = {}     # key -> (slot, gen, cause_id) still speculative
+        self._spec: dict[tuple, tuple] = {}   # key -> (slot, gen, cause_id, seq) still speculative
+        # Attempts that DIED before their target (evicted, or failed) and were retired so the key
+        # could be predicted again closer to demand. They still belong in the denominator -- the
+        # read happened -- and they classify when their target layer arrives.
+        self._expired: dict[int, list] = {}
+        self._seq = 0
+        # Set while settling: predictions issued after this are OUTSIDE the scored cohort. Keeping
+        # the predictor running during settlement is deliberate (see settle), so the boundary has
+        # to be per-prediction rather than "the predictor is off".
+        self._cohort_end = None
         # Every key the predictor NAMED, including ones already resident. Needed because precision
         # over predictions and precision over fetches are different numbers (see PrefetchStats):
         # a correct prediction that was already cached never becomes a fetch, so scoring only the
@@ -225,14 +234,32 @@ class Engine:
                         self.obs.safe_emit(Event(now_ns(), "prediction_resident_hit",
                                                  ctx=ctx or NO_CTX, key=k, cause_id=named[k]))
         wrong = []
+        # Attempts retired earlier for this layer: the read happened, so it counts, but it can
+        # only ever have failed to serve demand.
+        for _sl, _g, _cause, _sq, _k in self._expired.pop(layer, []):
+            if self._cohort_end is not None and _sq > self._cohort_end:
+                continue
+            self.pf.evicted_before_use += 1
+            self.pf.wasted += 1
+
         for key in [k for k in self._spec if k[0] == layer]:
-            slot, gen, cause = self._spec.pop(key)
+            slot, gen, cause, seq = self._spec.pop(key)
+            if self._cohort_end is not None and seq > self._cohort_end:
+                continue          # issued during settlement: outside the scored cohort
             if key in want:
                 # RESIDENT NOW, not "was ready once". _spec is independent of residency and
                 # SlotReady keeps (slot, gen) readiness for the life of the process, so a prefetch
                 # that completed and was then evicted before its target layer still looked ready --
                 # and was counted as a timely, useful hit while the engine re-read it as a demand
                 # miss. Classify against the CURRENT mapping and generation.
+                st = self.loader.ready.state(slot, gen)
+                if st == "error":
+                    # The prediction may have been perfect; the I/O did not land. The driver's
+                    # deferred un-map has not run yet, so the mapping still looks valid here --
+                    # which is how a FAILED read was being counted as a timely hit.
+                    self.pf.failed_before_use += 1
+                    self.pf.wasted += 1
+                    continue
                 resident = (self.slots.lru.get(key) == slot
                             and self.slots.gen.get(slot) == gen)
                 if not resident:
@@ -247,7 +274,7 @@ class Engine:
                 # READY or LATE? A prefetch whose read is still in flight is a mapping hit that the
                 # consumer still blocks on; counting it with the ready ones would report a win the
                 # engine never got.
-                ready_ts = self.loader.ready.ready_ts(slot, gen)
+                ready_ts = self.loader.ready.ready_ts(slot, gen) if st == "ready" else None
                 if ready_ts is not None:
                     self.pf.ready_hit += 1
                     lead = now_ns() - ready_ts
@@ -281,7 +308,25 @@ class Engine:
         keys = self.prefetch.predict(layer, uniq, self.c.steps)
         if not keys:
             return
-        keys = [k for k in keys if k not in self._spec]
+        live = []
+        for k in keys:
+            old = self._spec.get(k)
+            if old is None:
+                live.append(k)
+                continue
+            _sl, _g, _c, _sq = old
+            still = (self.slots.lru.get(k) == _sl and self.slots.gen.get(_sl) == _g)
+            if still:
+                continue                      # genuinely outstanding or resident: no duplicate
+            # DEAD. Suppressing the retry made the scheduler "earliest prediction wins forever":
+            # a prediction that loaded at L0 and was evicted at L7 blocked every closer prediction
+            # for the same key until L16, where it could only ever classify as evicted_before_use.
+            # Retire it so it still accounts, and let the nearer prediction through.
+            self._expired.setdefault(k[0], []).append(old + (k,))
+            del self._spec[k]
+            self.pf.reissued += 1
+            live.append(k)
+        keys = live
         # One id per prediction batch, carried by every event that batch causes, so a prediction's
         # whole life joins on a key instead of on timestamps. The commit text claimed this existed;
         # the schema did not have it.
@@ -299,7 +344,8 @@ class Engine:
         if not to_load:
             return
         for key, slot, gen in to_load:
-            self._spec[key] = (slot, gen, pred_id)
+            self._seq += 1
+            self._spec[key] = (slot, gen, pred_id, self._seq)
         self.pf.issued += len(to_load)
         if self.obs.enabled:
             for k, sl, g in to_load:
@@ -357,8 +403,13 @@ class Engine:
         the longer horizon is penalised for nothing but where the benchmark ended. That is a bias
         in favour of short horizons in exactly the sweep meant to choose a horizon.
 
-        Nothing new is predicted during settlement, so it adds no tail of its own. The timed
-        counters are restored afterwards -- only the prefetch classification is allowed to move.
+        THE PREDICTOR STAYS ON. Disabling it removes the contention the tail would actually meet:
+        in steady-state decode, layer L+1 issues speculation that competes for NVMe admission and
+        cache slots with a prediction still targeting L+3. Settling with prediction off gives those
+        tail predictions an artificially clear path to becoming ready and surviving until use --
+        the opposite bias to censoring, and again horizon-dependent. So the cohort is delimited by
+        SEQUENCE instead: predictions issued during settlement run, contend, and are simply not
+        scored. The timed counters are restored afterwards; only classification of the cohort moves.
         """
         if layers is None:
             layers = getattr(self.prefetch, "horizon", 0)
@@ -376,8 +427,7 @@ class Engine:
             raise RuntimeError(f"settle({layers}) needs {layers} more calls, trace has {avail}")
         import copy
         saved_c = copy.copy(self.c)
-        saved_pf = self.prefetch
-        self.prefetch = Prefetcher()                 # issue nothing new
+        self._cohort_end = self._seq                 # everything after this is unscored
         ran = 0
         try:
             for i in range(layers):
@@ -385,7 +435,6 @@ class Engine:
                                   OpContext(self.request_id, self.c.steps, i % N_LAYERS))
                 ran += 1
         finally:
-            self.prefetch = saved_pf
             wall, steps = self.c.wall_s, self.c.steps
             self.c = saved_c                         # timed counters are the window's, not this
             self.c.wall_s, self.c.steps = wall, steps

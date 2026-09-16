@@ -422,6 +422,17 @@ class SlotReady:
         with self._lk:
             return (slot, gen) in self._done
 
+    def state(self, slot: int, gen: int) -> str:
+        """PENDING / READY / ERROR. `ready_ts` alone cannot tell READY from ERROR -- set() records a
+        timestamp even when it is called with an exception, because the completion really did
+        happen; only the outcome differs. A consumer that treats "has a timestamp" as "has good
+        bytes" counts a FAILED speculative read as a timely hit, and then the driver's deferred
+        un-map removes it and the expert is read again as a demand miss."""
+        with self._lk:
+            if (slot, gen) not in self._done:
+                return "pending"
+            return "error" if (slot, gen) in self._err else "ready"
+
     def ready_ts(self, slot: int, gen: int):
         """When (slot, gen) became ready, or None if it has not. Lets the driver tell a prefetch
         that ARRIVED from one that was merely mapped and is still in flight."""
