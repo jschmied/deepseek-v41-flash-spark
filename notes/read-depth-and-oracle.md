@@ -275,6 +275,40 @@ WHAT THAT DOES NOT SAY: that prefetch is worthless. It says prefetching the FULL
 unprotected past one layer, is worthless once the cache is warm. A prefetcher that only issues when
 read depth is low, and that cannot evict anything a near-future layer wants, was never measured.
 
+## 13. The warm cache, measured properly at last (job 345)
+
+Three prior attempts were harness bugs, each producing plausible numbers: a policy with no history
+(310), a warm-up that replayed the timed window (315), a warm-up that loaded nothing at all and ran
+31/1280 routes (320), and an oracle reading the warm-up's own steps with issued=0 (335). The
+harness now aborts on each of those conditions.
+
+79 GB, engram live, warm-up = 30 REAL decode steps, timed on steps 30-59, three reps:
+
+| policy | arm | steps/s | reads | GB |
+|---|---|---|---|---|
+| lru | null | 5.461 / 5.455 / 5.468 | 474 | 6.53 |
+| lru | **oracle** | **6.596 / 6.553 / 6.734** | 474 | 6.53 |
+| age_over_freq | null | 5.491 / 5.388 / 5.384 | 474 | 6.53 |
+| age_over_freq | **oracle** | **6.485 / 6.493 / 6.588** | 474 | 6.53 |
+
+**The oracle is worth +20.4 % warm, at identical bytes.** Not the -13 % job 320 claimed (that run
+computed with wrong weights), and not the "approximately nothing" I reported from a single arm
+whose 5.27 happened to land inside the null spread -- with reps the arms separate cleanly, null at
++-0.2 % and oracle at +-2.7 %.
+
+**The policies still tie**, now on a warm-up that genuinely builds history: 5.46 against 5.42 mean.
+At 5,457 slots the victim choice does not matter, consistent with protection measuring near-null.
+
+WHY IT STILL HELPS WHEN THE DEVICE IS IDLE. Warm issues 15.8 reads per step at ~12 ms latency,
+which is ~190 ms against a measured step of 183 ms. The step time is essentially the SERIALIZED
+miss latency. The device is idle 84 % of the span and the step is still waiting on reads -- because
+they are taken one layer at a time, not because the device is busy. The oracle removes most of that
+wait by starting them a layer early.
+
+So "the pipe is empty" means two different things cold and warm. Cold: the device is starved of
+work it could be doing. Warm: the device has little to do, and what little there is sits directly
+on the critical path. Prefetch helps in both, for different reasons.
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
