@@ -115,6 +115,18 @@ class FastDecoder:
         self.eg_rows = {L: torch.zeros(T, a.engram_n_heads * (a.engram_max_ngram_size - 1), a.engram_head_dim,
                                        dtype=torch.float32, device=dev) for L in a.engram_layer_ids}
         self.slots = torch.zeros(T, a.n_activated_experts, dtype=torch.int32, device=dev)
+        # DSV41_DRAFT_TRACE=1 exposes the DSpark drafter's own routing for offline study: which of
+        # its 3 x 128 experts each draft position picks, and the full score vector behind that
+        # choice. The drafter runs BEFORE the verify step it feeds, so these are the earliest
+        # signal in the engine about what the backbone is about to do -- the question being whether
+        # they say anything about which BACKBONE experts will miss. Unset: None, nothing captured,
+        # no change to the graph.
+        self.draft_trace = None
+        if os.environ.get("DSV41_DRAFT_TRACE") == "1":
+            self.draft_trace = {
+                "idx": torch.zeros(3, T_DRAFT, 3, dtype=torch.int64, device=dev),
+                "score": torch.zeros(3, T_DRAFT, 128, dtype=torch.float32, device=dev),
+            }
         # ---- static state carried between graphs of one step
         self.h = torch.zeros(T, a.hc_mult, a.dim, dtype=torch.bfloat16, device=dev)
         self.pre_mix = torch.zeros(T, a.hc_mult, dtype=torch.float32, device=dev)
@@ -394,6 +406,12 @@ class FastDecoder:
             y = R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps)
             scores = F.softplus(R.mm(y.float(), self.W.mtp[k].gate_w)).sqrt()  # fp32, as Model.moe
             idx = (scores + w.gate_bias).topk(3, dim=-1)[1]
+            if self.draft_trace is not None:
+                # OFF BY DEFAULT AND DECIDED AT CAPTURE TIME. These are static buffers written
+                # inside the captured region, so each replay refreshes them; when the env is unset
+                # the writes are not captured at all and the graph is byte-for-byte the shipped one.
+                self.draft_trace["idx"][k].copy_(idx)
+                self.draft_trace["score"][k].copy_(scores)
             wts = scores.gather(1, idx); wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
             slots = (idx.to(torch.int32) + k * 128)
             out = self.m.moe_fn(y, slots, wts, self.W.dspark_arena, a.swiglu_limit).float()
