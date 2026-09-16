@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import torch
 
@@ -136,11 +137,20 @@ class RealLeaves(Leaves):
                 sys.path.insert(0, p)
 
     def __init__(self, cb3_path: str, arena, device: str = "cuda"):
+        import threading
+        self._ctr = threading.Lock()
+        self._tls = threading.local()
         self._v1_on_path()
         from engine.cb3_cache import CB3Cache
         self.cache = CB3Cache(cb3_path, device)
         self.arena = arena
         self.record = self.cache.record
+        # PROVIDER counters, the counterpart of v1's ExpertStore.stats. The engine's own numbers,
+        # not /proc/diskstats: a byte counted here is a byte this provider asked the device for.
+        self.read_bytes = 0
+        self.read_s = 0.0
+        # h2d timing is the LOADER's to measure now: the provider only enqueues, so a duration
+        # taken here would be the enqueue cost, not the copy's.
 
     def close(self):
         self.cache.close()
@@ -158,17 +168,46 @@ class RealLeaves(Leaves):
         try:
             view = pool.buffer(sid)
             layer, expert = key
+            t0 = time.perf_counter()
             self.cache.read_into(memoryview(view.numpy()), layer, expert)
+            dt = time.perf_counter() - t0
+            with self._ctr:
+                self.read_bytes += self.record
+                self.read_s += dt
         except BaseException:
             pool.release(sid)
             raise
         return StagedExpert(sid, view, pool)
 
-    def h2d(self, slot: int, key: tuple, staged: StagedExpert) -> None:
-        """The record into the arena slot. Synchronous by contract -- the loader releases the
-        pinned buffer the moment this returns, so the copy must have completed."""
-        self.cache.load_slot(self.arena, slot, staged.payload, non_blocking=False)
-        torch.cuda.synchronize()
+    def h2d(self, slot: int, key: tuple, staged: StagedExpert):
+        """ENQUEUE the record into the arena slot and hand back a device event.
+
+        The pinned buffer may not be reused until the copy has read it, but that is a BUFFER
+        LIFETIME dependency, not a compute one, and blocking the calling worker on it parks a
+        thread that could be issuing the next NVMe read. So this returns a cuda.Event and the
+        loader's completer releases the lease when the device says the bytes have landed.
+
+        Two earlier revisions of this method were both barriers wearing a copy's clothes:
+        non_blocking=False plus torch.cuda.synchronize() (device-wide, taken from a loader thread,
+        so compute waited on every H2D and every H2D waited on compute), then non_blocking=True
+        plus stream.synchronize() (narrower, still a host block on this worker). Neither is a
+        dependency of the model.
+        """
+        # PER-THREAD COPY STREAM, which is what v1 does (experts.py `_load_into_slot`): issue the
+        # twelve plane copies async on a stream this worker owns, then wait on THAT stream. The
+        # first revision used non_blocking=False plus torch.cuda.synchronize(), a device-wide
+        # barrier taken from a loader thread -- so every H2D also waited for the model's compute
+        # and, worse, made compute wait for it. That is not a copy cost, it is a barrier cost, and
+        # it was being reported as H2D time.
+        st = getattr(self._tls, "stream", None)
+        if st is None:
+            st = self._tls.stream = torch.cuda.Stream()
+            self._tls.events = []
+        with torch.cuda.stream(st):
+            self.cache.load_slot(self.arena, slot, staged.payload, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(st)
+        return ev
 
 
     # --- graph half ---------------------------------------------------------------------------
@@ -181,13 +220,18 @@ class RealLeaves(Leaves):
     # The graphs are captured PER PARITY (S % 2) because the ratio-2 compressor grouping depends on
     # it, so begin_step selects the pair for this step and captures on first sight.
 
-    def attach(self, engine, block_ids, engram_rows=None) -> "RealLeaves":
+    def attach(self, engine, block_ids, engram_rows=None, next_block=None) -> "RealLeaves":
         """Bind to a live V41Engine. The engine owns the weights, caches and captured graphs; this
         provider only replays them."""
         self.eng = engine
         self.fd = engine.fast
         self.block_ids = block_ids
         self.engram_rows = engram_rows or {}
+        # Multi-step decode needs a rule for the NEXT block. v1's is draft + verify; a harness that
+        # wants both arms to see the same token sequence supplies its own, identical rule to both.
+        # There is no default: a provider asked for more than one step without one is a bug, not a
+        # silently-repeated block.
+        self.next_block = next_block
         self._S = int(self.fd.c.len)
         self._gA = self._gB = self._gF = None
         return self
@@ -196,6 +240,11 @@ class RealLeaves(Leaves):
         """The prologue no layer owns. Mirrors fastdecode.step() up to the layer loop."""
         import torch as _t
         fd, a = self.fd, self.fd.a
+        if step:
+            if self.next_block is None:
+                raise RuntimeError("multi-step decode needs attach(next_block=...); without it "
+                                   "every step would replay the same block")
+            self.block_ids = self.next_block(fd.logits, step)
         S = self._S
         fd.ids.copy_(self.block_ids)
         fd.pos.copy_(S + _t.arange(fd.ids.numel(), device=fd.dev))

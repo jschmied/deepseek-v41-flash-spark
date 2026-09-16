@@ -168,6 +168,9 @@ class LoaderService:
         # PRIORITY QUEUE: demand reads (0) ahead of speculation (1). Speculation still takes the
         # same expert-read admissions once it starts -- it is deprioritised, never exempted, because a
         # prefetch for layer L+1 and a demand miss on layer L really do contend for one device.
+        # Deferred H2D completions. A provider that returns a device event from h2d() puts the
+        # completion here instead of blocking its worker on it.
+        self._completions: queue.Queue = queue.Queue()
         self.q: queue.PriorityQueue = queue.PriorityQueue()
         self._seq = 0
         self._cancelled: set = set()
@@ -213,10 +216,12 @@ class LoaderService:
                                          name=f"loader-{i}") for i in range(n_workers)]
         for w in self.workers:
             w.start()
+        self.completer = threading.Thread(target=self._completer, daemon=True, name="loader-done")
+        self.completer.start()
 
     # ------------------------------------------------------------------ the leaf
     def _load_one(self, ctx, cause_id: int, spec: bool, scored: bool, key: tuple, slot: int,
-                  gen: int) -> None:
+                  gen: int, is_demand: bool = False) -> bool:
         """read -> (handoff) -> compute-order barrier -> H2D -> per-slot event.
 
         Every step between the lease and the release must be inside the try, or the lease leaks and
@@ -236,13 +241,14 @@ class LoaderService:
             # whenever a low-priority queue entry happened to be dequeued. Nothing to do here but
             # drop the stale entry. Touching ExpertSlots from a worker is what this whole deferral
             # exists to avoid.
-            return
+            return False
         # The PROVIDER acquires the staging buffer, inside read(), and hands back a StagedExpert
         # that owns the lease -- because the bytes and the lease cannot be separated: a real reader
         # returns views ALIASING that pinned buffer. The loader decides only WHEN to release it,
         # which is after h2d has completed, never before.
         staged = None
         permit_held = False
+        deferred = False
         try:
             if key in self.fail:
                 raise IOError(f"injected NVMe failure {key}")
@@ -308,21 +314,71 @@ class LoaderService:
                                          scored=scored, aux=WaitReason.H2D_CAPACITY))
             elif not self.obs.enabled:
                 self.h2d_sem.acquire()
+            # ISSUE the copy. A provider that completes synchronously returns None and everything
+            # below runs on this thread, exactly as before. One that returns a HANDLE has only
+            # ENQUEUED the copy: the worker must not sit on it, because waiting for its own copy is
+            # a buffer-lifetime dependency, not a compute dependency, and it keeps a thread that
+            # could be issuing the next NVMe read parked on a device event instead.
+            wctx = self.arena.writing(slot, key)
+            wctx.__enter__()
+            if self.obs.enabled:
+                self.obs.safe_emit(Event(now_ns(), "h2d_start", ctx=ctx,
+                                         cause_id=cause_id, key=key, slot=slot, gen=gen,
+                                         scored=scored))
+            t0 = time.perf_counter()
             try:
-                with self.arena.writing(slot, key):
-                    if self.obs.enabled:
-                        self.obs.safe_emit(Event(now_ns(), "h2d_start", ctx=ctx,
-                                                 cause_id=cause_id, key=key, slot=slot, gen=gen,
-                                                 scored=scored))
-                    t0 = time.perf_counter()
-                    self.leaves.h2d(slot, key, staged)
-                    dt = time.perf_counter() - t0
-                    if self.obs.enabled:
-                        self.obs.safe_emit(Event(now_ns(), "h2d_end", ctx=ctx, cause_id=cause_id,
-                                                 key=key, slot=slot, gen=gen, value=dt,
-                                                 scored=scored))
-            finally:
+                handle = self.leaves.h2d(slot, key, staged)
+            except BaseException:
+                wctx.__exit__(None, None, None)
                 self.h2d_sem.release()
+                raise
+            if handle is None:
+                self._complete_h2d(None, wctx, staged, key, slot, gen, ctx, cause_id, scored, t0)
+                staged = None                      # the completion owns the lease now
+            else:
+                deferred = True
+                self._completions.put(
+                    (handle, wctx, staged, key, slot, gen, ctx, cause_id, scored, t0, is_demand))
+                staged = None
+        except BaseException as exc:              # noqa: BLE001
+            # A failed expert must be UN-MAPPED: its slot holds a torn read, and leaving the key
+            # mapped would make the next reserve() count it as a HIT and compute with partial
+            # bytes -- silent, and permanent for the life of the process. Deferred to the driver
+            # for the same reason as above; drain_forgets() runs before the next reserve().
+            with self._lk:
+                self._forget.append((key, slot, gen, False))
+            self.ready.set(slot, gen, err=exc)
+        finally:
+            if not deferred:
+                if permit_held:
+                    self.read_qd.release()
+                # The write is over (done or failed): the slot may be evicted again.
+                self.slots.clear_pending(slot, gen)
+                if staged is not None:
+                    staged.release()      # after the copy, always, and exactly once
+            elif permit_held and not self.policy.lease_until_completion:
+                pass                      # already released at handoff
+            # A DEFERRED copy owns all three: the completer releases the permit, clears the pending
+            # mark and returns the buffer when the device says the bytes have landed. Doing any of
+            # it here would hand the slot or the buffer to someone else mid-copy.
+        return deferred
+
+    def _complete_h2d(self, handle, wctx, staged, key, slot, gen, ctx, cause_id, scored, t0,
+                      is_demand: bool = False):
+        """Everything that may only happen once the bytes have LANDED.
+
+        Split out of _load_one so the inline path (a provider whose h2d has already completed on
+        return) and the deferred path (one that handed back a device event) run the same code and
+        cannot drift apart. `handle` is None for the inline path; otherwise it is waited on here,
+        on the completer thread, never on a worker.
+        """
+        try:
+            if handle is not None:
+                handle.synchronize()
+            dt = time.perf_counter() - t0
+            if self.obs.enabled:
+                self.obs.safe_emit(Event(now_ns(), "h2d_end", ctx=ctx, cause_id=cause_id,
+                                         key=key, slot=slot, gen=gen, value=dt, scored=scored))
             with self._lk:
                 self.h2d_calls += 1
                 self.h2d_s += dt
@@ -337,20 +393,45 @@ class LoaderService:
                 with self._lk:
                     self._forget.append((key, slot, gen, False))
         except BaseException as exc:              # noqa: BLE001
-            # A failed expert must be UN-MAPPED: its slot holds a torn read, and leaving the key
-            # mapped would make the next reserve() count it as a HIT and compute with partial
-            # bytes -- silent, and permanent for the life of the process. Deferred to the driver
-            # for the same reason as above; drain_forgets() runs before the next reserve().
             with self._lk:
                 self._forget.append((key, slot, gen, False))
             self.ready.set(slot, gen, err=exc)
         finally:
-            if permit_held:
+            wctx.__exit__(None, None, None)
+            self.h2d_sem.release()
+            if self.policy.lease_until_completion:
                 self.read_qd.release()
-            # The write is over (done or failed): the slot may be evicted again.
             self.slots.clear_pending(slot, gen)
             if staged is not None:
-                staged.release()          # after the copy, always, and exactly once
+                staged.release()
+            if handle is not None:
+                # DEFERRED: the worker already went back to the queue, so the two counters that say
+                # "this read is still happening" were NOT decremented there. They belong here --
+                # `_inflight` is what quiesce() waits on and `_demand` is D3's demand barrier, and
+                # dropping either while the copy is still in flight reports the loader at rest with
+                # bytes still landing. That is exactly the class of bug the exact-logits gate
+                # catches only intermittently, so it is fixed by construction instead.
+                if is_demand:
+                    with self._demand_cv:
+                        self._demand -= 1
+                        self._demand_cv.notify_all()
+                with self._inflight_cv:
+                    self._inflight -= 1
+                    self._inflight_cv.notify_all()
+
+    def _completer(self) -> None:
+        """One thread, waiting on device events in issue order. It is not a bottleneck: the copies
+        still overlap on the GPU, this only OBSERVES them, and the depth it has to keep up with is
+        `h2d_inflight`, not the number of workers."""
+        while True:
+            item = self._completions.get()
+            if item is None:
+                self._completions.task_done()
+                return
+            try:
+                self._complete_h2d(*item)
+            finally:
+                self._completions.task_done()
 
     def _worker(self) -> None:
         while True:
@@ -358,16 +439,18 @@ class LoaderService:
             try:
                 if entry is None or entry[2] is None:
                     return
+                deferred = False
                 try:
-                    self._load_one(*entry[2])
+                    deferred = bool(self._load_one(*entry[2], is_demand=bool(entry[3])))
                 finally:
-                    if entry[3]:
+                    if entry[3] and not deferred:
                         with self._demand_cv:
                             self._demand -= 1
                             self._demand_cv.notify_all()
-                with self._inflight_cv:
-                    self._inflight -= 1
-                    self._inflight_cv.notify_all()
+                if not deferred:
+                    with self._inflight_cv:
+                        self._inflight -= 1
+                        self._inflight_cv.notify_all()
             finally:
                 self.q.task_done()
 
@@ -528,3 +611,8 @@ class LoaderService:
             self.q.put((-1, self._seq, None, False))
         for w in self.workers:
             w.join(timeout=5)
+        # The completer stops LAST. quiesce() above already waited for every completion (that is
+        # what moving the _inflight decrement into _complete_h2d bought), but a worker can enqueue
+        # one right up to its sentinel, so the sentinel for this thread goes in after theirs.
+        self._completions.put(None)
+        self.completer.join(timeout=5)
