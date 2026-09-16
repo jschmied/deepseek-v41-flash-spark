@@ -193,6 +193,9 @@ class LoaderService:
         # stays correct through failures and any future scheduling change.
         self.started_demand = 0
         self.started_spec = 0
+        # Scored speculative reads, counted at the SAME ownership point. The scored bit rides with
+        # the work item so the denominator is measured rather than reconstructed from outcomes.
+        self.started_spec_scored = 0
         # Total outstanding work, for quiesce(). A helper thread wrapped around q.join() leaked one
         # blocked thread per timeout; a counter with its own condition times out cleanly.
         self._inflight = 0
@@ -212,7 +215,8 @@ class LoaderService:
             w.start()
 
     # ------------------------------------------------------------------ the leaf
-    def _load_one(self, ctx, cause_id: int, spec: bool, key: tuple, slot: int, gen: int) -> None:
+    def _load_one(self, ctx, cause_id: int, spec: bool, scored: bool, key: tuple, slot: int,
+                  gen: int) -> None:
         """read -> (handoff) -> compute-order barrier -> H2D -> per-slot event.
 
         Every step between the lease and the release must be inside the try, or the lease leaks and
@@ -263,6 +267,8 @@ class LoaderService:
             with self._lk:
                 if spec:
                     self.started_spec += 1
+                    if scored:
+                        self.started_spec_scored += 1
                 else:
                     self.started_demand += 1
             staged = self.leaves.read(key, self.stage, ctx)
@@ -362,7 +368,8 @@ class LoaderService:
                 self.q.task_done()
 
     # ------------------------------------------------------------------ service api
-    def submit(self, to_load, speculative: bool = False, ctx=NO_CTX, cause_id: int = 0) -> None:
+    def submit(self, to_load, speculative: bool = False, ctx=NO_CTX, cause_id: int = 0,
+               scored: bool = True) -> None:
         # Protect before queueing, never after: between the two a worker can already be writing.
         self.slots.mark_pending(to_load)
         for key, slot, gen in to_load:
@@ -384,7 +391,7 @@ class LoaderService:
                 self._queued.add((item[1], item[2]))
                 # the context travels WITH the work: a completion on a worker thread must still
                 # know which request and step asked for it.
-                self.q.put((prio, self._seq, (ctx, cause_id, speculative) + tuple(item),
+                self.q.put((prio, self._seq, (ctx, cause_id, speculative, scored) + tuple(item),
                             prio == 0))
 
     def cancel(self, items) -> tuple:

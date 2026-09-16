@@ -13,7 +13,7 @@ import time
 from .chain import Chain, EngramSource
 from .leaves import Bandwidth, ModelLeaves
 from .observe import NO_CTX, Event, NullObserver, OpContext, next_span, now_ns
-from .prefetch import PrefetchStats, Prefetcher
+from .prefetch import PrefetchStats, Prefetcher, SpecAttempt
 from .sched import ComputeStream, LoaderService, Policy
 from .store import ExpertSlots, SlotArena
 from .trace import N_LAYERS
@@ -70,16 +70,15 @@ class Engine:
         # component -- see chain.py.
         self.chain = Chain(observer=self.obs)
         self.engram = engram if engram is not None else EngramSource()
-        self._spec: dict[tuple, tuple] = {}   # key -> (slot, gen, cause_id, seq) still speculative
-        # Attempts that DIED before their target (evicted, or failed) and were retired so the key
-        # could be predicted again closer to demand. They still belong in the denominator -- the
-        # read happened -- and they classify when their target layer arrives.
+        self._spec: dict[tuple, SpecAttempt] = {}      # key -> the attempt in flight for it
+        # Attempts that DIED before their target and were retired so the key could be predicted
+        # again closer to demand. They keep their TERMINAL REASON: relabelling an I/O failure as an
+        # eviction made the failure-mode breakdown say the wrong thing about why prediction fails.
         self._expired: dict[int, list] = {}
-        self._seq = 0
-        # Set while settling: predictions issued after this are OUTSIDE the scored cohort. Keeping
-        # the predictor running during settlement is deliberate (see settle), so the boundary has
-        # to be per-prediction rather than "the predictor is off".
-        self._cohort_end = None
+        # Scored-ness is per attempt, not a global cutoff -- see SpecAttempt. `_scoring` is the
+        # flag new attempts inherit; settlement clears it and restores it, so a later decode on the
+        # same Engine is scored again.
+        self._scoring = True
         # Every key the predictor NAMED, including ones already resident. Needed because precision
         # over predictions and precision over fetches are different numbers (see PrefetchStats):
         # a correct prediction that was already cached never becomes a fetch, so scoring only the
@@ -222,9 +221,10 @@ class Engine:
         want = {(layer, e) for e in uniq}
         named = self._pred.pop(layer, None)
         if named:
-            hit = set(named) & want
+            scored = {k for k, (_c, sc) in named.items() if sc}
+            hit = scored & want
             self.pf.pred_hit += len(hit)
-            self.pf.pred_miss += len(named) - len(hit)
+            self.pf.pred_miss += len(scored) - len(hit)
             if self.obs.enabled:
                 # A correct prediction that was ALREADY RESIDENT never became I/O, so it appears in
                 # no load chain. Emitting it keeps predictor accounting complete rather than
@@ -232,20 +232,24 @@ class Engine:
                 for k in hit:
                     if k not in self._spec:
                         self.obs.safe_emit(Event(now_ns(), "prediction_resident_hit",
-                                                 ctx=ctx or NO_CTX, key=k, cause_id=named[k]))
+                                                 ctx=ctx or NO_CTX, key=k, cause_id=named[k][0]))
         wrong = []
         # Attempts retired earlier for this layer: the read happened, so it counts, but it can
         # only ever have failed to serve demand.
-        for _sl, _g, _cause, _sq, _k in self._expired.pop(layer, []):
-            if self._cohort_end is not None and _sq > self._cohort_end:
+        for att in self._expired.pop(layer, []):
+            if not att.scored:
                 continue
-            self.pf.evicted_before_use += 1
+            if att.terminal == "failed":
+                self.pf.failed_before_use += 1
+            else:
+                self.pf.evicted_before_use += 1
             self.pf.wasted += 1
 
         for key in [k for k in self._spec if k[0] == layer]:
-            slot, gen, cause, seq = self._spec.pop(key)
-            if self._cohort_end is not None and seq > self._cohort_end:
-                continue          # issued during settlement: outside the scored cohort
+            att = self._spec.pop(key)
+            slot, gen, cause = att.slot, att.gen, att.cause_id
+            if not att.scored:
+                continue          # issued during settlement: ran and contended, not counted
             if key in want:
                 # RESIDENT NOW, not "was ready once". _spec is independent of residency and
                 # SlotReady keeps (slot, gen) readiness for the life of the process, so a prefetch
@@ -314,17 +318,19 @@ class Engine:
             if old is None:
                 live.append(k)
                 continue
-            _sl, _g, _c, _sq = old
-            still = (self.slots.lru.get(k) == _sl and self.slots.gen.get(_sl) == _g)
+            still = (self.slots.lru.get(k) == old.slot and self.slots.gen.get(old.slot) == old.gen)
             if still:
                 continue                      # genuinely outstanding or resident: no duplicate
             # DEAD. Suppressing the retry made the scheduler "earliest prediction wins forever":
             # a prediction that loaded at L0 and was evicted at L7 blocked every closer prediction
             # for the same key until L16, where it could only ever classify as evicted_before_use.
             # Retire it so it still accounts, and let the nearer prediction through.
-            self._expired.setdefault(k[0], []).append(old + (k,))
+            st = self.loader.ready.state(old.slot, old.gen)
+            old.terminal = "failed" if st == "error" else "evicted"
+            self._expired.setdefault(k[0], []).append(old)
             del self._spec[k]
-            self.pf.reissued += 1
+            if old.scored:
+                self.pf.reissued += 1
             live.append(k)
         keys = live
         # One id per prediction batch, carried by every event that batch causes, so a prediction's
@@ -332,9 +338,12 @@ class Engine:
         # the schema did not have it.
         pred_id = next_span()
         for k in keys:
-            self._pred.setdefault(k[0], {})[k] = pred_id
+            # the scored bit travels with the PREDICTION too: a resident-correct prediction never
+            # becomes a fetch, so a fetch-sequence cutoff could never have gated it.
+            self._pred.setdefault(k[0], {})[k] = (pred_id, self._scoring)
         to_load, refused = self.slots.reserve_speculative(keys)
-        self.pf.refused += refused
+        if self._scoring:
+            self.pf.refused += refused
         if self.obs.enabled:
             self.obs.safe_emit(Event(now_ns(), "prediction", ctx=ctx or NO_CTX, cause_id=pred_id,
                                      value=len(keys), aux=self.prefetch.name))
@@ -344,9 +353,9 @@ class Engine:
         if not to_load:
             return
         for key, slot, gen in to_load:
-            self._seq += 1
-            self._spec[key] = (slot, gen, pred_id, self._seq)
-        self.pf.issued += len(to_load)
+            self._spec[key] = SpecAttempt(key, slot, gen, pred_id, scored=self._scoring)
+        if self._scoring:
+            self.pf.issued += len(to_load)
         if self.obs.enabled:
             for k, sl, g in to_load:
                 # source_layer / horizon travel with the event, so a prediction's whole life is
@@ -354,7 +363,8 @@ class Engine:
                 self.obs.safe_emit(Event(now_ns(), "prefetch_issued", ctx=ctx or NO_CTX, key=k,
                                          slot=sl, gen=g, cause_id=pred_id,
                                          aux=(layer, self.prefetch.horizon, self.prefetch.name)))
-        self.loader.submit(to_load, speculative=True, ctx=ctx or NO_CTX, cause_id=pred_id)
+        self.loader.submit(to_load, speculative=True, ctx=ctx or NO_CTX, cause_id=pred_id,
+                           scored=self._scoring)
 
     def decode(self, steps: int) -> Counters:
         """Run `steps` decode steps. Where the expert ids come from is the provider's business."""
@@ -427,14 +437,18 @@ class Engine:
             raise RuntimeError(f"settle({layers}) needs {layers} more calls, trace has {avail}")
         import copy
         saved_c = copy.copy(self.c)
-        self._cohort_end = self._seq                 # everything after this is unscored
+        self._scoring = False                        # run and contend, but do not count
         ran = 0
         try:
-            for i in range(layers):
-                self.decode_layer(i % N_LAYERS,
-                                  OpContext(self.request_id, self.c.steps, i % N_LAYERS))
+            for _ in range(layers):
+                # CONTINUE the sequence, do not restart it. `i % N_LAYERS` happened to be right
+                # only when settle() ran immediately after a whole number of steps; a second
+                # settle, or one after a partial step, desynced against the replay.
+                layer = self.leaves.calls[self.leaves.i][0]
+                self.decode_layer(layer, OpContext(self.request_id, self.c.steps, layer))
                 ran += 1
         finally:
+            self._scoring = True                     # restored: a later decode is scored again
             wall, steps = self.c.wall_s, self.c.steps
             self.c = saved_c                         # timed counters are the window's, not this
             self.c.wall_s, self.c.steps = wall, steps
@@ -461,7 +475,7 @@ class Engine:
             # settle first: classify what the window issued but did not reach
             self.settle(settle_layers)
         if cancel_outstanding:
-            pending = [(k, sl, g) for k, (sl, g, _c) in self._spec.items()]
+            pending = [(a.key, a.slot, a.gen) for a in self._spec.values()]
             if pending:
                 q, r, f = self.loader.cancel(pending)
                 self.pf.cancelled_queued += q
@@ -475,6 +489,7 @@ class Engine:
         self.loader.quiesce(timeout)
         self.loader.drain_forgets()
         self.pf.started = self.loader.started_spec
+        self.pf.started_cohort = self.loader.started_spec_scored
 
     def warm(self, calls, upto: int) -> None:
         """Bring the cache to the state the scored window starts in, with no I/O and no timing.

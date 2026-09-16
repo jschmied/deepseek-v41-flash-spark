@@ -33,6 +33,29 @@ import dataclasses
 from .trace import N_LAYERS
 
 
+@dataclasses.dataclass(slots=True)
+class SpecAttempt:
+    """One speculative attempt, from prediction to terminal state.
+
+    This exists because the same information was an anonymous tuple that changed shape three times
+    -- (slot, gen), then +cause_id, then +seq -- and the last change broke
+    finalize_stats(cancel_outstanding=True) at runtime, because one unpack site was missed. A named
+    object makes that class of regression a NameError at edit time instead of a ValueError in a
+    benchmark.
+
+    `scored` is per attempt rather than a global sequence cutoff: settlement runs the predictor and
+    its physical work, and only the STATISTICS are withheld. A global cutoff also leaked -- it
+    stayed set after settle(), so any later decode on the same Engine was permanently unscored.
+    """
+
+    key: tuple
+    slot: int
+    gen: int
+    cause_id: int
+    scored: bool = True
+    terminal: str | None = None      # why it ended: evicted / failed / wrong / used
+
+
 @dataclasses.dataclass
 class PrefetchStats:
     """TWO PRECISIONS, and the gap between them is a finding, not bookkeeping noise.
@@ -93,17 +116,11 @@ class PrefetchStats:
     started: int = 0
     refused: int = 0         # predictions the store had no free slot for
 
-    @property
-    def started_cohort(self) -> int:
-        """Reads that started AND belong to the scored cohort.
-
-        `started` is the loader's raw count and includes reads issued during settlement, which are
-        deliberately not scored. Dividing cohort hits by a whole-run denominator understates
-        precision by exactly the settlement tail -- 264 vs 248 on one arm. Every classified outcome
-        that involved a real read, and nothing else.
-        """
-        return (self.ready_hit + self.late_hit + self.evicted_before_use
-                + self.failed_before_use + self.discarded_running + self.discarded_finished)
+    # Reads that started AND are scored. MEASURED at the read leaf by the loader, not reconstructed
+    # from outcomes: an injected failure raises BEFORE started_spec increments, so summing outcome
+    # buckets counted a read that provably never reached the leaf. Set from
+    # LoaderService.started_spec_scored by finalize_stats().
+    started_cohort: int = 0
 
     @property
     def precision(self) -> float:

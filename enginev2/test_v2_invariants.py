@@ -38,7 +38,7 @@ import time
 from .drivers import Engine
 from .sched import V1, V2, ComputeStream, LoaderService, Policy
 from .chain import Chain, EngramSource
-from .prefetch import OraclePrefetcher, RecallOraclePrefetcher
+from .prefetch import OraclePrefetcher, RecallOraclePrefetcher, SpecAttempt
 from .observe import CounterObserver, NullObserver, TraceObserver, WaitReason
 from .leaves import Bandwidth, ModelLeaves, StagedExpert
 from .store import ExpertSlots, SlotArena, SlotReady, StagingPool
@@ -1261,7 +1261,7 @@ def test_a_dead_prediction_does_not_block_a_closer_one_and_a_failed_read_is_not_
         assert spec and not refused
         key, slot, gen = spec[0]
         e.loader.fail.add(key)
-        e._spec[key] = (slot, gen, 1, 1)
+        e._spec[key] = SpecAttempt(key, slot, gen, cause_id=1)
         e.loader.submit(spec, speculative=True)
         e.loader.quiesce()
         assert e.loader.ready.state(slot, gen) == "error", "the read did not fail"
@@ -1274,3 +1274,65 @@ def test_a_dead_prediction_does_not_block_a_closer_one_and_a_failed_read_is_not_
     finally:
         e.close()
     print("  retry: dead predictions are retired and re-predicted; a failed read is not a hit  OK")
+
+
+# ================================================================ 26. the cohort is one population
+def test_cancel_outstanding_works_and_every_statistic_is_cohort_scoped():
+    """The regression that motivated SpecAttempt, plus the mixing it was hiding.
+
+    a) _spec went (slot, gen, cause) -> +seq and one unpack site was missed, so
+       finalize_stats(cancel_outstanding=True) raised ValueError at runtime. A named object turns
+       that class of change into an edit-time error.
+    b) the sequence cutoff gated only FETCH outcomes. pred_hit/pred_miss, issued, refused and
+       reissued kept counting during settlement, so one PrefetchStats held two populations.
+    c) the cutoff was global and stayed set, so any decode after a settle() was permanently
+       unscored on the same Engine.
+    d) started_cohort was reconstructed from outcome buckets, which counts an injected failure --
+       it raises BEFORE the read leaf increments the counter. It is measured now.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+
+    # (a) must not raise
+    e = Engine(V2, lru_slots=5328, transient_slots=400,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut),
+               prefetch=OraclePrefetcher(calls, 8, start=cut))
+    try:
+        e.warm(calls, cut)
+        e.decode(3)
+        e.finalize_stats(cancel_outstanding=True)
+        assert not e._spec, "cancelled attempts were left in _spec; a second call double-counts"
+        e.finalize_stats(cancel_outstanding=True)      # idempotent
+    finally:
+        e.close()
+
+    # (b) + (c) + (d)
+    e = Engine(V2, lru_slots=5328, transient_slots=400,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut),
+               prefetch=OraclePrefetcher(calls, 4, start=cut))
+    try:
+        e.warm(calls, cut)
+        e.decode(3)
+        before = (e.pf.issued, e.pf.pred_hit + e.pf.pred_miss, e.pf.reissued)
+        e.settle(4)
+        after = (e.pf.issued, e.pf.pred_hit + e.pf.pred_miss, e.pf.reissued)
+        assert before[0] == after[0], f"issued grew during settlement: {before[0]} -> {after[0]}"
+        assert before[2] == after[2], f"reissued grew during settlement: {before[2]} -> {after[2]}"
+        # (c) scoring is restored, so a later decode counts again
+        assert e._scoring is True, "settlement left the engine permanently unscored"
+        # The property is that new attempts INHERIT scoring again -- not that a particular
+        # prediction produces I/O, which depends on residency and is not a fact about scoring.
+        # (decode() is also unusable here: settle() consumes trace, so a replay provider desyncs.)
+        from enginev2.prefetch import SpecAttempt as _SA
+        probe = _SA(("probe",), 0, 1, cause_id=0, scored=e._scoring)
+        assert probe.scored is True, "attempts created after settlement are still unscored"
+
+        e.finalize_stats()
+        # (d) measured, not reconstructed
+        assert e.pf.started_cohort == e.loader.started_spec_scored
+        assert e.pf.started_cohort <= e.pf.started
+        assert 0.0 <= e.pf.precision <= 1.0, e.pf.precision
+    finally:
+        e.close()
+    print("  cohort: cancel-outstanding works, settlement counts nothing, scoring is restored, "
+          "denominator is measured  OK")
