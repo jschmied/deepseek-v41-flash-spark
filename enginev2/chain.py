@@ -134,7 +134,7 @@ class EngramSource:
 
     name = "null"
 
-    def issue(self, layers, step: int, chain: "Chain") -> None:
+    def issue(self, layers, step: int, chain: "Chain", ctx=None, scored: bool = True) -> None:
         """Start this step's reads and SIGNAL each layer as its rows land.
 
         Event-based on purpose: a blocking `join(layer)` would hide the edge inside a call, and the
@@ -144,4 +144,4 @@ class EngramSource:
         the edge still EXISTS, which is the point.
         """
         for L in layers:
-            chain.set("engram", L)
+            chain.set("engram", L, ctx=ctx, scored=scored)

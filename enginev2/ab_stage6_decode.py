@@ -32,9 +32,14 @@ sys.path.insert(0, os.path.join(V1, "tools"))
 os.chdir(V1)
 
 from engine.v41_engine import V41Engine              # noqa: E402
-from enginev2.real import RealLeaves                 # noqa: E402
+from enginev2.real import RealEngramSource, RealLeaves   # noqa: E402
 from enginev2.sched import Policy                    # noqa: E402
 
+if "ENGRAM" not in os.environ:
+    raise RuntimeError(
+        "set ENGRAM=1 (the production model) or ENGRAM=0 (ablated) explicitly -- this benchmark "
+        "measured the ablated model for a whole day because zeroed eg_rows were the quiet default")
+ENGRAM = os.environ["ENGRAM"] == "1"
 ARM = os.environ.get("ARM", "v2")
 STEPS = int(sys.argv[1]) if len(sys.argv) > 1 else 30
 RECORD = 13_774_848
@@ -64,9 +69,20 @@ st0 = dict(eng.store.stats)
 
 if ARM == "v1":
     blk = block0
+    layer_ids = tuple(eng.args.engram_layer_ids)
+
+    def eg_futs(blk_, pos_):
+        """v1's own engram path: hash, D2H the ids before any graph is queued, submit both tables."""
+        h_np = m.hash_state(blk_[None], pos_)[0].cpu().numpy()
+        return {L: (eng.eg_pool.submit(eng.tables[L].read_raw, h_np[:, li, :]),
+                    eng.tables[L].to_device)
+                for li, L in enumerate(layer_ids)}
+
     t0 = time.perf_counter()
     for step in range(STEPS):
-        lg, _ = fd.step(blk, m.c.len, {})
+        pos = m.c.len
+        rows = (lambda _f=eg_futs(blk, pos): _f) if ENGRAM else {}
+        lg, _ = fd.step(blk, pos, rows)
         blk = next_block(lg, step + 1)
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
@@ -82,6 +98,8 @@ else:
     v2drivers.N_LAYERS = eng.args.n_layers
     rl = RealLeaves(os.path.expanduser("~/dsv41-cb3/experts-cb3-s3.bin"), eng.arena)
     rl.attach(eng, block0, next_block=next_block)
+    eg_src = RealEngramSource(eng, rl) if ENGRAM else None
+    rl.engram = eg_src
     # Count lookups the way v1's store does -- unique experts per layer -- or the hit rates are
     # two different quantities printed under one name.
     uniq_lookups = [0]
@@ -99,7 +117,8 @@ else:
                           lru_slots=eng.store.n_slots - 8, transient_slots=8,
                           n_workers=int(os.environ.get("V2_WORKERS", 8)), staging=staging,
                           expert_read_qd=int(os.environ.get("V2_QD", 8)),
-                          h2d_inflight=int(os.environ.get("V2_H2D", 2)), leaves=rl)
+                          h2d_inflight=int(os.environ.get("V2_H2D", 2)), leaves=rl,
+                          engram=eg_src)
     # SEED v2's slot table from v1's, so both arms start from the same physical residency.
     # Without this v2 faults in 2,367 experts v1 already has and the A/B measures the warm start.
     for k, slot in eng.store.lru.items():
@@ -128,6 +147,7 @@ if ARM != "v1":
           f"compute_barrier_global={pol.compute_barrier_global} "
           f"lease_until_completion={pol.lease_until_completion} "
           f"global_barrier={pol.global_barrier}")
+print(f"  engram {'LIVE' if ENGRAM else 'ABLATED'}")
 print(f"ARM {ARM}  steps {STEPS}  wall {wall:.2f}s  {STEPS / wall:.3f} steps/s")
 print(f"  experts read {reads}  {gb:.2f} GB  read_s {read_s:.2f}  "
       f"per-read {gb / read_s if read_s else 0:.2f} GB/s  "

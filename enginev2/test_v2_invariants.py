@@ -549,10 +549,10 @@ def test_declared_edges_are_load_bearing_not_decorative():
     cut = warmup_cut(calls)
 
     class SkipsOneLayer(EngramSource):
-        def issue(self, layers, step, chain):
+        def issue(self, layers, step, chain, ctx=None, scored=True):
             for L in layers:
                 if L != 7:
-                    chain.set("engram", L)
+                    chain.set("engram", L, ctx=ctx, scored=scored)
 
     e = Engine(V2, lru_slots=5328, transient_slots=400, scale=SCALE,
                leaves=ModelLeaves(calls, Bandwidth(scale=SCALE), scale=SCALE, start=cut),
@@ -1557,3 +1557,38 @@ def test_demand_work_during_settlement_is_not_labelled_measured():
               f"none labelled measured  OK")
     finally:
         e.close()
+
+
+def test_speculation_cannot_evict_the_current_layers_slots():
+    """Review 2026-09-16, item 1. Speculation is issued after bind_slots() has baked slot numbers
+    into the provider's route-aligned tensor but BEFORE graph B reads them. A slot in that set must
+    not be a legal victim.
+
+    The fixture is built so POLICY cannot hide the bug: the current layer's keys are made the
+    LEAST attractive victims-by-accident is exactly what masks this in production, so here they are
+    deliberately the OLDEST entries in the LRU and therefore the first victims any ordinary policy
+    would choose. Without protected_slots the speculative reservation takes them.
+    """
+    sl = ExpertSlots(lru_slots=6, transient_slots=8, policy="lru")
+
+    # six residents; the first three are oldest and would be evicted first
+    for i in range(6):
+        slot_of, to_load, _ = sl.reserve(0, (i,), prefill=False)
+        sl.clear_pending(slot_of[i], sl.gen[slot_of[i]])
+
+    current = {0: sl.lru[(0, 0)], 1: sl.lru[(0, 1)], 2: sl.lru[(0, 2)]}   # the oldest three
+    live = frozenset(current.values())
+
+    spec, refused = sl.reserve_speculative([(0, 90), (0, 91), (0, 92)], protected_slots=live)
+    got = {s for _k, s, _g in spec}
+    assert not (got & live), (
+        f"speculation took live slots {sorted(got & live)}; graph B is about to read them")
+    assert len(spec) + refused == 3
+
+    # and the protection is not a blanket refusal: with nothing live, the same call places them
+    sl2 = ExpertSlots(lru_slots=6, transient_slots=8, policy="lru")
+    for i in range(6):
+        so, _tl, _ = sl2.reserve(0, (i,), prefill=False)
+        sl2.clear_pending(so[i], sl2.gen[so[i]])
+    spec2, refused2 = sl2.reserve_speculative([(0, 90), (0, 91), (0, 92)])
+    assert len(spec2) == 3 and refused2 == 0, (len(spec2), refused2)

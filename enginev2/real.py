@@ -140,6 +140,20 @@ class RealLeaves(Leaves):
         import threading
         self._ctr = threading.Lock()
         self._tls = threading.local()
+        # PER-SLOT READER LIFETIME, on the device. ComputeStream.run(slots) models a slot as being
+        # read for the lifetime of the Python call, which is true for a modelled leaf and FALSE
+        # here: layer_b replays a graph and returns while the GPU is still reading the arena. So
+        # the host-side wait_slot_free() sees readers[] already at zero and D1-off would let a copy
+        # overwrite a slot the current graph is mid-read of. One event per LAYER, shared by every
+        # slot that layer bound -- thousands of events are not needed and not wanted.
+        #
+        # Initialised HERE, not in attach(): h2d() reads it, and the I/O half of this provider is
+        # used without a graph half at all (test_real_leaves drives read/h2d directly). Putting it
+        # in attach() made that path raise AttributeError -- caught by that test, 2026-09-16.
+        self._last_reader: dict = {}
+        self._reader_lk = threading.Lock()
+        self._bound_slots: frozenset = frozenset()
+        self.reader_waits = 0
         self._v1_on_path()
         from engine.cb3_cache import CB3Cache
         self.cache = CB3Cache(cb3_path, device)
@@ -203,6 +217,16 @@ class RealLeaves(Leaves):
         if st is None:
             st = self._tls.stream = torch.cuda.Stream()
             self._tls.events = []
+        # THE REAL per-slot write-after-read edge. Not wait_stream(compute), which would take
+        # everything queued on the compute stream up to NOW -- including work queued after this
+        # read began, which is the defect v1 carries (experts.py records its event inside the sink,
+        # after the ~5 ms read). This waits for ONE event: the last graph that actually read this
+        # slot.
+        with self._reader_lk:
+            ev_prev = self._last_reader.get(slot)
+        if ev_prev is not None:
+            st.wait_event(ev_prev)
+            self.reader_waits += 1
         with torch.cuda.stream(st):
             self.cache.load_slot(self.arena, slot, staged.payload, non_blocking=True)
             ev = torch.cuda.Event()
@@ -289,20 +313,34 @@ class RealLeaves(Leaves):
             self.engram.deliver(layer, self.fd)
         self._gA[layer].replay()
         idx = self.fd.route_idx
-        return RouteResult(uniq=tuple(sorted(set(idx.flatten().tolist()))), opaque=idx)
+        flat = idx.flatten().tolist()          # the one unavoidable D2H: the cache lookup is on the host
+        return RouteResult(uniq=tuple(sorted(set(flat))), opaque=idx, flat_cpu=flat)
 
     def bind_slots(self, route: RouteResult, slot_of: dict) -> None:
         """Give graph B its route-aligned slot tensor. This is v1's `self.slots.copy_(slots)`, with
         the mapping coming from v2's ExpertSlots instead of v1's store."""
         import torch as _t
         idx = route.opaque
-        flat = idx.flatten().tolist()
+        # Reuse the host copy layer_a already paid for; a second .tolist() is a second D2H, and
+        # host synchronisation between layers is exactly what leaves the NVMe pipe empty.
+        flat = route.flat_cpu if route.flat_cpu is not None else idx.flatten().tolist()
         self.fd.slots.copy_(_t.tensor([slot_of[e] for e in flat], dtype=self.fd.slots.dtype,
                                       device=self.fd.slots.device).view_as(self.fd.slots))
+        self._bound_slots = frozenset(slot_of.values())
 
     def layer_b(self, layer: int, route: RouteResult) -> None:
-        """Graph B: routed MoE + shared expert + HC residual, over slots already resident."""
+        """Graph B: routed MoE + shared expert + HC residual, over slots already resident.
+
+        replay() QUEUES the graph; it does not run it. So the arena slots it reads stay live on the
+        device after this returns, and the only honest statement of "this slot is free again" is an
+        event recorded after the replay on the same stream. h2d() waits on it before overwriting.
+        """
         self._gB[layer].replay()
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream())
+        with self._reader_lk:
+            for sl in self._bound_slots:
+                self._last_reader[sl] = ev
 
     def step_other(self) -> None:
         """The final head graph."""
@@ -363,7 +401,7 @@ class RealEngramSource:
         self.rows_read = 0
         self.steps = 0
 
-    def issue(self, layers, step: int, chain) -> None:
+    def issue(self, layers, step: int, chain, ctx=None, scored: bool = True) -> None:
         import numpy as np  # noqa: F401
         fd = self.leaves.fd
         block = self.leaves.block_ids
@@ -376,10 +414,14 @@ class RealEngramSource:
             self._futs[L] = fut
             # The edge is signalled from a callback so the DRIVER only ever waits, and a layer
             # whose rows are already cached is released without a round trip.
-            fut.add_done_callback(lambda _f, _L=L: chain.set("engram", _L))
+            fut.add_done_callback(
+                lambda _f, _L=L: chain.set("engram", _L, ctx=ctx, scored=scored))
         for L in layers:
             if L not in self._futs:
-                chain.set("engram", L)                    # no rows for this layer; the edge is still real
+                # no rows for this layer; the edge is still real, and still carries the cohort --
+                # an edge set during settlement with scored defaulted to True is a settlement
+                # event wearing a measured event's label
+                chain.set("engram", L, ctx=ctx, scored=scored)
         self.steps += 1
 
     def deliver(self, layer: int, fd) -> None:

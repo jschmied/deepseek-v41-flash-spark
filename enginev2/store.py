@@ -659,7 +659,7 @@ class ExpertSlots:
         assert len(set(slot_of.values())) == len(slot_of), "slot collision in reserve()"
         return slot_of, to_load, to_wait
 
-    def reserve_speculative(self, keys) -> list:
+    def reserve_speculative(self, keys, protected_slots=frozenset()) -> list:
         """Allocate slots for PREDICTED keys without perturbing any cache statistic.
 
         A speculative touch must not count as a hit, must not advance the age/(1+count) clock and
@@ -670,10 +670,23 @@ class ExpertSlots:
         Refusal is normal, not an error: with pending-write protection the store can legitimately
         have no free slot, and a prefetcher that cannot place a key simply does not get it. The
         caller is told how many were refused.
+
+        `protected_slots` is the CURRENT LAYER'S slot set, and it is a correctness argument, not a
+        tuning knob. Speculation is issued after bind_slots() has already baked slot numbers into
+        the provider's route-aligned tensor but BEFORE graph B consumes them, so a slot that is
+        merely resident-and-unpinned is a legal victim as far as this function can see. Nothing
+        stopped it recycling a slot the very next compute is about to read.
+
+        That it has not been observed is a property of the POLICY, not of this code: LRU has just
+        moved those keys to MRU and age/(1+count) finds them unattractive, so both happen to pick
+        other victims. Under cache pressure, a different policy, or deeper lookahead, the same call
+        can hand out a slot that is already in fd.slots. Refusing to place a prediction costs one
+        prefetch; overwriting a live slot is silent numerical corruption, so the asymmetry decides
+        it. Reviewed and closed 2026-09-16.
         """
         to_load, refused = [], 0
         used = set()
-        inflight = self.pending_slots()
+        inflight = self.pending_slots() | frozenset(protected_slots)
         for key in keys:
             if key in self.lru or key in self.transient_map:
                 continue                                   # already resident: nothing to do

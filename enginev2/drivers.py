@@ -84,6 +84,9 @@ class Engine:
         # a correct prediction that was already cached never becomes a fetch, so scoring only the
         # fetches would credit the predictor with none of its cheap hits.
         self._pred: dict[int, dict] = {}       # target layer -> {key: cause_id}
+        # Slots the CURRENT layer has bound and graph B has not yet read. Speculation may not evict
+        # these -- see ExpertSlots.reserve_speculative's protected_slots.
+        self._layer_slots: frozenset = frozenset()
         self.c = Counters()
 
     def close(self):
@@ -186,6 +189,9 @@ class Engine:
         # Host bookkeeping, so it belongs BEFORE the wait: the real provider copies an index tensor
         # to the device here, which does not need the expert bytes to have arrived.
         self.leaves.bind_slots(route, slot_of)
+        # From here until graph B has consumed them, these slots are live: they are baked into the
+        # provider's slot tensor. Speculation issued below must not be able to evict one.
+        self._layer_slots = frozenset(slot_of.values())
 
         # Speculation is queued AFTER this layer's demand reads, at lower priority, so a demand
         # miss never sits behind a prefetch for a layer we have not reached.
@@ -223,6 +229,7 @@ class Engine:
         if e:
             self.obs.safe_emit(Event(now_ns(), "layer_b_end", ctx=ctx, scored=self._scoring))
         self.chain.set("h", layer, ctx=ctx, scored=self._scoring)            # B wrote h and pre_mix for the next layer
+        self._layer_slots = frozenset()        # B has consumed them; they are ordinary victims again
 
     # ------------------------------------------------------------------ prefetch bookkeeping
     def _replay_step(self) -> int:
@@ -403,7 +410,10 @@ class Engine:
                 tgt[k] = (pred_id, self._scoring)
             elif self._scoring and not prev[1]:
                 tgt[k] = (pred_id, True)          # upgrade; never the reverse
-        to_load, refused = self.slots.reserve_speculative(keys)
+        # The current layer's slots are OFF LIMITS to speculation: bind_slots has already written
+        # them into the provider's route-aligned tensor and graph B has not consumed them yet.
+        to_load, refused = self.slots.reserve_speculative(
+            keys, protected_slots=self._layer_slots)
         if self._scoring:
             self.pf.refused += refused
         if self.obs.enabled:
@@ -437,15 +447,19 @@ class Engine:
             # verify. Waited on before anything else runs, and the step-level event is keyed by step
             # number so the reset below cannot delete it before it has been consumed -- which is
             # what made this edge decorative until now.
+            # THIS step's context, built before the first wait that is attributed to it. It used
+            # to be constructed after, so the wait for the previous step's logits was filed under
+            # the previous iteration's ctx -- typically step-1/layer 39 -- and on the first step
+            # under a name that did not exist yet. Execution is unchanged; the trace was wrong.
+            ctx = OpContext(self.request_id, step, -1)
             if step:
                 self.chain.wait("logits", step - 1, ctx=ctx, scored=self._scoring)
             self.chain.reset(keep=("logits",))
-            ctx = OpContext(self.request_id, step, -1)
             # THE BLOCK FIRST, then the engram reads that hash it. v1 builds the verify block,
             # hashes it and submits both tables' reads before the step runs; issuing engram first
             # would read rows for the PREVIOUS step's tokens.
             self._compute(lambda: self.leaves.select_block(step))
-            self.engram.issue(range(N_LAYERS), step, self.chain)
+            self.engram.issue(range(N_LAYERS), step, self.chain, ctx=ctx, scored=self._scoring)
             # The step's own prologue, before any layer: see Leaves.begin_step.
             self._compute(lambda: self.leaves.begin_step(step))
             for layer in range(N_LAYERS):

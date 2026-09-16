@@ -9,6 +9,13 @@ Never `/proc/diskstats`.
 against a measured step of ~437 ms. So perfectly overlapping *all* compute with *all* I/O is worth
 **3.8 %**, and forking the shared expert alone (`C_IND` x 40 = 0.18 ms/step) is worth **0.04 %**.
 
+**That bound covers the COMPUTE-overlap levers only, and an earlier revision of this note
+overstated it as covering "all four dependency-graph projects".** It does not. `lease_until_completion`
+overlaps NVMe with H2D -- two I/O operations -- and nothing about GPU kernel busy time bounds that.
+The device-event experiment (`5d40062`) suggests the lever is small in practice, measured as a null,
+but "small when measured once" is not "bounded by 3.8 % as a matter of arithmetic". Corrected after
+review, 2026-09-16.
+
 That bounds the dependency-graph work. The coarse barriers are real -- `stream.wait_stream(compute)`
 is issued inside the sink *after* the read, so it waits on whatever was queued during it -- but the
 room behind them is nearly empty at this operating point.
@@ -90,6 +97,7 @@ identically -- but it does mean the absolute steps/s are not the server's, and t
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
-- Bounded here: every compute/IO overlap project, at 3.8 % combined.
+- Bounded here: every compute/IO overlap project, at 3.8 % combined. NOT every scheduler toggle --
+  see the correction in section 1; an NVMe/H2D overlap lever is outside that arithmetic.
 - Live: read depth. The oracle needs information no predictor has, and the transition table is
   negative on this instrument (job 265: every arm below its oracle, fetch precision 2.8-3.7 %).

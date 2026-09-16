@@ -60,7 +60,13 @@ class TraceOracle(Prefetcher):
         return tuple((L, int(e)) for e in ids) if ids else ()
 
 
-ENGRAM = os.environ.get("ENGRAM", "0") == "1"
+if "ENGRAM" not in os.environ:
+    raise RuntimeError(
+        "set ENGRAM=1 (the production model) or ENGRAM=0 (ablated, what every arm before 50bfdf2 "
+        "measured) explicitly. There is no default: the ablation is a DIFFERENT MODEL -- priced at "
+        "7.717 in the logits -- and it went unnoticed for a whole day precisely because it was the "
+        "quiet fallback.")
+ENGRAM = os.environ["ENGRAM"] == "1"
 
 
 def build(eng, obs=None, prefetch=None):
@@ -156,7 +162,16 @@ rl.layer_a = check
 t0 = time.perf_counter()
 c = e2.decode(STEPS)
 wall = time.perf_counter() - t0
-# The depth histogram is the TIMED window's, so drain before settlement adds its own reads.
+# TWO DIFFERENT QUESTIONS, two drains.
+#
+#   depth-over-time is a WALL-WINDOW statistic: what was in flight between t0 and t0+wall. It has
+#   to be drained here, before settlement issues reads of its own.
+#
+#   bytes is a CAUSAL question: what I/O did this window cause. A scored speculative read issued
+#   inside the window can start or finish just after it, and counting brackets inside the window
+#   silently drops it -- which is how "2393 against 2392 reads" could look like parity that the
+#   accounting had produced rather than found. Event.scored already follows the cohort across the
+#   async boundary, so the causal count is every scored nvme_start after settlement and quiesce.
 ev = obs.drain()
 # SETTLEMENT, the real-engine way. drivers.settle() is a replay mechanism and refuses a provider
 # that computes its own routes -- correctly, it drives decode_layer() without a step's chain.reset()
@@ -167,7 +182,24 @@ e2.prefetch = Prefetcher()
 e2._scoring = False
 e2.decode(2)
 e2.finalize_stats(settle_layers=0)
+e2.loader.quiesce(60.0)              # nothing still in flight when the causal count is taken
+ev_causal = obs.drain()
 e2.close(); rl.close()
+
+# Every scored nvme_start, wherever it physically landed. Settlement runs with scoring off, so its
+# own demand reads are excluded by the cohort bit rather than by a timestamp comparison.
+#
+# ev_causal ALONE, not ev + ev_causal: TraceObserver.drain() is a non-destructive SNAPSHOT of the
+# rings, not a drain, so the later call already contains the earlier one and adding them counted
+# every read twice. That produced a causal count of exactly 2x the window count, identical across
+# arms -- arithmetic, not measurement. Caught 2026-09-16 by the count being suspiciously round.
+causal_reads = sum(1 for e in ev_causal if e.kind == "nvme_start" and e.scored)
+# The rings are finite. If they wrapped, the earliest events are gone and the causal count is a
+# silent undercount, which is worse than no number at all -- so say so.
+ring_full = len(ev_causal) >= obs.effective_capacity
+if ring_full:
+    print(f"  WARNING: observer ring wrapped ({len(ev_causal)} >= {obs.effective_capacity}); "
+          f"the causal count is truncated and must not be compared across arms")
 
 marks = sorted((e.ts_ns, +1 if e.kind == "nvme_start" else -1)
                for e in ev if e.kind in ("nvme_start", "nvme_end"))
@@ -185,8 +217,9 @@ print(f"  engram {'LIVE' if ENGRAM else 'ABLATED'}"
          f", zeroed-layer fills {rl.engram_ablated}"))
 print(f"  route sequence reproduced: {agree[0]} layers match, {agree[1]} differ")
 print(f"ARM {ARM} horizon {HORIZON}  {STEPS} steps  wall {wall:.2f}s  {STEPS / wall:.3f} steps/s")
-print(f"  demand fetches {c.fetches}  reads issued {reads}  "
-      f"{reads * RECORD / 1e9:.2f} GB  achieved {reads * RECORD / wall / 1e9:.2f} GB/s")
+print(f"  demand fetches {c.fetches}  reads in the wall window {reads}  "
+      f"causal scored reads {causal_reads}  {causal_reads * RECORD / 1e9:.2f} GB  "
+      f"achieved {reads * RECORD / wall / 1e9:.2f} GB/s")
 print(f"  depth 0 {idle:.2f}s = {idle / span * 100:.1f}% of span   mean depth while reading "
       f"{sum(k * v for k, v in dur.items() if k) / 1e9 / busy if busy else 0:.2f}   "
       f"in-flight {reads * RECORD / busy / 1e9 if busy else 0:.2f} GB/s")

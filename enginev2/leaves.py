@@ -212,6 +212,12 @@ class RouteResult:
 
     uniq: tuple
     opaque: object = None
+    # The host copy of the route, if the provider already paid for the D2H building `uniq`.
+    # bind_slots needs the SAME list, and reading it off the device a second time is a second
+    # synchronisation between two layers -- which, now that the measured problem is an NVMe pipe
+    # that empties between layers, is the wrong thing to spend twice. None means "not available",
+    # and bind_slots falls back.
+    flat_cpu: object = None
 
 
 class StagedExpert:
