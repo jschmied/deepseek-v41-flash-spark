@@ -212,28 +212,104 @@ def evaluate(pred, test, topk, thresh, warm_steps=40):
                 wrong_per_layer=wrong_reads / scored_layers)
 
 
-steps, traced_miss_per_layer = load(TRACE)
-cut = int(len(steps) * 0.6)
-train, test = steps[:cut], steps[cut:]
-print(f"  {os.path.basename(TRACE)}: {len(steps)} decode steps, "
-      f"train {len(train)} / test {len(test)}, ~{np.mean([len(u) for u in steps[0]]):.1f} active/layer")
+DSPARK = "--dspark" in sys.argv
+if not DSPARK:
+    steps, traced_miss_per_layer = load(TRACE)
+    cut = int(len(steps) * 0.6)
+    train, test = steps[:cut], steps[cut:]
+    print(f"  {os.path.basename(TRACE)}: {len(steps)} decode steps, "
+          f"train {len(train)} / test {len(test)}, ~{np.mean([len(u) for u in steps[0]]):.1f} active/layer")
 
-first = True
-for P in (Popularity, Transition, PrevStepMiss):
-    p = P(train)
-    for topk in (1, 2):
-        for thresh in (-1e18, 4.0, 8.0, 16.0, 24.0):
-            r = evaluate(p, test, topk, thresh)
-            t = "none" if thresh < -1e17 else f"{thresh:.0f}"
-            if first:
-                first = False
-                # SELF-CHECK: the replay's own miss rate against the trace's recorded one. If these
-                # disagree the residency model is wrong and every recall below is against the wrong
-                # denominator -- which is exactly what happened at 2759 slots.
-                d = abs(r["miss_per_layer"] - traced_miss_per_layer) / max(1e-9, traced_miss_per_layer)
-                flag = "OK" if d < 0.15 else "MISMATCH -- recall below is not trustworthy"
-                print(f"  replay {r['miss_per_layer']:.2f} misses/layer vs trace {traced_miss_per_layer:.2f}"
-                      f"  ({d * 100:.0f}% apart) {flag}")
-            print(f"  {p.name:11s} top-{topk} thr {t:>4s}  "
-                  f"miss-recall {r['recall'] * 100:5.1f}%  fetch-prec {r['precision'] * 100:5.1f}%  "
-                  f"issued {r['issued']:6d}  wrong/layer {r['wrong_per_layer']:.2f}")
+    first = True
+    for P in (Popularity, Transition, PrevStepMiss):
+        p = P(train)
+        for topk in (1, 2):
+            for thresh in (-1e18, 4.0, 8.0, 16.0, 24.0):
+                r = evaluate(p, test, topk, thresh)
+                t = "none" if thresh < -1e17 else f"{thresh:.0f}"
+                if first:
+                    first = False
+                    # SELF-CHECK: the replay's own miss rate against the trace's recorded one. If these
+                    # disagree the residency model is wrong and every recall below is against the wrong
+                    # denominator -- which is exactly what happened at 2759 slots.
+                    d = abs(r["miss_per_layer"] - traced_miss_per_layer) / max(1e-9, traced_miss_per_layer)
+                    flag = "OK" if d < 0.15 else "MISMATCH -- recall below is not trustworthy"
+                    print(f"  replay {r['miss_per_layer']:.2f} misses/layer vs trace {traced_miss_per_layer:.2f}"
+                          f"  ({d * 100:.0f}% apart) {flag}")
+                print(f"  {p.name:11s} top-{topk} thr {t:>4s}  "
+                      f"miss-recall {r['recall'] * 100:5.1f}%  fetch-prec {r['precision'] * 100:5.1f}%  "
+                      f"issued {r['issued']:6d}  wrong/layer {r['wrong_per_layer']:.2f}")
+
+
+# --------------------------------------------------------------------------- DSpark
+def eval_dspark(path):
+    """Score the DSpark drafter's routing against the backbone's per-layer MISS set.
+
+    Two questions, in order, because the second is only interesting if the first says yes:
+
+      1. MUTUAL INFORMATION, not a model. For each backbone layer, does knowing which drafter
+         experts fired change the distribution over which backbone experts miss? Measured as the
+         lift of a count-based conditional over the per-layer miss prior -- the same estimator the
+         transition table used, so the numbers are comparable to 8419ade's.
+      2. Only if there is lift: build a predictor and measure fetch precision.
+
+    Trained on the first 60 % of steps and scored on the last 40 %, as before.
+
+    The drafter's vocabulary is its own 3 x 128, disjoint from the backbone's 384, so this learns
+    the cross-vocabulary mapping from counts rather than assuming one exists.
+    """
+    rows = [json.loads(l) for l in open(path)]
+    rows = rows[50:]                                  # drop the cold cache at the head of the run
+    cut = int(len(rows) * 0.6)
+    train, test = rows[:cut], rows[cut:]
+    D = 3 * 128
+
+    def dfeat(r):
+        out = set()
+        for k, layers in enumerate(r["d_idx"]):
+            for posn in layers:
+                for e in posn:
+                    out.add(k * 128 + int(e))
+        return sorted(out)
+
+    joint = np.zeros((N_LAYER, D, N_EXPERT), dtype=np.float32)
+    src = np.zeros((N_LAYER, D), dtype=np.float64)
+    prior = np.zeros((N_LAYER, N_EXPERT), dtype=np.float64)
+    nstep = np.zeros(N_LAYER, dtype=np.float64)
+    for r in train:
+        f = dfeat(r)
+        for lay in r["layers"]:
+            L, miss = lay["L"], lay.get("miss_ids")
+            if miss is None:
+                continue                              # older traces recorded only the miss COUNT
+            joint[L][np.ix_(f, miss)] += 1
+            src[L, f] += 1
+            prior[L, miss] += 1
+            nstep[L] += 1
+    if nstep.sum() == 0:
+        print("  the trace records miss COUNTS but not miss IDS; re-capture with miss_ids to score "
+              "DSpark. Nothing else in this function can run.")
+        return
+    cond = joint / np.maximum(src[:, :, None], 1.0)
+    pri = prior / np.maximum(nstep[:, None], 1.0)
+
+    hit = issued = need = 0
+    for r in test:
+        f = np.asarray(dfeat(r), dtype=np.int64)
+        for lay in r["layers"]:
+            L, miss = lay["L"], set(lay.get("miss_ids") or [])
+            need += len(miss)
+            if not miss or not len(f):
+                continue
+            s = (np.log(cond[L][f] + EPS) - np.log(pri[L] + EPS)[None, :]).sum(axis=0)
+            top = int(np.argmax(s))
+            issued += 1
+            if top in miss:
+                hit += 1
+    print(f"  dspark->miss  top-1  miss-recall {hit / max(1, need) * 100:5.1f}%  "
+          f"fetch-prec {hit / max(1, issued) * 100:5.1f}%  issued {issued}  "
+          f"(baseline: popularity was 6.2 % precision on the route trace)")
+
+
+if DSPARK:
+    eval_dspark(sys.argv[sys.argv.index("--dspark") + 1])
