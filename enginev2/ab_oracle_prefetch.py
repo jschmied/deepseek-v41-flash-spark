@@ -29,6 +29,15 @@ from enginev2.prefetch import Prefetcher             # noqa: E402
 from enginev2.real import RealLeaves                 # noqa: E402
 from enginev2.sched import Policy                    # noqa: E402
 
+# ONE PASS PER PROCESS. The in-process rewind (c.rollback(0) + begin_prompt) restores decode
+# state exactly at 8 steps and NOT at 30: with STEPS=6 pass 2 reproduced 240/240 recorded layer
+# routes, with STEPS=30 it differed at the very first layer, (0,0). Measured 2026-09-16; the cause
+# is not established and does not need to be, because the fix removes the rewind entirely. PASS=rec
+# records the true routes to ROUTES and exits; PASS=run loads them into a FRESH engine. Each arm
+# therefore starts from its own cold engine and its own prefill, which is also what made the
+# stage-6 A/B trustworthy.
+PASS = os.environ.get("PASS", "run")
+ROUTES = os.environ.get("ROUTES", "/tmp/ds41_routes.json")
 ARM = os.environ.get("ARM", "oracle")
 HORIZON = int(os.environ.get("HORIZON", 1))
 STEPS = int(sys.argv[1]) if len(sys.argv) > 1 else 30
@@ -90,32 +99,65 @@ lg = prefill()
 T = fd.ids.numel()
 nb = lambda l, s: torch.full((T,), int(l[-1].argmax()), dtype=torch.long, device="cuda")
 
-# ---- pass 1: record the true routes. Untimed; its only output is the route table.
-routes = {}
-e2, rl = build(eng)
-rl.attach(eng, nb(lg, 0), next_block=nb)
-_la = rl.layer_a
-def spy(L, _f=_la):
-    r = _f(L)
-    routes[(e2.c.steps, L)] = r.uniq
-    return r
-rl.layer_a = spy
-e2.decode(STEPS)
-e2.close(); rl.close()
-print(f"  recorded {len(routes)} routes over {STEPS} steps")
+if PASS == "rec":
+    # ---- record the true routes and exit. Untimed; its only output is the route table.
+    routes = {}
+    e2, rl = build(eng)
+    rl.attach(eng, nb(lg, 0), next_block=nb)
+    _la = rl.layer_a
+    def spy(L, _f=_la):
+        r = _f(L)
+        routes[(e2.c.steps, L)] = list(r.uniq)
+        return r
+    rl.layer_a = spy
+    e2.decode(STEPS)
+    e2.close(); rl.close()
+    import json
+    json.dump({f"{s_}:{l_}": v for (s_, l_), v in routes.items()}, open(ROUTES, "w"))
+    print(f"  recorded {len(routes)} routes over {STEPS} steps -> {ROUTES}")
+    sys.exit(0)
 
-# ---- pass 2: the timed arm, from the same prefilled state and the same residency
-m.c.rollback(m.c.len - m.c.len)
-lg = prefill()
+import json                                          # noqa: E402
+routes = {tuple(int(x) for x in k.split(":")): tuple(v)
+          for k, v in json.load(open(ROUTES)).items()}
+print(f"  loaded {len(routes)} recorded routes from {ROUTES}")
+
+# ---- the timed arm, in its own process, from its own cold engine and prefill
 obs = TraceObserver(capacity=1 << 18)
 pf = TraceOracle(routes, HORIZON) if ARM == "oracle" else None
 e2, rl = build(eng, obs=obs, prefetch=pf)
 rl.attach(eng, nb(lg, 0), next_block=nb)
+# DOES THE ORACLE ACTUALLY KNOW THE FUTURE? Pass 2 must walk the same route sequence pass 1
+# recorded, or the "oracle" is a random predictor wearing the name and every number below is about
+# something else. Checked, not assumed: the first run of this harness reported pred_miss 11145
+# against pred_hit 2837, which for a trace-reading oracle is impossible and was the tell.
+agree = [0, 0]
+_la2 = rl.layer_a
+def check(L, _f=_la2):
+    r = _f(L)
+    want = routes.get((e2.c.steps, L))
+    ok = want == r.uniq
+    agree[0 if ok else 1] += 1
+    if not ok and agree[1] == 1:
+        print(f"  first mismatch at key {(e2.c.steps, L)}: "
+              f"recorded {None if want is None else want[:6]} got {r.uniq[:6]}  "
+              f"(recorded keys start {sorted(routes)[:2]})")
+    return r
+rl.layer_a = check
 t0 = time.perf_counter()
 c = e2.decode(STEPS)
 wall = time.perf_counter() - t0
-st = e2.finalize_stats()
+# The depth histogram is the TIMED window's, so drain before settlement adds its own reads.
 ev = obs.drain()
+# SETTLEMENT, the real-engine way. drivers.settle() is a replay mechanism and refuses a provider
+# that computes its own routes -- correctly, it drives decode_layer() without a step's chain.reset()
+# or engram.issue(). The equivalent here is real decode steps with prediction OFF and scoring off:
+# predictions issued near the end of the window get CLASSIFIED instead of right-censored, and they
+# contend for the device exactly as they really would.
+e2.prefetch = Prefetcher()
+e2._scoring = False
+e2.decode(2)
+e2.finalize_stats(settle_layers=0)
 e2.close(); rl.close()
 
 marks = sorted((e.ts_ns, +1 if e.kind == "nvme_start" else -1)
@@ -129,10 +171,11 @@ span = sum(dur.values()) / 1e9
 idle = dur[0] / 1e9
 busy = span - idle
 reads = len(marks) // 2
+print(f"  route sequence reproduced: {agree[0]} layers match, {agree[1]} differ")
 print(f"ARM {ARM} horizon {HORIZON}  {STEPS} steps  wall {wall:.2f}s  {STEPS / wall:.3f} steps/s")
 print(f"  demand fetches {c.fetches}  reads issued {reads}  "
       f"{reads * RECORD / 1e9:.2f} GB  achieved {reads * RECORD / wall / 1e9:.2f} GB/s")
 print(f"  depth 0 {idle:.2f}s = {idle / span * 100:.1f}% of span   mean depth while reading "
       f"{sum(k * v for k, v in dur.items() if k) / 1e9 / busy if busy else 0:.2f}   "
       f"in-flight {reads * RECORD / busy / 1e9 if busy else 0:.2f} GB/s")
-print(f"  prefetch: {st}")
+print(f"  prefetch: {e2.pf}")
