@@ -50,13 +50,42 @@ a 40 GB device arena, 862 MiB of pinned host memory and 96 threads did not lower
 Two later blocks, differing only in a variable that cannot touch the bare stage, read 6.76 GB/s and
 stayed there.
 
-Arena size explains nothing. **Order explains everything**: the first block after the job's
-`stop.sh` and memory-settle wait was slow; later blocks were not. That is also how the 4.99 GB/s
-"engine loaded, GPU idle" figure was taken -- seconds after a 40 GB warm start -- and possibly how
-every in-flight figure in section 3 was taken. Job 285 runs the identical block three times back to
-back, then after a 120 s idle, to separate a time-healed transient from a work-healed one.
+Arena size explains nothing.
 
-Until that lands, treat the ~4.9 GB/s in-flight ceiling as **unverified**.
+## 5. It is bimodal, and order does not explain it either (job 285)
+
+The identical block, five times, nothing varying but when it ran:
+
+| run | stage 0 (bare) | stage 4 |
+|---|---|---|
+| 1 back to back | 4.71 / 4.90 | 5.02 / 5.03 |
+| 2 back to back | **6.79 / 6.79** | 6.75 / 6.74 |
+| 3 back to back | 4.65 / 4.81 | 5.04 / 5.15 |
+| 4 after 120 s idle | 4.80 / 4.85 | 5.05 / 5.13 |
+| 5 after 120 s idle | 4.62 / 4.78 | 5.05 / 5.09 |
+
+So the "first block is slow" reading from job 280 was wrong too: four of five runs are ~4.8 and one
+is 6.8, and it is not position in the sequence, not time-healed, and flat across stages within each
+run. The box delivers 4.8 or 6.8 for the same work under nominally identical conditions.
+
+**A confound is identified and not yet excluded**: the watchdog restored a DS4.1 server at 11:28:56,
+three minutes before this job, and a restored server warm-starts by reading 40 GB. Whether a server
+was up, and what it was doing, was not recorded alongside these numbers. The re-run must record it.
+
+Until then, treat the ~4.9 GB/s in-flight ceiling in section 3 as **unverified**, and note that if
+the true rate is 6.8, the remaining gap in job 275 is made of something other than what section 3
+implies.
+
+## 6. Every number above was measured on an engram-ablated model
+
+`RealLeaves.begin_step` zeroed `eg_rows` whenever no source supplied them, and the stage-5 gate
+passed `{}` to v1 as well -- so both arms were ablated, agreed to 0.000e+00, and the gate was blind
+to it. The real source landed in `50bfdf2`; its mutation check prices the ablation at **7.717** in
+the logits.
+
+This does not invalidate the A/B comparisons in sections 2-4 -- both arms of each were ablated
+identically -- but it does mean the absolute steps/s are not the server's, and the engram stream's
+~144 rows per step of small reads were absent from the device contention those sections measure.
 
 ## What this closes and what it leaves
 
