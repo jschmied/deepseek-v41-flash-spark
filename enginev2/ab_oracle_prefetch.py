@@ -96,6 +96,31 @@ def build(eng, obs=None, prefetch=None):
     return e2, rl
 
 
+def warm_policy(e2, rl, routes, steps, n_layers):
+    """Give the eviction policy real HISTORY before the timed window.
+
+    Seeding calls on_insert(key, slot, 0) for every resident key, so all of them carry count 1 and
+    the same age. age/(1+count) then picks the count-1 bucket's LRU head -- which is LRU. Job 310
+    measured LRU twice and reported byte-identical fetch counts for both policies because of this,
+    not because the policies tie.
+
+    So replay recorded routes through the slot table first, untimed and with no reads: hits bump
+    use counts through on_hit exactly as a real run would, and the frequency signal the policy
+    exists to exploit is present when the measurement starts.
+    """
+    seen = 0
+    for st in range(steps):
+        for L in range(n_layers):
+            u = routes.get((st, L))
+            if not u:
+                continue
+            slot_of, to_load, _w = e2.slots.reserve(L, tuple(u), prefill=False)
+            for _k, sl, g in to_load:
+                e2.slots.clear_pending(sl, g)      # offline replay: the read "completes" at once
+            seen += 1
+    return seen
+
+
 eng = V41Engine(os.path.expanduser("~/dsv41-lean"), max_seq=8192,
                 arena_gb=float(os.environ.get("ARENA_GB", 40)),
                 spec=True, expert_format="cb3")
@@ -164,6 +189,11 @@ def check(L, _f=_la2):
               f"(recorded keys start {sorted(routes)[:2]})")
     return r
 rl.layer_a = check
+# Policy history before timing. WARM=0 reproduces job 310's flat-seeded behaviour for comparison.
+_warm = int(os.environ.get("WARM", 0))
+if _warm:
+    n = warm_policy(e2, rl, routes, min(_warm, STEPS), eng.args.n_layers)
+    print(f"  warmed the policy over {n} recorded layers before timing")
 t0 = time.perf_counter()
 c = e2.decode(STEPS)
 wall = time.perf_counter() - t0
