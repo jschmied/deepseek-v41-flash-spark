@@ -522,24 +522,54 @@ continuing the sweep. A missing cell, not a dead box.
 ## 19. The step, attributed at last (job 385)
 
 Wall time per driver phase, on the host, `DSV41_HOST_PROFILE=1`. 600 steps after a 150-step warm-up,
-engram live, `age_over_freq`. **Every figure below is the raw row divided by 1.25** -- see the bug
-note at the end of this section.
+engram live, `age_over_freq`. **The table below is job 390**, the clean re-run after the divisor bug
+described at the end of this section was fixed; job 385's columns are kept underneath it because the
+79 GB arm has not been re-measured.
 
-| phase | 79 GB | 86 GB | what it is |
+| phase | 86 GB rep 1 | rep 2 | what it is |
 |---|---|---|---|
-| `wait_reads` | 328.9 ms | **292.8 ms** | the driver blocked on this layer's expert misses |
-| `layer_a` | 122.4 ms | 122.1 ms | graph A replay + the synchronous D2H of `route_idx` |
-| `resolve` | 26.0 ms | 22.3 ms | settle, drain, reserve, submit, bind_slots, speculate |
+| `wait_reads` | 272.0 ms | 266.0 ms | the driver blocked on this layer's expert misses |
+| `layer_a` | 122.5 ms | 123.1 ms | graph A replay + the synchronous D2H of `route_idx` |
+| `resolve` | 24.3 ms | 24.2 ms | settle, drain, reserve, submit, bind_slots, speculate |
 | `end_step` | 6.2 ms | 6.2 ms | draft, verify, rollback |
-| `await_copies` | 2.6 ms | 2.5 ms | putting copy events on the compute stream |
-| `layer_b` | 2.2 ms | 2.2 ms | ENQUEUE only; the device work lands in the next sync |
-| `wait_engram` | 0.9 ms | 1.9 ms | |
-| `wait_h` | 0.04 ms | 0.03 ms | |
-| INSTRUMENTED | 491.6 ms | 451.7 ms | |
-| wall/step | 489.8 ms | 448.0 ms | residual -1.8 ms / -3.7 ms |
+| `await_copies` | 2.4 ms | 2.2 ms | putting copy events on the compute stream |
+| `layer_b` | 2.1 ms | 1.9 ms | ENQUEUE only; the device work lands in the next sync |
+| `wait_engram` | 2.0 ms | 1.0 ms | |
+| `begin_step` | 1.0 ms | 1.6 ms | |
+| INSTRUMENTED | 432.6 ms | 426.1 ms | |
+| wall/step | 445.6 ms | 439.1 ms | **residual +13.1 / +12.9 ms, 2.9 %** |
 
-**THE DRIVER'S TIME IS FULLY ACCOUNTED FOR.** The residual is under 1 %, so there is no hidden term:
-the step is read wait, graph A, and host resolve, in that order, and nothing else is material.
+Counts are right in this run -- `layer_a x40.0` for 40 layers, `begin_step x1.0` per step -- and the
+residual is positive and small, which is what says the instrument is now telling the truth.
+
+### Job 385's uncorrected run, and where my correction was wrong
+
+385's raw rows were scaled by the warm-up bug. I reported them divided by 1.25 and called that
+"exact, not an estimate". **That was wrong, and job 390 shows by how much.** Dividing by 1.25 is
+exact only for a phase whose per-call cost is the same in the warm-up as in the timed window:
+
+| phase | 385 / 1.25 | 390 measured | error |
+|---|---|---|---|
+| `layer_a` | 122.1 | 122.8 | +0.6 % |
+| `end_step` | 6.2 | 6.2 | 0 % |
+| `wait_reads` | 292.8 | 269.0 | **-8.1 %** |
+| `begin_step` | 1.65 | 1.26 | **-24 %** |
+
+The warm-up runs colder, so its misses cost more: the phases that BLOCK were inflated by more than
+1.25x and the phases that do constant work were inflated by exactly 1.25x. The correction had to be
+per-phase and I applied it uniformly. Nothing qualitative changes -- `wait_reads` still dominates at
+62 %, `layer_a` is still 29 % -- but the read-wait figure to quote is **269 ms, not 293 ms**.
+
+Job 385, raw rows divided by 1.25 (79 GB was measured only here), for the arena comparison only:
+
+| phase | 79 GB | 86 GB |
+|---|---|---|
+| `wait_reads` | 328.9 ms | 292.8 ms |
+| `layer_a` | 122.4 ms | 122.1 ms |
+| `resolve` | 26.0 ms | 22.3 ms |
+
+**THE DRIVER'S TIME IS FULLY ACCOUNTED FOR.** The residual is 2.9 %, so there is no hidden term: the
+step is read wait, graph A, and host resolve, in that order, and nothing else is material.
 
 **1. `wait_reads` is ~65 % of the step, and it is where the arena win lands.** 79 -> 86 GB moves
 `wait_reads` by -36.1 ms while `layer_a` moves by -0.3 ms. That was the pre-registered test of note
@@ -559,7 +589,7 @@ GPU work (~102 ms/step by job 355's node trace, plus launch and sync latency) an
 SERIAL against the 293 ms of read wait: A(L) -> wait(L) -> B(L) -> A(L+1), with the host blocked in
 between. Perfect overlap of compute with the read wait would give
 
-    max(293, 122) + 22 + 13 = 328 ms   against 448 ms today   = +37 %
+    max(269, 123) + 24 + 12 + 13 = 318 ms   against 442 ms today   = +39 %
 
 That supersedes the "every compute/IO overlap project, bounded at 3.8 % combined" line in the
 closing section, which came from the loader-overlap family on a modelled provider. The 3.8 % bound
@@ -598,7 +628,7 @@ effect replicates: **+9.3 % in 385 against +10.1 % in 381.**
 - Bounded here: every compute/IO overlap project, at 3.8 % combined. NOT every scheduler toggle --
   see the correction in section 1; an NVMe/H2D overlap lever is outside that arithmetic.
   **SUPERSEDED for the real engine by section 19**: that 3.8 % came from the loader-overlap family on
-  a modelled provider. Measured phases on the real one put compute/read-wait overlap at +37 %.
+  a modelled provider. Measured phases on the real one put compute/read-wait overlap at +39 %.
 - Closed by sections 8-9: prediction of expert IDENTITY, by any of co-occurrence, recurrence, or
   the DSpark drafter. Routing entropy 8.52/8.58 says there is almost nothing to infer.
 - Live, and non-predictive: CONCURRENCY. More requests in flight means more misses per layer to
