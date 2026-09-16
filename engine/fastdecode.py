@@ -90,6 +90,14 @@ def _draft_block() -> int:
 
 
 T_DRAFT = _draft_block()
+
+
+# Run the shared expert in its own CUDA graph so a driver can replay it while this layer's expert
+# reads are still in flight (notes section 19: the GPU work is strictly serial against a 293 ms
+# read wait). Off by default -- unset, _layer_b is the production path unchanged and no extra graph
+# is captured. This covers ONLY the shared expert, not the routed MoE, which is the bulk of the
+# overlap prize and needs a residency split with a fixed-order reduction.
+SHARED_FIRST = os.environ.get("DSV41_SHARED_FIRST") == "1"
 T_VERIFY = T_DRAFT + 1   # tok + T_DRAFT drafts
 
 
@@ -135,6 +143,9 @@ class FastDecoder:
         self.ffn_comb = torch.zeros(T, a.hc_mult, a.hc_mult, dtype=torch.float32, device=dev)
         self.ffn_pre = torch.zeros(T, a.hc_mult, dtype=torch.float32, device=dev)
         self.y = torch.zeros(T, a.dim, dtype=torch.bfloat16, device=dev)
+        # Carries the shared expert's output from its own graph into graph B. float32 because that
+        # is what graph B accumulates in. Allocated always, captured into only under the flag.
+        self.sh_out = torch.zeros(T, a.dim, dtype=torch.float32, device=dev)
         self.route_idx = torch.zeros(T, a.n_activated_experts, dtype=torch.long, device=dev)
         self.route_w = torch.zeros(T, a.n_activated_experts, dtype=torch.float32, device=dev)
         self.topk = torch.full((T, a.index_topk), -1, dtype=torch.long, device=dev)
@@ -172,6 +183,9 @@ class FastDecoder:
         self._premix0 = torch.zeros(T, a.hc_mult, dtype=torch.float32, device=dev)
         self._premix0[:, 0] = 1.0
         self.graphs = {}
+        # Parallel to self.graphs, and deliberately NOT inside it: several sites unpack that value
+        # as exactly five elements, so widening it there would break them silently.
+        self.graphs_shared = {}
         self.pool = None
         # resident mode: (layer, expert) -> arena slot as a device table, so the router's expert ids can be
         # turned into slots inside the graph and the whole layer is ONE graph (no host round-trip per layer)
@@ -322,6 +336,16 @@ class FastDecoder:
             self.nan_probe[0] += (~torch.isfinite(t)).sum()
             self.nan_probe[1] += 1
 
+    def shared_graph(self, parity: int, L: int):
+        """The shared-expert graph for (parity, layer), or None when SHARED_FIRST is off.
+
+        The graph key is the sequence parity -- capture uses `key = S_parity` and replay uses
+        `parity = S % 2` -- so this takes it as an argument instead of inventing its own notion of
+        which capture is live.
+        """
+        gs = self.graphs_shared.get(parity)
+        return gs[L] if gs else None
+
     def _layer_a(self, L, sh_state):
         """attention + HC + router for backbone layer L, reading self.h/self.pre_mix/self.pos."""
         a = self.a
@@ -366,11 +390,24 @@ class FastDecoder:
             self.rs_uniq[L] += self.rs_hits.sum()
         self._tap('moe_in', L, y); self._tap('route_idx', L, idx); self._tap('topk', L, self.topk)
 
+    def _layer_shared(self, L):
+        """The shared expert alone, into a float32 buffer.
+
+        It reads only `y`, which graph A wrote, so it has no dependency on this layer's expert
+        reads and can run while they are still in flight. Captured only under SHARED_FIRST.
+        """
+        a = self.a
+        w = self.W.layers[L]
+        self.sh_out.copy_(R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float())
+
     def _layer_b(self, L):
         a = self.a
         w = self.W.layers[L]
         out = self.m.moe_fn(self.y, self.slots, self.route_w, self.m.store.arena, a.swiglu_limit).float()
-        out += R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+        # Same two operands, same order, same dtypes as the unsplit version -- the shared term was
+        # merely computed earlier. float32 copy_ is exact, so this stays bit-identical.
+        out += (self.sh_out if SHARED_FIRST
+                else R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float())
         h = R.hc_post(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb)
         self.h.copy_(h); self.pre_mix.copy_(self.ffn_pre)
 
@@ -478,14 +515,17 @@ class FastDecoder:
         if self.pool is None:
             self.pool = torch.cuda.graph_pool_handle()
         st = {"parity": S_parity, "ckv": None, "ik": None, "ratio": 0}
-        gA, gB = [], []
+        gA, gB, gS = [], [], []
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             # warm-up run (allocations, triton compiles) on a scratch copy of the state
             saved = [self.h.clone(), self.pre_mix.clone()]
             for L in range(self.a.n_layers):
-                self._layer_a(L, st); self._layer_b(L)
+                self._layer_a(L, st)
+                if SHARED_FIRST:
+                    self._layer_shared(L)
+                self._layer_b(L)
             self._final(); self._draft()
             self.h.copy_(saved[0]); self.pre_mix.copy_(saved[1])
         torch.cuda.current_stream().wait_stream(s)
@@ -511,6 +551,8 @@ class FastDecoder:
             gD = torch.cuda.CUDAGraph()
             with torch.cuda.graph(gD, pool=self.pool):
                 self._draft()
+            # The LUT/segment path fuses A and B into one graph per segment, so there is no host
+            # gap to fill and nothing to split out. SHARED_FIRST does not apply here.
             self.graphs[key] = (None, None, None, gD, segs)
             torch.cuda.synchronize()
             return
@@ -525,6 +567,11 @@ class FastDecoder:
             with torch.cuda.graph(g, pool=self.pool):
                 self._layer_a(L, st)
             gA.append(g)
+            if SHARED_FIRST:
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=self.pool):
+                    self._layer_shared(L)
+                gS.append(g)
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g, pool=self.pool):
                 self._layer_b(L)
@@ -536,6 +583,7 @@ class FastDecoder:
         with torch.cuda.graph(gD, pool=self.pool):
             self._draft()
         self.graphs[key] = (gA, gB, gF, gD, None)
+        self.graphs_shared[key] = gS
         torch.cuda.synchronize()
 
     # ------------------------------------------------------------------ run
@@ -601,6 +649,12 @@ class FastDecoder:
                         self.stats["engram_s"] += time.perf_counter() - t0r
                     gA[L].replay()
                     if gB[L] is not None:
+                        # Under SHARED_FIRST the shared expert lives in its own graph and graph B
+                        # reads its output from sh_out. It MUST be replayed or B accumulates a
+                        # stale buffer -- wrong output, not slow output. Queued before the host
+                        # resolve so it overlaps that too, which is all the overlap this path has.
+                        if SHARED_FIRST:
+                            self.graphs_shared[parity][L].replay()
                         self._resolve(L)
                         gB[L].replay()
                 gF.replay()
@@ -613,7 +667,10 @@ class FastDecoder:
                     self.eg_rows[LL].copy_(finish(*f.result()))
             st = {"parity": parity, "ckv": None, "ik": None, "ratio": 0}
             for L in range(a.n_layers):
-                self._layer_a(L, st); self._resolve(L); self._layer_b(L)
+                self._layer_a(L, st)
+                if SHARED_FIRST:
+                    self._layer_shared(L)      # same reason as the graph path above
+                self._resolve(L); self._layer_b(L)
             self._final()
         # host-side bookkeeping for Caches.rollback (same tuple layout as model.py)
         for L in self.kvl_buf:
