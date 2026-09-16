@@ -67,6 +67,12 @@ if WARM:
     print(f"  warm {WARM} steps: {rl.tokens_out} tokens committed, "
           f"{e2.loader.started_demand} reads", flush=True)
 t_out0, reads0, acc0 = rl.tokens_out, rl.read_bytes, len(rl.accepted)
+# ENGRAM IS AN IOPS QUESTION, NOT A BYTES ONE. 144 rows per step at 264 B is ~0.003 % of decode
+# bytes, which is why it was written off -- but engram.py does TWO preads per row (weight then
+# scale, line 60), so that is ~288 operations per step against ~67-80 expert reads. On a device
+# whose binding constraint is operations in flight rather than GB/s, the small stream can cost more
+# than its bytes. These counters are the engine's own.
+eg0 = {L: dict(t.stats) for L, t in eng.tables.items()}
 
 torch.cuda.synchronize()
 t0 = time.perf_counter()
@@ -84,3 +90,13 @@ print(f"  steps/s {STEPS / wall:.3f}   accept_len_mean {st.mean(acc) + 1:.2f}  "
       f"(tokens per step {toks / STEPS:.2f})")
 print(f"  nvme {gb:.2f} GB  {gb * 1000 / max(1, toks):.1f} MB per committed token  "
       f"{(rl.read_bytes - reads0) / RECORD / max(1, toks):.1f} reads per token")
+if ENGRAM:
+    rows = sum(t.stats["rows"] - eg0[L]["rows"] for L, t in eng.tables.items())
+    calls = sum(t.stats["calls"] - eg0[L]["calls"] for L, t in eng.tables.items())
+    rd = sum(t.stats.get("read_s", 0.0) - eg0[L].get("read_s", 0.0) for L, t in eng.tables.items())
+    sec = sum(t.stats["seconds"] - eg0[L]["seconds"] for L, t in eng.tables.items())
+    print(f"  engram rows {rows} ({rows / STEPS:.0f}/step, {rows * 2} preads = "
+          f"{rows * 2 / STEPS:.0f}/step)  bytes {rows * 264 / 1e6:.1f} MB")
+    print(f"  engram read_s {rd:.2f}s ({rd / wall * 100:.1f} % of wall)  "
+          f"total_s {sec:.2f}s ({sec / wall * 100:.1f} % of wall)  "
+          f"{rd / max(1, rows) * 1e6:.0f} us per row")

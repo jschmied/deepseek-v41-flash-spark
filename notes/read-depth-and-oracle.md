@@ -358,6 +358,38 @@ serving.
 What v2 does keep: a third of the H2D time and 8 pinned staging buffers against 48. It reads
 slightly MORE (1952 against 1900) from different eviction timing.
 
+## 16. Real tokens/s at last, and the eviction policy finally separates (job 360)
+
+First measurement from the served loop -- DSpark draft, verify, rollback, tokens COUNTED rather
+than inferred (`2906b20`). 600 steps after a 150-step warm-up, 79 GB, engram live, two reps:
+
+| policy | tok/s | reads/token | MB/token | accept_len |
+|---|---|---|---|---|
+| lru | 5.80 / 5.94 | 27.1 | 373.4 | 2.95 |
+| **age_over_freq** | **6.32 / 6.35** | **22.8** | **314.6** | 2.95 |
+
+**age/(1+count) is +8.0 % on real tokens**, with 16 % fewer reads and 16 % fewer bytes per token.
+Reproducible across reps (+-1.2 % and +-0.5 %).
+
+THIS OVERTURNS "THE POLICIES TIE", WHICH THIS FILE SAID TWICE. Jobs 310/315/320/345 all reported a
+tie, and every one of them was blind to the difference for a different reason: a flat-seeded policy
+with no history, a warm-up that replayed the timed window, a warm-up that loaded nothing, and --
+running through all of them -- a greedy `next_block` that collapsed to a repeating token, so the
+same experts were touched every step and no eviction decision mattered. The policy only separates
+when the token stream is real and acceptance is real.
+
+It also agrees in direction with the server-level job 140 (2.13 against 1.85 tok/s), which had been
+the one measurement saying the policy mattered and was repeatedly explained away here.
+
+SANITY: 5.80-6.35 tok/s brackets production's 6.26, so this harness is finally measuring the engine
+the server runs rather than a proxy.
+
+STILL OPEN: accept_len 2.95 against production's 3.65. The verify matches v41_engine line for line,
+so it is prompt or drafter-state, not logic -- but it is 24 % of tokens per step and therefore sits
+directly in the tok/s.
+
+SHIPPABLE TODAY: `DSV41_EVICT_POLICY=age_over_freq` is an env var production does not set.
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
