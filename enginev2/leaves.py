@@ -285,13 +285,16 @@ class Leaves:
     def step_other(self) -> None:
         """Per-step GPU work outside the layer loop. Default: none."""
 
-    def read(self, key: tuple, pool, ctx=None) -> "StagedExpert":
+    def read(self, key: tuple, pool, ctx=None, scored: bool = True) -> "StagedExpert":
         """Acquire a staging buffer from `pool`, read the expert into it, and return a handle that
         OWNS that lease. The loader releases it after h2d completes, never before.
 
-        `ctx` is passed EXPLICITLY rather than through a thread-local so that a provider with its
-        own pool or thread layout still attributes a staging wait to the right request -- and so
-        that pool.acquire(ctx) is reachable at all, which it was not when read() took two args.
+        `ctx` and `scored` are passed EXPLICITLY rather than through thread-locals so a provider
+        with its own pool or thread layout still attributes a staging wait to the right request AND
+        the right measurement cohort. Cohort identity has to travel with the work: a global "are we
+        measuring" switch gets asynchronous ownership wrong in both directions -- it drops the end
+        of a scored wait that outlives the window, and counts an unscored read that outlives
+        settlement.
         """
         raise NotImplementedError
 
@@ -371,8 +374,8 @@ class ModelLeaves(Leaves):
     def prefill_moe(self, layer: int, slots, chunks: int = 1) -> None:
         delay(C_DEP * chunks / self.scale)
 
-    def read(self, key: tuple, pool, ctx=None) -> StagedExpert:
-        sid = pool.acquire(ctx) if ctx is not None else pool.acquire()
+    def read(self, key: tuple, pool, ctx=None, scored: bool = True) -> StagedExpert:
+        sid = pool.acquire(ctx, scored) if ctx is not None else pool.acquire(scored=scored)
         try:
             self.bw.read(EXPERT_BYTES)
             # A VIEW of the leased buffer, never a copy. This is the whole zero-copy contract: a

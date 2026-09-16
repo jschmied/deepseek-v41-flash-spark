@@ -249,10 +249,10 @@ class LoaderService:
             if self.obs.enabled and not self.read_qd.acquire(blocking=False):
                 sp = next_span()
                 self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, key=key, slot=slot, gen=gen, span=sp,
-                                         aux=WaitReason.NVME_ADMISSION))
+                                         scored=scored, aux=WaitReason.NVME_ADMISSION))
                 self.read_qd.acquire()
                 self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, key=key, slot=slot, gen=gen, span=sp,
-                                         aux=WaitReason.NVME_ADMISSION))
+                                         scored=scored, aux=WaitReason.NVME_ADMISSION))
             elif not self.obs.enabled:
                 self.read_qd.acquire()
             permit_held = True
@@ -272,7 +272,7 @@ class LoaderService:
                         self.started_spec_scored += 1
                 else:
                     self.started_demand += 1
-            staged = self.leaves.read(key, self.stage, ctx)
+            staged = self.leaves.read(key, self.stage, ctx, scored)
             if self.obs.enabled:
                 self.obs.safe_emit(Event(now_ns(), "nvme_end", ctx=ctx, cause_id=cause_id, key=key, slot=slot, gen=gen,
                                          scored=scored))
@@ -302,10 +302,10 @@ class LoaderService:
             if self.obs.enabled and not self.h2d_sem.acquire(blocking=False):
                 sp = next_span()
                 self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, key=key, slot=slot, gen=gen, span=sp,
-                                         aux=WaitReason.H2D_CAPACITY))
+                                         scored=scored, aux=WaitReason.H2D_CAPACITY))
                 self.h2d_sem.acquire()
                 self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, key=key, slot=slot, gen=gen, span=sp,
-                                         aux=WaitReason.H2D_CAPACITY))
+                                         scored=scored, aux=WaitReason.H2D_CAPACITY))
             elif not self.obs.enabled:
                 self.h2d_sem.acquire()
             try:
@@ -377,7 +377,7 @@ class LoaderService:
         # Protect before queueing, never after: between the two a worker can already be writing.
         self.slots.mark_pending(to_load)
         for key, slot, gen in to_load:
-            self.ready.arm(slot, gen, ctx, cause_id)
+            self.ready.arm(slot, gen, ctx, cause_id, scored)
         if self.obs.enabled:
             for key, slot, gen in to_load:
                 self.obs.safe_emit(Event(now_ns(), "load_queued", ctx=ctx, key=key, slot=slot,
@@ -465,19 +465,19 @@ class LoaderService:
             self.slots.clear_pending(slot, gen)
         return len(pending)
 
-    def wait_slots(self, to_load, ctx=NO_CTX) -> None:
+    def wait_slots(self, to_load, ctx=NO_CTX, scored: bool = True) -> None:
         """Wait only for the slots THIS consumer needs. Errors are drained, then the first re-raised."""
         err = None
         for key, slot, gen in to_load:
             try:
-                self.ready.wait(slot, gen, ctx=ctx, key=key)
+                self.ready.wait(slot, gen, ctx=ctx, key=key, scored=scored)
             except BaseException as e:            # noqa: BLE001
                 if err is None:
                     err = e
         if err is not None:
             raise err
 
-    def wait_all(self, timeout: float = 60.0, ctx=NO_CTX) -> None:
+    def wait_all(self, timeout: float = 60.0, ctx=NO_CTX, scored: bool = True) -> None:
         """The global barrier: every pending DEMAND read, whether or not this consumer needs it.
 
         Instrumented here because this is where D3 actually costs something. It was invisible, and
@@ -489,14 +489,14 @@ class LoaderService:
                 return
             sp = next_span()
             if self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, span=sp,
+                self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, span=sp, scored=scored,
                                          value=self._demand, aux=WaitReason.GLOBAL_BARRIER))
             try:
                 if not self._demand_cv.wait_for(lambda: self._demand == 0, timeout):
                     raise TimeoutError("global barrier never drained")
             finally:
                 if self.obs.enabled:
-                    self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, span=sp,
+                    self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, span=sp, scored=scored,
                                              aux=WaitReason.GLOBAL_BARRIER))
 
     def shutdown(self, drain: bool = True, timeout: float = 60.0) -> None:

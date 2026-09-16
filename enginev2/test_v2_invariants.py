@@ -614,9 +614,9 @@ def test_staging_is_zero_copy_and_the_buffer_outlives_the_h2d():
             seen.setdefault("released_during_h2d", []).append(staged.released)
             super().h2d(slot, key, staged)
 
-        def read(self, key, pool, ctx=None):
+        def read(self, key, pool, ctx=None, scored=True):
             self.__dict__["_pool"] = pool
-            return super().read(key, pool, ctx)
+            return super().read(key, pool, ctx, scored)
 
     for pol in (V1, V2):                       # D2 on and off: the buffer rule holds either way
         seen.clear()
@@ -1436,26 +1436,85 @@ def test_settlement_cannot_erase_a_prediction_made_inside_the_window():
     finally:
         e.close()
 
-    # (b) + (c) end to end
-    obs = CounterObserver()
+    # (b) + (c) end to end. The counter is compared against a TRACE of the same run: the property
+    # is not "nothing moved during settlement" -- scored reads issued in the window legitimately
+    # START during it, and asserting stillness rewarded the very bug this replaced. The property is
+    # that NO UNSCORED event reached the aggregate.
+    # Budget for the WHOLE run on one ring: capacity is a total divided across rings, and the
+    # driver thread alone emits tens of thousands here. A wrapped ring silently undercounts the
+    # scored population and makes the comparison below look like an aggregate over-count.
+    trace = TraceObserver(capacity=1 << 21, max_rings=8)
+
+    class Both(CounterObserver):
+        def emit(self, event):
+            trace.emit(event)                 # trace keeps everything, including unscored
+            super().emit(event)               # aggregate must keep only scored
+
+    obs = Both()
     e = Engine(V2, lru_slots=2000, transient_slots=400, observer=obs,
                leaves=ModelLeaves(calls, Bandwidth(), start=cut),
                prefetch=RecallOraclePrefetcher(calls, 4, recall=1.0, precision=0.4, start=cut))
     try:
         e.warm(calls, cut)
         e.decode(3)
-        counts_before = dict(obs.counts)
         e.settle(4)
-        counts_after = dict(obs.counts)
-        moved = {k: (counts_before.get(k, 0), v) for k, v in counts_after.items()
-                 if v != counts_before.get(k, 0)}
-        assert not moved, f"CounterObserver counted settlement work: {list(moved)[:4]}"
-
         e.finalize_stats()
-        # (b) every classified outcome is one of the named buckets and nothing is double-counted
-        assert e.pf.evicted_before_use <= e.pf.used + e.pf.evicted_before_use
+        ev = trace.drain()
+        assert trace.dropped == 0, f"the trace wrapped ({trace.dropped} dropped); comparison void"
+        unscored = [x for x in ev if not x.scored]
+        assert unscored, "settlement emitted no unscored events; the arm proves nothing"
+        assert obs.counts, "the aggregate recorded nothing at all"
+        # every counted event must be scored: compare totals per kind
+        from collections import Counter as _C
+        scored_by_kind = _C(x.kind for x in ev if x.scored)
+        for kind, n in obs.counts.items():
+            assert n <= scored_by_kind[kind], (
+                f"aggregate counted {n} {kind} but only {scored_by_kind[kind]} were scored")
+        # (b) a retired attempt that was never wanted must not be a timing failure
         assert e.pf.wasted >= e.pf.evicted_before_use + e.pf.failed_before_use
+        print(f"  cohort boundary: {len(unscored)} unscored events traced, none counted; "
+              f"scored starts {e.pf.started_cohort}/{e.pf.started}  OK")
     finally:
         e.close()
-    print("  cohort boundary: a scored prediction survives an unscored duplicate, and the "
-          "aggregate observer ignores settlement  OK")
+
+
+
+
+# ================================================================ 29. a wrong retired attempt
+def test_a_retired_attempt_the_layer_never_wanted_is_not_a_timing_failure():
+    """evicted_before_use means RIGHT but too early. A false positive must not borrow that label.
+
+    Test 28's assertions on this were tautological (`x <= y + x`). Constructed explicitly here: a
+    retired attempt whose key the target layer does not want must land in `wasted` only, leaving
+    both timing buckets untouched -- otherwise the failure-mode breakdown reports a prediction
+    error as a scheduling problem, which is the opposite diagnosis.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+    e = Engine(V2, lru_slots=5328, transient_slots=400,
+               leaves=ModelLeaves(calls, Bandwidth(), start=cut))
+    try:
+        before = (e.pf.evicted_before_use, e.pf.failed_before_use, e.pf.wasted)
+        # a retired attempt for layer 5, key the layer will NOT want
+        att = SpecAttempt((5, 999), slot=17, gen=3, cause_id=7, scored=True)
+        att.terminal = "evicted"
+        e._expired.setdefault(5, []).append(att)
+        e._settle_speculation(5, (1, 2, 3), None)          # layer 5 wants 1,2,3 -- not 999
+        after = (e.pf.evicted_before_use, e.pf.failed_before_use, e.pf.wasted)
+        assert after[0] == before[0], (
+            f"a retired attempt the layer never wanted was counted evicted_before_use "
+            f"({before[0]} -> {after[0]})")
+        assert after[1] == before[1], "it was counted as an I/O failure"
+        assert after[2] == before[2] + 1, f"it should be plain wasted ({before[2]} -> {after[2]})"
+
+        # and the same attempt, when the layer DOES want it, is a timing failure
+        att2 = SpecAttempt((6, 42), slot=18, gen=4, cause_id=8, scored=True)
+        att2.terminal = "evicted"
+        e._expired.setdefault(6, []).append(att2)
+        mid = e.pf.evicted_before_use
+        e._settle_speculation(6, (42,), None)
+        assert e.pf.evicted_before_use == mid + 1, (
+            "a retired attempt the layer DID want was not counted as too-early")
+    finally:
+        e.close()
+    print("  retired: wanted+evicted is a timing failure, unwanted is just wrong  OK")

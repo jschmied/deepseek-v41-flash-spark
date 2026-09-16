@@ -324,7 +324,7 @@ class StagingPool:
         with self._lk:
             return sid in self._leased
 
-    def acquire(self, ctx=NO_CTX) -> int:
+    def acquire(self, ctx=NO_CTX, scored: bool = True) -> int:
         # The lease is the ownership point for STAGING_BUFFER waits: whoever blocks here is blocked
         # on a pinned buffer, whatever they meant to do with it.
         # Atomic probe: testing a private _value and then acquiring is racy in both directions --
@@ -332,10 +332,10 @@ class StagingPool:
         # false ones recorded. try-acquire answers exactly the question being asked.
         if self.obs.enabled and not self._sem.acquire(blocking=False):
             sp = next_span()
-            self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, span=sp,
+            self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, span=sp, scored=scored,
                                      aux=WaitReason.STAGING_BUFFER))
             self._sem.acquire()
-            self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, span=sp,
+            self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, span=sp, scored=scored,
                                      aux=WaitReason.STAGING_BUFFER))
         elif not self.obs.enabled:
             self._sem.acquire()
@@ -397,20 +397,20 @@ class SlotReady:
         # 12 for layer 16 would attribute layer 16's blocking to layer 12. The consumer passes its
         # own context to wait(); only cause_id is recovered from here, because the cause really is
         # the prediction that issued the read.
-        self._ctx: dict[tuple, tuple] = {}   # (slot, gen) -> (producer_ctx, cause_id)
+        self._ctx: dict[tuple, tuple] = {}   # (slot, gen) -> (producer_ctx, cause_id, scored)
         self._err: dict[tuple, BaseException] = {}
 
-    def arm(self, slot: int, gen: int, ctx=NO_CTX, cause_id: int = 0) -> None:
+    def arm(self, slot: int, gen: int, ctx=NO_CTX, cause_id: int = 0, scored: bool = True) -> None:
         # Still clears nothing -- clearing here is what stranded waiters before. It only RECORDS
         # who this generation belongs to, so later events can carry it.
-        if ctx is not NO_CTX or cause_id:
-            self._ctx[(slot, gen)] = (ctx, cause_id)
+        if ctx is not NO_CTX or cause_id or not scored:
+            self._ctx[(slot, gen)] = (ctx, cause_id, scored)
 
     def set(self, slot: int, gen: int, err: BaseException | None = None) -> None:
         if self.obs.enabled:
-            c, cause = self._ctx.get((slot, gen), (NO_CTX, 0))
+            c, cause, sc = self._ctx.get((slot, gen), (NO_CTX, 0, True))
             self.obs.safe_emit(Event(now_ns(), "slot_ready", ctx=c, slot=slot, gen=gen,
-                                     cause_id=cause, aux=err))
+                                     cause_id=cause, scored=sc, aux=err))
         with self._lk:
             self._done.add((slot, gen))
             self._ts[(slot, gen)] = now_ns()
@@ -440,18 +440,18 @@ class SlotReady:
             return self._ts.get((slot, gen))
 
     def wait(self, slot: int, gen: int, timeout: float | None = None, ctx=NO_CTX,
-             key: tuple | None = None) -> None:
+             key: tuple | None = None, scored: bool = True) -> None:
         with self._lk:
             blocked = (slot, gen) not in self._done
             sp = next_span()
-            _producer, cause = self._ctx.get((slot, gen), (NO_CTX, 0))
+            _producer, cause, _psc = self._ctx.get((slot, gen), (NO_CTX, 0, True))
             if blocked and self.obs.enabled:
                 # ctx is the CONSUMER: the layer actually blocked. cause_id is the producer's
                 # prediction, so "who waited" and "what caused the wait" stay separable.
                 # the key travels with the wait: without it a trace cannot say WHICH expert the
                 # consumer was blocked on, only which slot, and slots are recycled.
                 self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, key=key, slot=slot,
-                                         gen=gen, span=sp, cause_id=cause,
+                                         gen=gen, span=sp, cause_id=cause, scored=scored,
                                          aux=WaitReason.EXPERT_DATA))
             try:
                 if not self._cv.wait_for(lambda: (slot, gen) in self._done, timeout):
@@ -459,7 +459,7 @@ class SlotReady:
             finally:
                 if blocked and self.obs.enabled:
                     self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, key=key, slot=slot,
-                                             gen=gen, span=sp, cause_id=cause,
+                                             gen=gen, span=sp, cause_id=cause, scored=scored,
                                              aux=WaitReason.EXPERT_DATA))
             err = self._err.get((slot, gen))
         if err is not None:

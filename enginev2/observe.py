@@ -125,13 +125,13 @@ class Observer:
 
     enabled = True
     failed: BaseException | None = None
-    # Is a MEASUREMENT in progress? Settlement runs real work under real contention and is excluded
-    # from the statistics. Per-event `scored` covers what the driver and loader emit, but the
-    # ownership-point abstractions -- Chain, SlotReady, StagingPool -- emit the most important
-    # waits and do not know about cohorts, and threading a scoring flag through all of them would
-    # put experiment bookkeeping inside the primitives. One flag on the sink instead: aggregates
-    # stop counting, trace observers keep everything for diagnostics.
-    measurement_active = True
+    # NOTE: there is deliberately NO global "are we measuring" switch. One was tried and was wrong
+    # in both directions, because cohort membership is CAUSAL and the work is asynchronous: a
+    # scored read issued inside the window can finish after the switch flips (its wait_end was
+    # dropped, the duration went to zero and the open span leaked), and an unscored settlement read
+    # can finish after it flips back (counted as measured). Cohort identity travels WITH the work
+    # instead -- the loader work item, the staging lease, the armed generation, the consumer's own
+    # wait -- and Event.scored is the single thing an aggregate observer has to trust.
 
     def emit(self, event: Event) -> None:
         raise NotImplementedError
@@ -198,7 +198,7 @@ class CounterObserver(Observer):
         self._lk = threading.Lock()
 
     def emit(self, event: Event) -> None:
-        if not (event.scored and self.measurement_active):
+        if not event.scored:
             return                       # settlement: real work, not part of the measurement
         k = event.kind
         with self._lk:

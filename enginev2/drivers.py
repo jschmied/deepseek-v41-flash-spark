@@ -130,10 +130,10 @@ class Engine:
         # EDGE 1: graph A reads h and pre_mix, which graph B of the PREVIOUS layer wrote. Both
         # stages write the same single `h` buffer, so this is also why A(L+1) cannot simply be run
         # early: it would clobber what B(L) still needs.
-        self.chain.wait("h", layer - 1, ctx=ctx)
+        self.chain.wait("h", layer - 1, ctx=ctx, scored=self._scoring)
         # EDGE 5: eg_rows[L] comes off a second async NVMe stream and is read by graph A. The
         # source signals per layer; the driver only waits.
-        self.chain.wait("engram", layer, ctx=ctx)
+        self.chain.wait("engram", layer, ctx=ctx, scored=self._scoring)
 
         e = self.obs.enabled
         if e:
@@ -147,9 +147,9 @@ class Engine:
             self.obs.safe_emit(Event(now_ns(), "route_ready", ctx=ctx, value=len(uniq), aux=uniq, scored=self._scoring))
         # EDGE 2 and 6: A wrote y / route_idx / route_w, and the KV buffers this layer's
         # bookkeeping will clone.
-        self.chain.set("y", layer, ctx=ctx)
-        self.chain.set("route", layer, ctx=ctx)
-        self.chain.set("kv", layer, ctx=ctx)
+        self.chain.set("y", layer, ctx=ctx, scored=self._scoring)
+        self.chain.set("route", layer, ctx=ctx, scored=self._scoring)
+        self.chain.set("kv", layer, ctx=ctx, scored=self._scoring)
 
         # What did speculation actually buy, and what did it cost? Settled BEFORE reserve(), while
         # the previous prediction for this layer is still distinguishable from a real residency.
@@ -209,12 +209,12 @@ class Engine:
         self.obs.safe_gpu_begin("layer_b", ctx)
         # EDGE 3 and 4 are already enforced above: the ids came out of A, and _wait covers both the
         # `slots` mapping and the expert bytes being resident.
-        self.chain.wait("y", layer, ctx=ctx)
+        self.chain.wait("y", layer, ctx=ctx, scored=self._scoring)
         self._compute(lambda: self.leaves.layer_b(layer, route), slots=reads)
         self.obs.safe_gpu_end("layer_b", ctx)
         if e:
             self.obs.safe_emit(Event(now_ns(), "layer_b_end", ctx=ctx, scored=self._scoring))
-        self.chain.set("h", layer, ctx=ctx)            # B wrote h and pre_mix for the next layer
+        self.chain.set("h", layer, ctx=ctx, scored=self._scoring)            # B wrote h and pre_mix for the next layer
 
     # ------------------------------------------------------------------ prefetch bookkeeping
     def _replay_step(self) -> int:
@@ -244,7 +244,8 @@ class Engine:
                 for k in hit:
                     if k not in self._spec:
                         self.obs.safe_emit(Event(now_ns(), "prediction_resident_hit",
-                                                 ctx=ctx or NO_CTX, key=k, cause_id=named[k][0], scored=self._scoring))
+                                                 ctx=ctx or NO_CTX, key=k, cause_id=named[k][0],
+                                                 scored=named[k][1]))
         wrong = []
         # Attempts retired earlier for this layer: the read happened, so it counts, but it can
         # only ever have failed to serve demand.
@@ -296,7 +297,7 @@ class Engine:
                     if self.obs.enabled:
                         self.obs.safe_emit(Event(now_ns(), "prefetch_evicted_before_use",
                                                  ctx=ctx or NO_CTX, key=key, slot=slot, gen=gen,
-                                                 cause_id=cause, scored=self._scoring))
+                                                 cause_id=cause, scored=att.scored))
                     continue
                 if att.scored:
                     self.pf.used += 1
@@ -312,13 +313,13 @@ class Engine:
                     if self.obs.enabled:
                         self.obs.safe_emit(Event(now_ns(), "prefetch_ready_hit", ctx=ctx or NO_CTX,
                                                  key=key, slot=slot, gen=gen, cause_id=cause,
-                                                 value=lead, scored=self._scoring))
+                                                 value=lead, scored=att.scored))
                 else:
                     if att.scored:
                         self.pf.late_hit += 1
                     if self.obs.enabled:
                         self.obs.safe_emit(Event(now_ns(), "prefetch_late_hit", ctx=ctx or NO_CTX,
-                                                 key=key, slot=slot, gen=gen, cause_id=cause, scored=self._scoring))
+                                                 key=key, slot=slot, gen=gen, cause_id=cause, scored=att.scored))
             else:
                 if att.scored:
                     self.pf.wasted += 1
@@ -326,7 +327,7 @@ class Engine:
                 scored_wrong[(slot, gen)] = att.scored
                 if self.obs.enabled:
                     self.obs.safe_emit(Event(now_ns(), "prefetch_wasted", ctx=ctx or NO_CTX,
-                                             key=key, slot=slot, gen=gen, cause_id=cause, scored=self._scoring))
+                                             key=key, slot=slot, gen=gen, cause_id=cause, scored=att.scored))
         if wrong and self.discard_wrong_asap:
             # A wrong prefetch holds a slot AND a pending write, so it blocks eviction as well as
             # occupying capacity. Cancelling recovers the slot for reads that are already known to
@@ -429,13 +430,13 @@ class Engine:
             # number so the reset below cannot delete it before it has been consumed -- which is
             # what made this edge decorative until now.
             if step:
-                self.chain.wait("logits", step - 1)
+                self.chain.wait("logits", step - 1, ctx=ctx, scored=self._scoring)
             self.chain.reset(keep=("logits",))
             self.engram.issue(range(N_LAYERS), step, self.chain)
             ctx = OpContext(self.request_id, step, -1)
             for layer in range(N_LAYERS):
                 self.decode_layer(layer, ctx.at(layer))
-            self.chain.wait("h", N_LAYERS - 1)      # EDGE 7: gF replays after the last layer
+            self.chain.wait("h", N_LAYERS - 1, ctx=ctx, scored=self._scoring)      # EDGE 7: gF replays after the last layer
             # Per-step GPU work outside the layer loop (head, draft). Zero unless the provider was
             # told that part of the unattributed 78.5 % lives here rather than in a layer.
             if self.obs.enabled:
@@ -447,7 +448,7 @@ class Engine:
                 self.obs.safe_emit(Event(now_ns(), "final_end",
                                          ctx=OpContext(self.request_id, step, -1),
                                          scored=self._scoring))
-            self.chain.set("logits", step)
+            self.chain.set("logits", step, ctx=ctx, scored=self._scoring)
             self.c.steps += 1
         self.c.wall_s = time.perf_counter() - t0
         # The window boundary, not the total: speculation issued near the last layer has not begun
@@ -496,7 +497,6 @@ class Engine:
         import copy
         saved_c = copy.copy(self.c)
         self._scoring = False                        # run and contend, but do not count
-        self.obs.measurement_active = False          # ...including at the ownership points
         ran = 0
         try:
             for _ in range(layers):
@@ -508,7 +508,6 @@ class Engine:
                 ran += 1
         finally:
             self._scoring = True                     # restored: a later decode is scored again
-            self.obs.measurement_active = True
             wall, steps = self.c.wall_s, self.c.steps
             self.c = saved_c                         # timed counters are the window's, not this
             self.c.wall_s, self.c.steps = wall, steps

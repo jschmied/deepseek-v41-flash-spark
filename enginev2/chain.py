@@ -77,26 +77,29 @@ class Chain:
             self._done = {(n, i) for (n, i) in self._done if n in keep}
             self._cv.notify_all()
 
-    def set(self, name: str, index: int = -1, ctx=NO_CTX) -> None:
+    def set(self, name: str, index: int = -1, ctx=NO_CTX, scored: bool = True) -> None:
         with self._lk:
             self._done.add((name, index))
             self._cv.notify_all()
         if self.obs.enabled:
-            self.obs.safe_emit(Event(now_ns(), "edge_set", ctx=ctx, aux=(name, index)))
+            self.obs.safe_emit(Event(now_ns(), "edge_set", ctx=ctx, scored=scored,
+                                     aux=(name, index)))
 
-    def wait(self, name: str, index: int = -1, timeout: float = 60.0, ctx=NO_CTX) -> None:
+    def wait(self, name: str, index: int = -1, timeout: float = 60.0, ctx=NO_CTX,
+             scored: bool = True) -> None:
         if index < 0 and name in _PER_LAYER:
             return                     # no predecessor: layer 0
         with self._lk:
             self.checks += 1
             if self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "edge_check", ctx=ctx, aux=(name, index)))
+                self.obs.safe_emit(Event(now_ns(), "edge_check", ctx=ctx, scored=scored,
+                                     aux=(name, index)))
             if (name, index) in self._done:
                 return
             self.blocks += 1
             sp = next_span()
             if self.obs.enabled:
-                self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, span=sp,
+                self.obs.safe_emit(Event(now_ns(), "wait_start", ctx=ctx, span=sp, scored=scored,
                                          aux=WaitReason.ENGRAM if name == "engram"
                                          else WaitReason.CHAIN))
             try:
@@ -104,7 +107,7 @@ class Chain:
                     raise TimeoutError(f"edge {name}@{index} never satisfied")
             finally:
                 if self.obs.enabled:
-                    self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, span=sp,
+                    self.obs.safe_emit(Event(now_ns(), "wait_end", ctx=ctx, span=sp, scored=scored,
                                              aux=WaitReason.ENGRAM if name == "engram"
                                              else WaitReason.CHAIN))
 
