@@ -266,6 +266,19 @@ class Leaves:
     # exactly why it is declared here and not toggled per call.
     shared_first = False
 
+    # --- the per-STEP bracket. Stage 4 of the real bring-up found the contract had only an
+    # epilogue (`step_other`, the final head graph) and nowhere to put a prologue -- but a decode
+    # step really begins with work no layer owns: token ids and positions into their static
+    # buffers, engram rows, the embedding gather, pre_mix, selecting the graphs for this step's
+    # PARITY (the ratio-2 compressor grouping depends on S % 2), and capturing them the first time
+    # a parity is seen. It ends with per-layer KV `pending` clones and advancing the cache length.
+    # A provider that cannot express those is not an engine, so they are part of the contract.
+    def begin_step(self, step: int) -> None:
+        """Everything a step does before its first layer. Default: nothing."""
+
+    def end_step(self, step: int) -> None:
+        """Everything a step does after its final head. Default: nothing."""
+
     def layer_a(self, layer: int) -> "RouteResult":
         raise NotImplementedError
 

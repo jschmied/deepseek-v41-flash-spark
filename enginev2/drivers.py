@@ -442,6 +442,8 @@ class Engine:
             self.chain.reset(keep=("logits",))
             self.engram.issue(range(N_LAYERS), step, self.chain)
             ctx = OpContext(self.request_id, step, -1)
+            # The step's own prologue, before any layer: see Leaves.begin_step.
+            self._compute(lambda: self.leaves.begin_step(step))
             for layer in range(N_LAYERS):
                 self.decode_layer(layer, ctx.at(layer))
             self.chain.wait("h", N_LAYERS - 1, ctx=ctx, scored=self._scoring)      # EDGE 7: gF replays after the last layer
@@ -452,6 +454,7 @@ class Engine:
                                          ctx=OpContext(self.request_id, step, -1),
                                          scored=self._scoring))
             self._compute(self.leaves.step_other)
+            self._compute(lambda: self.leaves.end_step(step))
             if self.obs.enabled:
                 self.obs.safe_emit(Event(now_ns(), "final_end",
                                          ctx=OpContext(self.request_id, step, -1),

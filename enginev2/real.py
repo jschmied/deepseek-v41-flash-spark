@@ -12,7 +12,10 @@ Both come from engine/cb3_cache.py. The record is 13,774,848 B, page-aligned by 
 WHAT THIS FILE OWNS: the pinned pool (O_DIRECT needs ALIGN-aligned addresses, which torch does not
 promise), and the mapping from the skeleton's Leaves contract onto those two calls.
 
-Stage 1 and 2 of the bring-up. Graph A/B are not here yet -- see notes at the bottom.
+Stages 1-4: the I/O half plus the graph half. Graph A and graph B are replayed from
+engine/fastdecode.py's captures; the DRIVER owns the resolve between them, which is the whole point
+-- v1's step() calls gA, _resolve, gB in one loop, and v2 splits the resolve out so a scheduler can
+sit there.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ import sys
 
 import torch
 
-from .leaves import Leaves, StagedExpert
+from .leaves import Leaves, RouteResult, StagedExpert
 
 ALIGN = 4096
 
@@ -161,3 +164,89 @@ class RealLeaves(Leaves):
         pinned buffer the moment this returns, so the copy must have completed."""
         self.cache.load_slot(self.arena, slot, staged.payload, non_blocking=False)
         torch.cuda.synchronize()
+
+
+    # --- graph half ---------------------------------------------------------------------------
+    #
+    # v1's step() is: prologue, then per layer { gA[L].replay(); _resolve(L); gB[L].replay() },
+    # then gF, then the KV epilogue. v2 keeps exactly that order and takes over only the middle --
+    # _resolve becomes the driver's reserve/submit/wait, which is what lets a scheduler exist there
+    # at all.
+    #
+    # The graphs are captured PER PARITY (S % 2) because the ratio-2 compressor grouping depends on
+    # it, so begin_step selects the pair for this step and captures on first sight.
+
+    def attach(self, engine, block_ids, engram_rows=None) -> "RealLeaves":
+        """Bind to a live V41Engine. The engine owns the weights, caches and captured graphs; this
+        provider only replays them."""
+        self.eng = engine
+        self.fd = engine.fast
+        self.block_ids = block_ids
+        self.engram_rows = engram_rows or {}
+        self._S = int(self.fd.c.len)
+        self._gA = self._gB = self._gF = None
+        return self
+
+    def begin_step(self, step: int) -> None:
+        """The prologue no layer owns. Mirrors fastdecode.step() up to the layer loop."""
+        import torch as _t
+        fd, a = self.fd, self.fd.a
+        S = self._S
+        fd.ids.copy_(self.block_ids)
+        fd.pos.copy_(S + _t.arange(fd.ids.numel(), device=fd.dev))
+        for L in fd.eg_rows:
+            rows = self.engram_rows.get(L)
+            if rows is None:
+                fd.eg_rows[L].zero_()
+            else:
+                fd.eg_rows[L].copy_(rows)
+        fd.h.copy_(fd.W.embed[fd.ids].unsqueeze(1).expand(-1, a.hc_mult, -1))
+        fd.pre_mix.copy_(fd._premix0)
+        parity = S % 2
+        fd.prepare_pending_buffers()
+        if parity not in fd.graphs:
+            fd.capture(parity)
+            fd.prepare_pending_buffers()   # capture's warm-up overwrites the buffers
+        self._gA, self._gB, self._gF = fd.graphs[parity][0], fd.graphs[parity][1], fd.graphs[parity][2]
+
+    def layer_a(self, layer: int) -> RouteResult:
+        """Graph A: attention + HC + router. The expert ids come OUT of it.
+
+        `opaque` is the router's own index tensor -- bind_slots needs its SHAPE and ORDER, not just
+        the unique ids, because moe_fn consumes a slot tensor shaped like route_idx.
+        """
+        self._gA[layer].replay()
+        idx = self.fd.route_idx
+        return RouteResult(uniq=tuple(sorted(set(idx.flatten().tolist()))), opaque=idx)
+
+    def bind_slots(self, route: RouteResult, slot_of: dict) -> None:
+        """Give graph B its route-aligned slot tensor. This is v1's `self.slots.copy_(slots)`, with
+        the mapping coming from v2's ExpertSlots instead of v1's store."""
+        import torch as _t
+        idx = route.opaque
+        flat = idx.flatten().tolist()
+        self.fd.slots.copy_(_t.tensor([slot_of[e] for e in flat], dtype=self.fd.slots.dtype,
+                                      device=self.fd.slots.device).view_as(self.fd.slots))
+
+    def layer_b(self, layer: int, route: RouteResult) -> None:
+        """Graph B: routed MoE + shared expert + HC residual, over slots already resident."""
+        self._gB[layer].replay()
+
+    def step_other(self) -> None:
+        """The final head graph."""
+        if self._gF is not None:
+            self._gF.replay()
+
+    def end_step(self, step: int) -> None:
+        """KV bookkeeping for Caches.rollback, and advance the cache length."""
+        fd = self.fd
+        S, T = self._S, fd.ids.numel()
+        for L in fd.kvl_buf:
+            before = fd.c.pending.get(L)
+            fd.c._chunk_inputs[L] = (S, fd.kvl_buf[L], fd.sc_buf[L], before)
+            if S % 2 == 1:
+                fd.c.pending[L] = (fd.kvl_buf[L][T - 1].clone(), fd.sc_buf[L][T - 1].clone())
+            else:
+                fd.c.pending[L] = None
+        fd.c.len = S + T
+        self._S = fd.c.len
