@@ -281,6 +281,18 @@ class Leaves:
         from .store import StagingPool
         return StagingPool(n, observer=observer)
 
+    def select_block(self, step: int) -> None:
+        """Decide this step's input block, BEFORE anything else in the step runs.
+
+        Split out of begin_step because the engram source needs it. v1's order is: build the block
+        (draft + verify), hash it, D2H the hash ids, submit both tables' NVMe reads, and only then
+        run the step. A block chosen inside begin_step is chosen AFTER EngramSource.issue() has
+        already been called, so the second NVMe stream would be reading rows for the previous
+        step's tokens -- silently, and only visibly as a quality loss.
+
+        Default: nothing, for a provider whose block does not depend on the previous step.
+        """
+
     def begin_step(self, step: int) -> None:
         """Everything a step does before its first layer. Default: nothing."""
 

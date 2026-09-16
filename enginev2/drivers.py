@@ -440,8 +440,12 @@ class Engine:
             if step:
                 self.chain.wait("logits", step - 1, ctx=ctx, scored=self._scoring)
             self.chain.reset(keep=("logits",))
-            self.engram.issue(range(N_LAYERS), step, self.chain)
             ctx = OpContext(self.request_id, step, -1)
+            # THE BLOCK FIRST, then the engram reads that hash it. v1 builds the verify block,
+            # hashes it and submits both tables' reads before the step runs; issuing engram first
+            # would read rows for the PREVIOUS step's tokens.
+            self._compute(lambda: self.leaves.select_block(step))
+            self.engram.issue(range(N_LAYERS), step, self.chain)
             # The step's own prologue, before any layer: see Leaves.begin_step.
             self._compute(lambda: self.leaves.begin_step(step))
             for layer in range(N_LAYERS):

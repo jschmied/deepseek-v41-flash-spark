@@ -232,28 +232,40 @@ class RealLeaves(Leaves):
         # There is no default: a provider asked for more than one step without one is a bug, not a
         # silently-repeated block.
         self.next_block = next_block
+        # The engram source, if one is attached. It owns the reads; this owns the dequant+H2D at
+        # the consumer, because to_device() makes CUDA calls and may not run on a reader thread.
+        self.engram = None
+        self.engram_ablated = 0
         self._S = int(self.fd.c.len)
         self._gA = self._gB = self._gF = None
         return self
+
+    def select_block(self, step: int) -> None:
+        """This step's input block. Must run before EngramSource.issue() hashes it."""
+        if step:
+            if self.next_block is None:
+                raise RuntimeError("multi-step decode needs attach(next_block=...); without it "
+                                   "every step would replay the same block")
+            self.block_ids = self.next_block(self.fd.logits, step)
 
     def begin_step(self, step: int) -> None:
         """The prologue no layer owns. Mirrors fastdecode.step() up to the layer loop."""
         import torch as _t
         fd, a = self.fd, self.fd.a
-        if step:
-            if self.next_block is None:
-                raise RuntimeError("multi-step decode needs attach(next_block=...); without it "
-                                   "every step would replay the same block")
-            self.block_ids = self.next_block(fd.logits, step)
         S = self._S
         fd.ids.copy_(self.block_ids)
         fd.pos.copy_(S + _t.arange(fd.ids.numel(), device=fd.dev))
-        for L in fd.eg_rows:
-            rows = self.engram_rows.get(L)
-            if rows is None:
-                fd.eg_rows[L].zero_()
-            else:
-                fd.eg_rows[L].copy_(rows)
+        # ENGRAM. With no source attached this ZEROES the rows, which is engram_ablate -- a
+        # different model, not a neutral default. It was the silent state of every v2 measurement
+        # before a real source existed, so it is now named and counted rather than implied.
+        if self.engram is None:
+            for L in fd.eg_rows:
+                rows = self.engram_rows.get(L)
+                if rows is None:
+                    fd.eg_rows[L].zero_()
+                    self.engram_ablated += 1
+                else:
+                    fd.eg_rows[L].copy_(rows)
         fd.h.copy_(fd.W.embed[fd.ids].unsqueeze(1).expand(-1, a.hc_mult, -1))
         fd.pre_mix.copy_(fd._premix0)
         parity = S % 2
@@ -269,6 +281,12 @@ class RealLeaves(Leaves):
         `opaque` is the router's own index tensor -- bind_slots needs its SHAPE and ORDER, not just
         the unique ids, because moe_fn consumes a slot tensor shaped like route_idx.
         """
+        # EDGE: graph A reads eg_rows[L]. The raw NVMe read was waited on by the driver's
+        # chain.wait("engram", L); the dequantize and H2D are CUDA work and belong here, on the
+        # consumer, which is exactly where v1 does them (`eg_rows[L].copy_(finish(*fut.result()))`
+        # inside its layer loop).
+        if self.engram is not None:
+            self.engram.deliver(layer, self.fd)
         self._gA[layer].replay()
         idx = self.fd.route_idx
         return RouteResult(uniq=tuple(sorted(set(idx.flatten().tolist()))), opaque=idx)
@@ -304,3 +322,72 @@ class RealLeaves(Leaves):
                 fd.c.pending[L] = None
         fd.c.len = S + T
         self._S = fd.c.len
+
+
+class RealEngramSource:
+    """The SECOND NVMe stream, for real: engine/engram.py's two tables.
+
+    The skeleton's EngramSource completes immediately and exists only so the edge is real. This one
+    does what v1 does per step, in v1's order:
+
+        hashes = hash_state(block, pos)      GPU
+        h_np   = hashes.cpu().numpy()        D2H HERE, before any graph is queued -- a .cpu() later
+                                             would wait for the whole step
+        futs   = {L: eg_pool.submit(tables[L].read_raw, h_np[:, li, :])}   host-only, thread-safe
+        ...                                  each layer's rows dequantized and copied at its graph A
+
+    THE SPLIT IS NOT COSMETIC. `read_raw` is host-only and safe on a pool thread; `to_device`
+    dequantizes and copies and therefore makes CUDA calls, so it runs on the consumer. The source
+    signals `chain.set("engram", L)` when the RAW READ lands, and `deliver()` does the CUDA half at
+    graph A. Signalling after to_device instead would put CUDA work on a reader thread and hide the
+    edge inside it.
+
+    Only `engram_layer_ids` have rows. Every other layer is signalled immediately, because the edge
+    must still exist for it -- a driver that waits on "engram" for layer 7 must not hang.
+
+    ~144 lookups per layer per step, 264 B each, deduped against a process cache: ~0.2 % of expert
+    byte traffic but a large number of tiny reads, so it competes for IOPS and host CPU rather than
+    for bandwidth. Whether that matters is measurable now and was not before.
+    """
+
+    name = "real"
+
+    def __init__(self, engine, leaves):
+        self.eng = engine
+        self.leaves = leaves
+        self.tables = engine.tables
+        self.pool = engine.eg_pool
+        self.hash_state = engine.model.hash_state
+        self.layer_ids = tuple(engine.args.engram_layer_ids)
+        self._futs: dict = {}
+        self.rows_read = 0
+        self.steps = 0
+
+    def issue(self, layers, step: int, chain) -> None:
+        import numpy as np  # noqa: F401
+        fd = self.leaves.fd
+        block = self.leaves.block_ids
+        pos = int(self.leaves._S)
+        hashes = self.hash_state(block[None], pos)[0]
+        h_np = hashes.cpu().numpy()                       # D2H before any graph is queued
+        self._futs = {}
+        for li, L in enumerate(self.layer_ids):
+            fut = self.pool.submit(self.tables[L].read_raw, h_np[:, li, :])
+            self._futs[L] = fut
+            # The edge is signalled from a callback so the DRIVER only ever waits, and a layer
+            # whose rows are already cached is released without a round trip.
+            fut.add_done_callback(lambda _f, _L=L: chain.set("engram", _L))
+        for L in layers:
+            if L not in self._futs:
+                chain.set("engram", L)                    # no rows for this layer; the edge is still real
+        self.steps += 1
+
+    def deliver(self, layer: int, fd) -> None:
+        """The CUDA half, at the consumer. Raises if the read failed rather than feeding graph A
+        stale rows -- a silent stale row is a quality loss with no symptom."""
+        fut = self._futs.get(layer)
+        if fut is None:
+            return
+        raw, inv, shape = fut.result()
+        fd.eg_rows[layer].copy_(self.tables[layer].to_device(raw, inv, shape))
+        self.rows_read += int(shape[0]) if hasattr(shape, "__getitem__") else 0
