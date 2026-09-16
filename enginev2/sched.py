@@ -136,7 +136,7 @@ class LoaderService:
         # reader of it must tolerate None.
         self.leaves = leaves if leaves is not None else _default_leaves(scale)
         self.bw = getattr(self.leaves, "bw", None)
-        self.stage = StagingPool(staging, observer=self.obs)
+        self.stage = self.leaves.make_staging(staging, observer=self.obs)
         self.ready = SlotReady(observer=self.obs)
         self.scale = scale
         # FOUR SEPARATE RESOURCES. They were conflated: one semaphore named `device_queue_depth`

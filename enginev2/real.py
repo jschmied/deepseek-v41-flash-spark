@@ -145,6 +145,11 @@ class RealLeaves(Leaves):
     def close(self):
         self.cache.close()
 
+    def make_staging(self, n: int, observer=None) -> "PinnedStagingPool":
+        """Real pinned buffers, one record wide. n x 13.1 MiB of page-locked host memory, which is
+        why the count is worth choosing rather than inheriting the skeleton's 48."""
+        return PinnedStagingPool(n, self.record)
+
     # --- I/O half ---------------------------------------------------------------------------
     def read(self, key: tuple, pool, ctx=None, scored: bool = True) -> StagedExpert:
         """One record, O_DIRECT, straight into the leased pinned buffer. Zero copy: the payload is

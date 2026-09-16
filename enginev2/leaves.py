@@ -273,6 +273,14 @@ class Leaves:
     # PARITY (the ratio-2 compressor grouping depends on S % 2), and capturing them the first time
     # a parity is seen. It ends with per-layer KV `pending` clones and advancing the cache length.
     # A provider that cannot express those is not an engine, so they are part of the contract.
+    def make_staging(self, n: int, observer=None):
+        """The staging pool is the PROVIDER's, because its buffers are the provider's medium: the
+        modelled one hands out plain memoryviews, a real one hands out page-locked, ALIGN-aligned
+        host memory that O_DIRECT can land in. The loader owns how many there are and when each is
+        released; it does not own what they are made of."""
+        from .store import StagingPool
+        return StagingPool(n, observer=observer)
+
     def begin_step(self, step: int) -> None:
         """Everything a step does before its first layer. Default: nothing."""
 
