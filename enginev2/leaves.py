@@ -287,6 +287,22 @@ class Leaves:
     # reader finished while the GPU is still reading.
     device_orders_slot_reuse = False
 
+    def await_copies(self, slots) -> int:
+        """Make the COMPUTE stream wait for the copies into `slots`, and return how many it waited
+        on. Called by the driver after the loader reports those slots ready, before the graph that
+        reads them.
+
+        This is what lets readiness mean "the H2D has been ENQUEUED and its event published"
+        instead of "the H2D has completed". The old meaning put a host block on copy completion in
+        front of every layer: worker -> completer -> synchronize -> ready.set -> driver wakes, about
+        three thread handoffs per expert. The new one is a GPU-side dependency, so the driver can
+        queue the graph while the copy is still running and the device orders it.
+
+        Default: nothing. A provider that does not implement this must NOT be given the early
+        readiness, which is why the loader gates it on device_orders_slot_reuse.
+        """
+        return 0
+
     def make_staging(self, n: int, observer=None):
         """The staging pool is the PROVIDER's, because its buffers are the provider's medium: the
         modelled one hands out plain memoryviews, a real one hands out page-locked, ALIGN-aligned

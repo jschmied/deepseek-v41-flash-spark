@@ -49,6 +49,11 @@ class _Bare(RealLeaves):
         self.engram = None
         self.engram_ablated = 0
         self._last_reader = {}
+        # Mirrors RealLeaves.__init__. This fixture reimplements that constructor, so it drifts
+        # whenever state is added -- it has now broken twice that way. Anything new there belongs
+        # here too, or the test stops covering the code it names.
+        self._copy_event = {}
+        self.copies_awaited = 0
         self._reader_lk = threading.Lock()
         self._bound_slots = frozenset()
         self.reader_waits = 0

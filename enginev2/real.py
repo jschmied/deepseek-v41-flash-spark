@@ -154,6 +154,13 @@ class RealLeaves(Leaves):
         # used without a graph half at all (test_real_leaves drives read/h2d directly). Putting it
         # in attach() made that path raise AttributeError -- caught by that test, 2026-09-16.
         self._last_reader: dict = {}
+        # Copies ENQUEUED but not yet complete: slot -> the event recorded after the H2D. The
+        # driver drains these through await_copies() before the graph that reads those slots, so
+        # completion becomes a GPU dependency instead of a host block. Written by loader threads
+        # and drained by the driver, so it keeps a lock -- unlike _last_reader, which has exactly
+        # one writer (layer_b) and is only read.
+        self._copy_event: dict = {}
+        self.copies_awaited = 0
         self._reader_lk = threading.Lock()
         self._bound_slots: frozenset = frozenset()
         self.reader_waits = 0
@@ -234,6 +241,11 @@ class RealLeaves(Leaves):
             self.cache.load_slot(self.arena, slot, staged.payload, non_blocking=True)
             ev = torch.cuda.Event()
             ev.record(st)
+        # PUBLISH, do not wait. The loader may now call this slot ready: the bytes are not there
+        # yet, but the event that says when they will be is. await_copies() puts that dependency on
+        # the compute stream before the graph reads the slot.
+        with self._reader_lk:
+            self._copy_event[slot] = ev
         return ev
 
 
@@ -361,6 +373,24 @@ class RealLeaves(Leaves):
         self.fd.slots.copy_(_t.tensor([slot_of[e] for e in flat], dtype=self.fd.slots.dtype,
                                       device=self.fd.slots.device).view_as(self.fd.slots))
         self._bound_slots = frozenset(slot_of.values())
+
+    def await_copies(self, slots) -> int:
+        """Put this layer's outstanding copies on the compute stream as a GPU dependency.
+
+        Called by the driver after the loader reports the slots ready and before graph B reads
+        them. Readiness now means "H2D enqueued, event published", so without this the graph could
+        read a slot mid-copy -- which is why the loader only publishes early for a provider that
+        declares device_orders_slot_reuse and therefore implements this.
+        """
+        n = 0
+        cur = torch.cuda.current_stream()
+        with self._reader_lk:
+            evs = [self._copy_event.pop(s) for s in set(slots) if s in self._copy_event]
+        for ev in evs:
+            cur.wait_event(ev)
+            n += 1
+        self.copies_awaited += n
+        return n
 
     def layer_b(self, layer: int, route: RouteResult) -> None:
         """Graph B: routed MoE + shared expert + HC residual, over slots already resident.

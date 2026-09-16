@@ -363,6 +363,16 @@ class LoaderService:
                 staged = None                      # the completion owns the lease now
             else:
                 deferred = True
+                if self._dev_orders:
+                    # EARLY READINESS. The copy is enqueued and its event published, so the driver
+                    # may reserve and queue the graph now; leaves.await_copies() puts the event on
+                    # the compute stream before that graph reads the slot, and the DEVICE enforces
+                    # completion. This takes a host block off the front of every layer -- the old
+                    # path was worker -> completer -> synchronize -> ready.set -> driver wakes,
+                    # about three thread handoffs per expert, all to learn something CUDA already
+                    # knows. Only for a provider that declares device_orders_slot_reuse, because
+                    # only that provider implements await_copies.
+                    self.ready.set(slot, gen)
                 self._completions.put(
                     (handle, wctx, staged, key, slot, gen, ctx, cause_id, scored, t0, is_demand))
                 staged = None
@@ -408,7 +418,8 @@ class LoaderService:
             with self._lk:
                 self.h2d_calls += 1
                 self.h2d_s += dt
-            self.ready.set(slot, gen)
+            if not (handle is not None and self._dev_orders):
+                self.ready.set(slot, gen)     # already published at enqueue on the fast path
             # Was this speculation discarded while it was in flight? The read is done and paid for;
             # refuse it the cache slot. Nothing ever waits on a speculative read, so un-mapping
             # after completion cannot strand a consumer.

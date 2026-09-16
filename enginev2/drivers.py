@@ -30,6 +30,7 @@ class Counters:
     mean_inflight: float = 0.0
     achieved_gbs: float = 0.0
     device_busy_s: float = 0.0
+    copies_awaited: int = 0       # H2Ds turned into a GPU dependency instead of a host block
 
     @property
     def steps_per_s(self) -> float:
@@ -239,6 +240,10 @@ class Engine:
         # thing and collapsing them (passing sorted(set(...)) as the input) loses the per-expert
         # ordering and multiplicity that moe_fn needs.
         reads = sorted(set(slot_of.values()))
+        # The loader reported these ready as soon as their copies were ENQUEUED, so the bytes may
+        # still be in flight. Put those copies on the compute stream before the graph reads them;
+        # from here the device orders it. A provider without this seam never gets early readiness.
+        self.c.copies_awaited += self.leaves.await_copies(reads)
         if e:
             self.obs.safe_emit(Event(now_ns(), "layer_b_start", ctx=ctx, scored=self._scoring))
         self.obs.safe_gpu_begin("layer_b", ctx)
