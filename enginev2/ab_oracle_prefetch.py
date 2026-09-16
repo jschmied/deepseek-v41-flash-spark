@@ -96,7 +96,7 @@ def build(eng, obs=None, prefetch=None):
     return e2, rl
 
 
-def warm_policy(e2, rl, routes, steps, n_layers):
+def warm_policy_BROKEN(e2, rl, routes, steps, n_layers):
     """Give the eviction policy real HISTORY before the timed window.
 
     Seeding calls on_insert(key, slot, 0) for every resident key, so all of them carry count 1 and
@@ -108,6 +108,13 @@ def warm_policy(e2, rl, routes, steps, n_layers):
     use counts through on_hit exactly as a real run would, and the frequency signal the policy
     exists to exploit is present when the measurement starts.
     """
+    # WITHDRAWN 2026-09-16, DO NOT USE. reserve() only rewrites METADATA: the slot is remapped to
+    # the new key while the arena still holds the previous expert's bytes, and clear_pending() then
+    # declares the write finished. Every "warmed" key was a lie -- resident by bookkeeping, wrong
+    # by content -- so the timed decode both under-read (971 against 1895) and computed with the
+    # wrong weights. Job 320's own route check printed "31 layers match, 1249 differ" and nothing
+    # acted on it. Kept only so the defect is legible next to its replacement.
+    #
     # WARM FROM THE TAIL, NOT THE HEAD. The timed window always replays steps 0..STEPS-1 from a
     # fresh prefill, so warming on those same steps pre-loads exactly the experts the measurement
     # is about to ask for. Job 315 did that: every arm, oracle included, collapsed to 658 reads
@@ -186,7 +193,7 @@ agree = [0, 0]
 _la2 = rl.layer_a
 def check(L, _f=_la2):
     r = _f(L)
-    want = routes.get((e2.c.steps, L))
+    want = routes.get((ROUTE_BASE + e2.c.steps, L))
     ok = want == r.uniq
     agree[0 if ok else 1] += 1
     if not ok and agree[1] == 1:
@@ -198,14 +205,23 @@ rl.layer_a = check
 # Policy history before timing. WARM=0 reproduces job 310's flat-seeded behaviour for comparison.
 _warm = int(os.environ.get("WARM", 0))
 if _warm:
+    # REAL DECODE, chronologically ahead of the timed window. Nothing else warms a cache: the
+    # arena only holds an expert once a read has actually put its bytes there. So steps
+    # 0.._warm-1 run untimed with prediction off, and the timed window is steps _warm.._warm+STEPS-1
+    # of the SAME continuous generation -- no re-prefill, no rewind, no replay of the test set.
     have = max((k[0] for k in routes), default=-1) + 1
     if have < STEPS + _warm:
         raise RuntimeError(
-            f"WARM={_warm} needs routes for steps {STEPS}..{STEPS + _warm - 1} but the recording "
-            f"only has {have}. Record STEPS+WARM steps, or the warm-up would replay the timed "
-            f"window and pre-load its answer.")
-    n = warm_policy(e2, rl, routes, _warm, eng.args.n_layers)
-    print(f"  warmed the policy over {n} recorded layers before timing")
+            f"WARM={_warm} + STEPS={STEPS} needs {STEPS + _warm} recorded steps, have {have}")
+    saved_pf, e2.prefetch = e2.prefetch, Prefetcher()
+    e2._scoring = False
+    e2.decode(_warm)
+    e2.prefetch, e2._scoring = saved_pf, True
+    e2.c = type(e2.c)()                      # the warm-up's counters are not the measurement's
+    ROUTE_BASE = _warm
+    print(f"  warmed with {_warm} REAL decode steps ({e2.loader.started_demand} reads issued)")
+else:
+    ROUTE_BASE = 0
 t0 = time.perf_counter()
 c = e2.decode(STEPS)
 wall = time.perf_counter() - t0
@@ -265,6 +281,14 @@ print(f"  engram {'LIVE' if ENGRAM else 'ABLATED'}"
       + (f", rows {sum(t.stats['rows'] for t in eng.tables.values())}" if ENGRAM else
          f", zeroed-layer fills {rl.engram_ablated}"))
 print(f"  route sequence reproduced: {agree[0]} layers match, {agree[1]} differ")
+# FAIL, do not merely report. Job 320 printed "31 match, 1249 differ" for four arms and every
+# number from them was reported as a result. A run whose routes diverge inside the timed window is
+# computing with weights that are not the model's, and nothing it measures is about this engine.
+_timed = STEPS * eng.args.n_layers
+if agree[0] < _timed:
+    raise SystemExit(f"ABORT: {agree[1] - (agree[0] + agree[1] - _timed)} route divergences inside "
+                     f"the timed window ({agree[0]} of {_timed} matched). The cache is serving "
+                     f"experts whose bytes were never loaded, or the state was not reproduced.")
 print(f"ARM {ARM} horizon {HORIZON}  {STEPS} steps  wall {wall:.2f}s  {STEPS / wall:.3f} steps/s")
 print(f"  demand fetches {c.fetches}  reads in the wall window {reads}  "
       f"causal scored reads {causal_reads}  {causal_reads * RECORD / 1e9:.2f} GB  "

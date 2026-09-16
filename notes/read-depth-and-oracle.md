@@ -217,7 +217,31 @@ only added an EVICT env defaulting to the previously hardcoded "lru" plus print 
 halves ran the same eviction behaviour and the comparison stands. Recorded because the stamp is
 only worth having if its warnings are acted on rather than explained away.
 
-## 12. age/(1+count) ties LRU here, and the oracle HURTS a warm cache (job 320)
+## 12. WITHDRAWN -- job 320's warmed arms computed with the wrong weights
+
+Found by review, confirmed in job 320's own output. `warm_policy` called `reserve()` then
+`clear_pending()` and never LOADED anything: `reserve()` only rewrites metadata, so each slot was
+remapped to a new key while the arena still held the previous expert's bytes, and `clear_pending()`
+then declared the write finished. Every warmed key was resident by bookkeeping and wrong by content.
+
+The harness printed the evidence for all four warmed arms and nothing acted on it:
+
+    route sequence reproduced: 31 layers match, 1249 differ
+
+Thirty-one of 1,280. The WARM=0 arms show 1280/0, so the defect is exactly the warm-up.
+
+So BOTH conclusions below are withdrawn: "the policies tie" and "the oracle is a net loss on a warm
+cache, -13 %". The 971-against-1895 read count that looked like a warm cache was the cache serving
+experts it had never read.
+
+Two fixes, not one. The warm-up is now REAL decode -- steps 0..WARM-1 run untimed with prediction
+off and the timed window is steps WARM..WARM+STEPS-1 of the same continuous generation, no
+re-prefill and no replay. And the route check now RAISES on any divergence inside the timed window
+instead of printing it, because a run whose routes diverge is not measuring this engine at all.
+
+The original section is kept below, struck, so the numbers are not quoted from memory later.
+
+## 12-OLD (WITHDRAWN, DO NOT QUOTE) age/(1+count) ties LRU, oracle hurts a warm cache
 
 Warmed on recorded steps 30-59, timed on 0-29, at 79 GB with engram live:
 
