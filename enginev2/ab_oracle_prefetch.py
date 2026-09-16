@@ -52,8 +52,16 @@ class TraceOracle(Prefetcher):
     def __init__(self, routes, horizon):
         self.routes = routes          # {(step, layer): (expert ids,)}
         self.horizon = horizon
+        # THE WARM-UP OFFSET. The driver derives `step` from its own counter, which the harness
+        # RESETS after the warm-up so the measurement starts at zero -- while the timed window is
+        # recorded steps WARM..WARM+STEPS-1. Without this the oracle reads the warm-up's own steps,
+        # names experts the warm-up just loaded, finds them all resident and issues NOTHING. Job
+        # 335 shipped four arms like that: issued=0, used=0, pred_miss=7487 for a predictor that
+        # cannot miss. Set by the harness once the base is known.
+        self.base = 0
 
     def predict(self, layer, uniq, step):
+        step = step + self.base
         tgt = layer + self.horizon
         s, L = (step, tgt) if tgt < N_L else (step + 1, tgt - N_L)
         ids = self.routes.get((s, L))
@@ -227,6 +235,8 @@ if _warm:
         raise SystemExit(f"ABORT: {agree[1]} route divergences during the WARM-UP itself")
     ROUTE_BASE = _warm
     agree[0] = agree[1] = 0                  # the timed window is scored on its own
+    if pf is not None:
+        pf.base = _warm                      # the oracle must read the TIMED window's routes
 # The observer's drain() is a SNAPSHOT, not a drain, so the warm-up's events are still in the ring
 # and would be counted in both the wall-window read count and the depth histogram -- the first run
 # of the repaired warm-up reported 2369 reads and a 9.61 s depth span against a 5.55 s wall.
@@ -308,3 +318,10 @@ print(f"  depth 0 {idle:.2f}s = {idle / span * 100:.1f}% of span   mean depth wh
       f"{sum(k * v for k, v in dur.items() if k) / 1e9 / busy if busy else 0:.2f}   "
       f"in-flight {reads * RECORD / busy / 1e9 if busy else 0:.2f} GB/s")
 print(f"  prefetch: {e2.pf}")
+if ARM == "oracle":
+    # An oracle reads a recorded trace: pred_miss must be 0 and it must issue something. Anything
+    # else means it is not reading the window being measured, which is how job 335's oracle arms
+    # were reported with issued=0.
+    if e2.pf.pred_miss or e2.pf.issued == 0:
+        raise SystemExit(f"ABORT: not an oracle -- pred_miss={e2.pf.pred_miss} "
+                         f"issued={e2.pf.issued}; it is not reading the timed window's routes")
