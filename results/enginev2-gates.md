@@ -290,6 +290,24 @@ plausible reason v2's assignment never settles.
 scheduler — because the engine-level evidence is circumstantial until the kernel itself is shown to
 be slot-order sensitive.
 
+## Job 635 — 99 of 769 bound slots hold the wrong bytes, and the audit may be measuring itself
+
+    req1  bound-slot checks=769  WRONG=99   layer=4 expert=287 slot=2497 plane=w1_lo gen=1
+    req2  bound-slot checks=769  WRONG=97   layer=4 expert=287 slot=2565 plane=w1_lo gen=2
+
+Same layer and experts job 625 flagged; every bad slot is high-numbered with generation 1 or 2,
+i.e. freshly loaded during that step.
+
+**Not claimed as the defect.** The audit runs at END OF STEP. A step touches ~760 unique experts
+across 40 layers against a 2,367-slot arena, so a slot bound at layer 4 can be legitimately evicted
+and refilled for a later layer before the audit reaches it — indistinguishable from corruption by
+content alone, and entirely consistent with job 615 finding the LRU map correct at rest.
+
+Job 640 adds the one field that separates them: at audit time, does `slots.slot_key[slot]` still
+map to `(layer, expert)`? Still-mapped and wrong is a real defect; re-mapped is recycling and the 99
+are an artifact. It also re-audits after a further step, since recycling should raise the recycled
+count while a genuine defect should not care.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
