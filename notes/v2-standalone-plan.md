@@ -70,3 +70,46 @@ a different model rather than an independent engine. The dependency worth removi
 *control*: `V41Engine._decode_loop`, `_generate`, its prefill branch, its stats assembly. That is
 what items 1-4 replace. Keeping the leaf math shared is the reuse the request asks for, and the
 bitwise gates (jobs 520, 536) are what keep it honest.
+
+## Branch convergence, and the standing decision on upstream
+
+**Decided 2026-09-17.** All four of our branches sit on `main`;
+`feat/enginev2-realleaves` already CONTAINS `one-spark-full-router` (merged in for the P0 fix), and
+`merge/upstream-server` touches only `server/`, which the serving line never modified. So ours
+converge cleanly. The order, each step with the gate that has to be met first:
+
+1. **`merge/upstream-server` -> `one-spark-full-router`.** Independent of the engine; green on CPU
+   (16 + 29 + repair, MockEngine). Gate: a decision on `DSV41_TOOL_GRAMMAR` 0 -> 1. That is a
+   serving default we held pending our own end-to-end run, and it is not a merge question.
+2. **`feat/enginev2-realleaves` -> `one-spark-full-router`.** Gate: job 555 green, because this
+   branch carries changes to v1 FILES -- `warm_start=False` in `v41_engine.py`, the arena repoint in
+   `model.py` and `fastdecode.py` -- into the engine that serves. Plus `V2Engine` having actually
+   served a request: today its prefill half is bitwise-gated and its API half has only CPU fakes.
+3. `one-spark-full-router` stays the single line. `main` stays the stale fork point and is never
+   pushed (memory `push-own-repos-standing-go`).
+
+### Upstream is NEVER merged. Cherry-pick only.
+
+`0xBakeer/deepseek-v41-flash-spark` is 101 commits ahead of our fork point. Five were the
+endpoint/template fixes, taken wholesale into `merge/upstream-server` because `server/` is
+engine-agnostic and upstream was a strict superset there. **The remaining ~96 are engine commits and
+must not arrive as a merge.**
+
+The reason is a hazard we have already written down (memory `merge-hazard-bypassed-kernel`):
+**upstream fusing an op into a kernel we bypass merges CLEANLY and is silently wrong.** v2 bypasses
+v1's `_resolve`, v1's prefill loop and v1's expert store -- precisely the surfaces upstream is most
+likely to have rewritten. A merge would report success, change nothing we can see, and invalidate
+measurements that took a day each to produce.
+
+Procedure for taking something from upstream:
+
+* Survey by AREA, not by reading 96 commits: `git log upstream/main --oneline -- <path>`.
+* **Diff the file, never trust the commit list.** `git log base..head -- <path>` reports 0 commits
+  while `git diff` shows the change, because of history simplification. That has cost us once.
+* Check whether upstream is a SUPERSET of ours for that path before taking it wholesale --
+  `git diff ours upstream -- <path>` and read the `-` lines, which are the ones of ours that would
+  be lost. For `server/` those turned out to be older versions of the same code; for anything in
+  `engine/` assume they are not.
+* `git cherry-pick -x <sha>` so the origin is recorded in the message.
+* Gate by area: `server/` -> the three CPU suites; `engine/` -> the bitwise gates (jobs 520, 536,
+  555). An engine cherry-pick with no bitwise gate does not land.
