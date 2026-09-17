@@ -790,13 +790,26 @@ alternated:
 measured. Under the broken seam the same change moved `layer_a` only 3.3 ms and the wall not at all,
 so the placement was the difference.
 
-**THE MAGNITUDE IS NOT SHIPPABLE ON ITS OWN.** +0.75 % sits inside the sf=0 arms' own 1.4 % spread.
-The flag stays off by default; job 415 adds four more reps.
+**THE MAGNITUDE, over 12 arms (jobs 410 + 415).** Four more reps each, order alternated:
+
+| | n | mean tok/s | `layer_a` | range |
+|---|---|---|---|---|
+| sf=0 | 6 | 6.638 | 122.48 | 6.60-6.71 |
+| sf=1 | 6 | **6.703** | **116.62** | 6.63-6.79 |
+
+**+0.98 %**, t ~ 2.25 on a two-sample test, p ~ 0.05. Marginal on throughput; unambiguous on the
+mechanism, where `layer_a` separates by 5.86 ms with non-overlapping ranges across all 12 arms. The
+accounting closes: -5.86 saved, +2.4 paid in launch, -3.5 predicted against -4.7 measured.
+
+RECOMMENDATION: leave the default OFF. One per cent at p ~ 0.05 does not justify changing what
+production captures (40 extra graphs) on its own, and the value of this work is the conversion rate
+below, not the shared expert. `DSV41_SHARED_FIRST=1` is there for anyone who wants it, and it is
+bitwise identical.
 
 ### The conversion rate, which is the number that matters
 
-Graph S is 10.0-10.5 ms of device time (two instruments, jobs 400/405), and moving it bought 5.95 ms
-of critical path -- **about 60 %**. The rest is presumably device time that was already overlapped
+Graph S is 10.0-10.5 ms of device time (two instruments, jobs 400/405), and moving it bought 5.86 ms
+of critical path over 12 arms -- **about 57 %**. The rest is presumably device time that was already overlapped
 with something, or that falls outside the window.
 
 That rate is the multiplier on the routed-MoE split. At a ~83 % hit rate, 0.83 x 69.7 = 57.9 ms of
