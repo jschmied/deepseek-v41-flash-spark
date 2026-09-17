@@ -105,6 +105,8 @@ if c.pairs_total:
     print(f"  PAIR residency {c.pairs_resident}/{c.pairs_total} = "
           f"{c.pairs_resident / c.pairs_total * 100:.1f} %  <- the weight that prices a resident-first "
           f"MoE split; the unique-key hit rate is NOT it")
+    print(f"  pairs/layer-step {c.pairs_total / max(1, c.steps * 40):.1f}, "
+          f"non-resident pairs {c.pairs_total - c.pairs_resident}")
 gt = rl.gt_report()
 if gt:
     print(gt)

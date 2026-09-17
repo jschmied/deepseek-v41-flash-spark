@@ -311,9 +311,19 @@ class Engine:
         # layer past the first routes from a residual stream that never passed through its
         # predecessors. That probe reported 22.6 unique experts per layer against the engine's
         # ~11.6, which is how the error announced itself.
-        _miss_e = {k[1] for k in to_load} | {k[1] for k in to_wait}
+        # to_load / to_wait items are (KEY, slot, gen) and key is (layer, expert) -- so the expert
+        # id is k[0][1]. Taking k[1] takes the SLOT NUMBER, which never matches an expert id, so
+        # every pair looks resident and this reports 100 %. That was the third wrong version of this
+        # one statistic (the first replayed graph A without graph B; the second used the unique-key
+        # hit rate as the weight), which is why the assert below exists rather than a comment.
+        _miss_e = {k[0][1] for k in to_load} | {k[0][1] for k in to_wait}
         _flat = getattr(route, "flat_cpu", None)
         if _flat:
+            # Every missing expert must be one this layer actually routed to. If the wrong tuple
+            # element is ever taken again, this fails loudly instead of printing a plausible number.
+            assert _miss_e <= set(_flat), (
+                f"layer {layer}: miss ids {sorted(_miss_e - set(_flat))[:4]} are not in this "
+                f"layer's route -- the wrong element of (key, slot, gen) is being read")
             self.c.pairs_total += len(_flat)
             self.c.pairs_resident += sum(1 for e in _flat if e not in _miss_e)
         # DEMAND work carries the cohort too. Settlement generates real demand misses, and submit
