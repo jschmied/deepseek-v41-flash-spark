@@ -18,7 +18,8 @@ swiglu cannot produce NaN, which would make `torch.equal` meaningless (NaN != Na
 import os, sys, torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import cb3_moe as C3                                            # noqa: E402
+import cb3_moe as C3
+from cb3_moe import DIM as _DIM  # noqa: F401                                            # noqa: E402
 from fp4_moe import DIM, _pick_bm, build_routing_small          # noqa: E402
 
 torch.manual_seed(0)
@@ -53,6 +54,19 @@ for T, K in ((6, 6), (1, 6), (5, 6)):
                                   block_pair=block_pair, NB=NB, BM=BM,
                                   phase_masks=(bs_res, bs_mis))
     same = torch.equal(ref, out)
+
+    # THE FORM THE ENGINE WILL ACTUALLY USE: two masked SLOT tensors, caller-owned h and parts
+    # shared across the phases, one reduction at the end. This is what survives CUDA-graph capture,
+    # because the two phases land in different graphs and must share the same memory.
+    hbuf = torch.empty((P, C3.INTER), dtype=torch.bfloat16, device="cuda")
+    pbuf = torch.empty((P, C3.DIM), dtype=torch.float32, device="cuda")
+    C3.moe_v3_phase(x, slots, wgt, arena, hbuf, pbuf, routing=(bs_res, block_pair, NB))
+    C3.moe_v3_phase(x, slots, wgt, arena, hbuf, pbuf, routing=(bs_mis, block_pair, NB))
+    out2 = C3.moe_v3_reduce(pbuf, T, K)
+    same2 = torch.equal(ref, out2)
+    print(f"        masked-slots form (shared h/parts, one reduce): exact match {same2}  "
+          f"max |delta| {(ref.float() - out2.float()).abs().max():.3e}")
+    fails += 0 if same2 else 1
     n_res = int(blk_res.sum())
     print(f"  T={T} K={K} P={P} BM={BM} NB={NB}  blocks {n_res} resident / {NB - n_res} missing  "
           f"exact match {same}  max |delta| {(ref.float() - out.float()).abs().max():.3e}")

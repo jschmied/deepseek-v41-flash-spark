@@ -879,6 +879,63 @@ def _unpack_into(arena, src_slots: torch.Tensor, scratch, dst_slots: torch.Tenso
             s_dst[dst_slots.long()] = s_src[src_slots.long()]
 
 
+def moe_v3_phase(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena: CB3ArenaV2,
+                 h: torch.Tensor, parts: torch.Tensor, swiglu_limit: float = 10.0,
+                 block_m: int | None = None, routing=None, cfg_up=None, cfg_down=None) -> None:
+    """One PHASE of a split routed MoE: run up+down for `slots` into CALLER-OWNED h and parts.
+
+    Split out of moe_forward_v3 for the resident-first path, where the two phases are separated in
+    time by this layer's expert reads and therefore live in two different CUDA graphs. Two things
+    follow from that and both are why this signature looks the way it does:
+
+      * h and parts are the CALLER'S. moe_forward_v3 allocates them per call, which is fine inside
+        one graph but gives the two phases different buffers. They must be the same memory.
+      * there is NO reduction here. Doing `parts.view(K,T,DIM).sum(dim=0)` per phase and adding the
+        results is NOT the same number: summing six terms as (p0+p2+p3)+(p1+p4+p5) differs from
+        p0+p1+p2+p3+p4+p5 in float. The single fixed-order reduction stays in moe_v3_reduce, called
+        once after the last phase.
+
+    MASK THE BLOCK LIST, NOT THE SLOTS. Passing `slots` with the other phase's entries set to -1
+    looks equivalent and is not: build_routing_small assumes "a slot never has more than BM pairs at
+    this size", which holds for real slots but not for the -1 sentinel group. With 36 pairs and BM
+    16, masking out 25 resident pairs puts 25 entries in block 0 and `blk * BM + rank` runs past its
+    16 slots into block 1's pair list. tools/test_moe_split_bitwise.py caught that as a 1.3e6 delta.
+
+    So the caller builds ONE routing from the full slots and passes `block_slot` already masked --
+    the other phase's blocks set to -1, which both kernels early-out on. `block_pair` is shared and
+    identical across phases, every pair is computed exactly once, and which block a pair sits in
+    never changes its own accumulation over K.
+    """
+    assert x.dtype == torch.bfloat16 and x.shape[1] == DIM and x.is_contiguous()
+    T, K = slots.shape
+    P = T * K
+    BM = block_m or _pick_bm(P)
+    bn1, nw1, ns1 = cfg_up or CB3_UP_CFG[BM]
+    bn2, nw2, ns2 = cfg_down or CB3_DOWN_CFG[BM]
+    if routing is None:
+        block_slot, block_pair, NB = build_routing_small(slots, BM)
+    else:
+        block_slot, block_pair, NB = routing
+    wgt = weights.reshape(-1)
+    if wgt.dtype != torch.float32 or not wgt.is_contiguous():
+        wgt = wgt.float().contiguous()
+    _cb3v3_up_kernel[(NB, INTER // bn1)](
+        x, arena.w1_lo, arena.w1_hi, arena.w1_cb, arena.s1, arena.w3_lo, arena.w3_hi, arena.w3_cb,
+        arena.s3, h, wgt, block_slot, block_pair, x.stride(0), h.stride(0), float(swiglu_limit),
+        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, NB512=CB3.block_plan(DIM)[0],
+        NB256=CB3.block_plan(DIM)[1], num_warps=nw1, num_stages=ns1)
+    _cb3v3_down_kernel[(NB, DIM // bn2)](
+        h, arena.w2_lo, arena.w2_hi, arena.w2_cb, arena.s2, parts, block_slot, block_pair,
+        h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T,
+        NB512=CB3.block_plan(INTER)[0], NB256=CB3.block_plan(INTER)[1],
+        num_warps=nw2, num_stages=ns2)
+
+
+def moe_v3_reduce(parts: torch.Tensor, T: int, K: int) -> torch.Tensor:
+    """The one fixed-order reduction, unchanged from moe_forward_v3 and called once per layer."""
+    return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
+
+
 def moe_forward_v3_split(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor,
                          arena: CB3ArenaV2, swiglu_limit: float = 10.0, *,
                          block_slot, block_pair, NB: int, BM: int, phase_masks,
