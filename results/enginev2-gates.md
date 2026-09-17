@@ -145,9 +145,13 @@ So it is a **one-time transition after the first generation**, plus a smaller ef
 the tail occasionally. Not a two-state toggle (A B A B) and not steady accumulation (A B C D).
 `S0=9, parity=1` on every generation, confirming parity is constant as predicted.
 
-The one-time transition is the tractable half: v2 keeps ExpertSlots and the physical arena across
-requests, so request 1 deterministically rewrites the LRU order and the expert → slot mapping
-before request 2 starts. v1 carries neither and v1 is reproducible. Job 590 resets one half of the
+The one-time transition is the tractable half. **Correction to what this file said first: v1 does
+NOT drop its expert cache between requests.** `_reset()` (engine/v41_engine.py:646) clears the model
+caches and the stats and never touches `ExpertStore` or the arena. So persistence itself is not the
+defect — v1 persists and stays reproducible. What differs is v2's cache-management SEMANTICS, and
+the concrete one is that on a decode hit in the transient ring v1 calls `_promote_transient()`
+(experts.py:636, fired at :733), moving the hot expert into the LRU and swapping a donor back into
+the ring, while v2's `reserve()` takes the `transient_map` hit and leaves it there. Job 590 resets one half of the
 state at a time — model caches, or the expert map — and logs a digest of the mapping per request so
 an A → B transition can be lined up against a mapping change rather than inferred.
 
@@ -155,6 +159,36 @@ Note the CB3 kernel writes each (token, top-k) pair to a fixed pair position and
 K,T order, so slot assignment should NOT affect arithmetic. If restoring the mapping changes the
 answer, the defect is stale or wrong expert bytes, or a mapping-generation hole — not reduction
 order.
+
+## Job 590 — the model-cache reset is not it; the expert arm was unsound (2026-09-17)
+
+    control  req1 map=21fd9cc19a05 hits=0     [52480, 260, 9162, 294, 5085, 89673, 4061, 305]
+             req2 map=be873e6c8986 hits=2715  [52480, 270, 5085, 18505, 9335, 305, 270, 1167]
+             req3 map=303f04c4cbf2 hits=5578  [52480, 270, 5085, 18505, 9335, 305, 270, 18967]
+    meta     IDENTICAL to control, token for token, all three requests
+    expert   CRASHED -- "slot collision in reserve()"
+
+**The cache-metadata reset changes nothing.** `rollback(0)` + `begin_prompt()` already cover what v1
+clears explicitly, so that hypothesis is retired.
+
+**The expert arm is VOID, and its crash is the proof.** Restoring `lru`/`slot_key` to their old
+values without reloading the corresponding experts points slots at bytes request 1 had overwritten;
+a complete restore needs the physical bytes, the LRU *order* (not just the pairs), `free_lru`,
+`transient_map`, `transient_pos`, `slot_key`, the per-slot generations, no `_pending`/`_displaced`
+leftovers, and the eviction policy's own age/count state. A digest of `sorted((layer, expert, slot))`
+cannot prove equivalent cache state — that arm was uninterpretable before it ran, and the engine's
+assert caught it rather than letting it produce a number.
+
+What the digests do show: the mapping churns every request (`21fd → be87 → 303f`) while `resident`
+stays 2367, which lines the A → B transition up against a mapping change instead of leaving it
+inferred.
+
+**One caveat on the B′/B″ tail, which should not yet be treated as a second defect.** `V2Engine`
+truncates the EMITTED burst to `max_tokens` after `RealLeaves` has already committed the whole
+speculative burst, so a request can execute hidden extra tokens on its final step and perturb
+residency by an amount that depends on acceptance length — 585 had `steps=3` for gen2 and 4 for the
+others. Job 595 asks for 16 tokens and compares the first 8, putting the truncation far past the
+compared prefix.
 
 ## Not yet gated
 
