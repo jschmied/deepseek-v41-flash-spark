@@ -196,6 +196,7 @@ class Engine:
         self._layer_slots: frozenset = frozenset()
         self.c = Counters()
         self.hostprof = HostPhases(os.environ.get("DSV41_HOST_PROFILE") == "1")
+        self._route_dump = [] if os.environ.get("DSV41_ROUTE_DUMP") else None
 
     def close(self):
         self.loader.shutdown()
@@ -344,6 +345,13 @@ class Engine:
             # are the popular ones and carry more pairs each than the tail misses do. Recording both
             # so one run prices both models; the kernel microbenchmark decides between them.
             _uniq = set(_flat)
+            # ROUTE CAPTURE for the kernel microbenchmark. The last attempt to price the split used
+            # SYNTHETIC routes (randperm per token) and produced 36 distinct experts for 36 pairs,
+            # where real decode has ~11.6 -- which is exactly the distribution the cost model turns
+            # on. So the benchmark replays routes captured HERE, from real steps, rather than
+            # inventing them. Off unless DSV41_ROUTE_DUMP is set; appends, never allocates per pair.
+            if self._route_dump is not None:
+                self._route_dump.append((layer, tuple(_flat), tuple(sorted(_miss_e))))
             self.c.pairs_total += len(_flat)
             self.c.pairs_resident += sum(1 for e in _flat if e not in _miss_e)
             self.c.uniq_total += len(_uniq)
@@ -382,6 +390,16 @@ class Engine:
         if self.leaves.shared_first:
             with hp("shared"):
                 self._compute(lambda: self.leaves.shared(layer))
+
+        # PHASE 1 OF THE SPLIT MoE, ahead of the wait. ~94 % of this layer's token-expert pairs use
+        # experts that are already resident (job 480: 94.4 % of one launch's time, +4.0 % overhead),
+        # so that work does not depend on the reads submitted just above. Position matters more than
+        # anything else here: shared_first sat between the two wait branches and overlapped nothing
+        # for three jobs before that was noticed.
+        if self.leaves.resident_first:
+            _missing = [sl for _k, sl, _g in to_load] + [sl for _k, sl, _g in to_wait]
+            with hp("moe_resident"):
+                self._compute(lambda: self.leaves.layer_b_resident(layer, _missing))
 
         # v1 (resolve_blocks): resolve() ends in list(pool.map(...)). Nothing issues work except a
         # call that immediately blocks on it, which is why the device cannot be kept busy at any

@@ -142,6 +142,9 @@ class RealLeaves(Leaves):
     # moved into the read window -- A(L) must finish before the layer's expert ids exist -- so the
     # realisable overlap is bounded by B, not by total GPU time.
     graph_timing = os.environ.get("DSV41_GRAPH_TIMING") == "1"
+    # MIRRORS engine/fastdecode.py's flag, for the same reason shared_first does: declaring the
+    # split without the capture would claim graphs that do not exist.
+    resident_first = os.environ.get("DSV41_RESIDENT_FIRST") == "1"
     # layer_b records a CUDA event and h2d waits on it per slot, so the DEVICE orders slot reuse
     # and the host-side ComputeStream is redundant here -- see Leaves.device_orders_slot_reuse.
     device_orders_slot_reuse = True
@@ -391,6 +394,15 @@ class RealLeaves(Leaves):
             fd.prepare_pending_buffers()   # capture's warm-up overwrites the buffers
         self._gA, self._gB, self._gF = fd.graphs[parity][0], fd.graphs[parity][1], fd.graphs[parity][2]
         self._gS = fd.graphs_shared.get(parity) if self.shared_first else None
+        self._gB1 = self._gB2 = None
+        if self.resident_first:
+            _sp = fd.graphs_split.get(parity)
+            if not _sp or not _sp[0]:
+                raise RuntimeError(
+                    "resident_first is on but engine/fastdecode.py captured no split graphs. "
+                    "DSV41_RESIDENT_FIRST must be set for BOTH -- the engine reads it at import "
+                    "time, so setting it later leaves gB as None and the MoE never runs.")
+            self._gB1, self._gB2 = _sp
         if self.graph_timing and self._gt_ev is None:
             # Two events per graph per layer, reused every step. Recorded on the compute stream and
             # read ONCE per step in gt_drain(), so no synchronisation is added inside the step.
@@ -463,6 +475,24 @@ class RealLeaves(Leaves):
                    "layer's expert ids exist.")
         return "\n".join(out)
 
+    def layer_b_resident(self, layer: int, missing_slots) -> None:
+        """Phase 1 of the split MoE: the pairs whose experts are ALREADY RESIDENT.
+
+        Called by the driver BEFORE it waits on this layer's reads -- that position is the whole
+        point, and it is the lesson from shared_first, whose seam sat between the two wait branches
+        and therefore overlapped nothing for three jobs running.
+
+        `missing_slots` are the arena slots this layer is still waiting for. They go into the
+        engine's static `slot_missing` flags, which the captured graph reads to mask its half of the
+        shared routing; writing them here is the only host work the split adds per layer.
+        """
+        fd = self.fd
+        fd.slot_missing.zero_()
+        if missing_slots:
+            idx = torch.as_tensor(list(missing_slots), dtype=torch.long, device=fd.slot_missing.device)
+            fd.slot_missing[idx] = True
+        self._gB1[layer].replay()
+
     def shared(self, layer: int) -> None:
         """Graph S: the shared expert, into fastdecode's sh_out buffer.
 
@@ -515,13 +545,14 @@ class RealLeaves(Leaves):
         device after this returns, and the only honest statement of "this slot is free again" is an
         event recorded after the replay on the same stream. h2d() waits on it before overwriting.
         """
+        _g = self._gB2[layer] if self.resident_first else self._gB[layer]
         if self.graph_timing:
             self._gt_ev["B"][layer][0].record()
-            self._gB[layer].replay()
+            _g.replay()
             self._gt_ev["B"][layer][1].record()
             self._gt_seen["B"][layer] = True
         else:
-            self._gB[layer].replay()
+            _g.replay()
         ev = torch.cuda.Event()
         ev.record(torch.cuda.current_stream())
         if len(self._last_reader) < self._arena_slots:

@@ -271,6 +271,9 @@ class Leaves:
     # pieces (B1 = shared expert, B2 = routed MoE + the rest); it is a capture-time cost, which is
     # exactly why it is declared here and not toggled per call.
     shared_first = False
+    # Split the routed MoE so the resident pairs can run before this layer's reads land. A provider
+    # that sets this must also implement layer_b_resident().
+    resident_first = False
 
     # --- the per-STEP bracket. Stage 4 of the real bring-up found the contract had only an
     # epilogue (`step_other`, the final head graph) and nowhere to put a prologue -- but a decode
@@ -370,6 +373,10 @@ class Leaves:
     # (tools/cb3_moe.py moe_forward_prefill) over a chunk of many tokens, not the decode path.
     # These exist so the chunked driver -- the only shape that can reach D3 -- stays runnable on
     # the modelled provider. A real provider must define them before prefill means anything.
+    def layer_b_resident(self, layer: int, missing_slots) -> None:
+        """Phase 1 of the split routed MoE. Only called when `resident_first`."""
+        raise NotImplementedError
+
     def prefill_attn(self, layer: int) -> None:
         raise NotImplementedError
 

@@ -111,6 +111,12 @@ if c.pairs_total:
           f"{c.uniq_resident / max(1, c.uniq_total) * 100:.1f} %  <- the WEIGHT-BYTES weight; the MoE "
           f"streams an expert once per launch however many pairs it serves")
     print(f"  unique/layer-step {c.uniq_total / max(1, c.steps * 40):.1f}")
+_rd = os.environ.get("DSV41_ROUTE_DUMP")
+if _rd and e2._route_dump:
+    import pickle
+    with open(_rd, "wb") as fh:
+        pickle.dump(e2._route_dump[-40 * 200:], fh)     # last ~200 steps is plenty
+    print(f"  routes dumped: {len(e2._route_dump)} layer-visits -> {_rd}")
 gt = rl.gt_report()
 if gt:
     print(gt)
