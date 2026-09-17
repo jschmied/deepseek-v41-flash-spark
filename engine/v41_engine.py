@@ -339,6 +339,7 @@ class V41Engine:
     def __init__(self, model_dir: str, max_seq: int = 32768, arena_gb: float | None = None, device: str = "cuda",
                  trace_stats: str | None = None, act_quant: bool = False, spec: bool = True, io_threads: int = 48,
                  transient_slots: int = 400, keep_free_gb: float = 20.0, swa_replay: bool | None = None,
+                 warm_start: bool = True,
                  hot_profile: str | None = None, prune_keep: float | None = None,
                  sim_bits: int | None = None, sim_cold_frac: float = 1.0, prune_select: str = "uniform",
                  expert_format: str = "fp4", sim_cb2_frac: float = 0.0):
@@ -607,7 +608,17 @@ class V41Engine:
             ranked = (EX.rank_from_trace(trace_stats, profile=self.hot_profile) if trace_stats
                       else [(L, e) for e in range(384) for L in range(40)])
         self.model.prune_mask = self.model_prune_mask
-        self.store.warm_start(ranked, log=log)
+        # WHO OWNS THE EXPERT CACHE. With `warm_start=False` this engine allocates the arena
+        # and leaves it EMPTY, and its own ExpertSlots stays unpopulated: the caller owns the
+        # residency. enginev2 does, and it has its own ExpertSlots over the same physical
+        # slots -- two populated maps over one arena is two owners of one resource, and the
+        # copy that reconciled them was a symptom, not a design.
+        self.owns_cache = warm_start
+        if warm_start:
+            self.store.warm_start(ranked, log=log)
+        else:
+            self.warm_rank = ranked
+            log(f"arena allocated EMPTY ({self.store.n_slots} slots); the caller owns residency")
         self.fast = None
         if spec and os.environ.get("DSV41_FAST", "1") == "1":
             from engine.fastdecode import FastDecoder

@@ -59,9 +59,11 @@ class V2Engine(_ServerEngine):
                  transient_slots: int = 400, evict: str = "lru",
                  engram: bool = True, policy: Policy | None = None,
                  n_workers: int = 48, staging: int = 48):
+        # warm_start=False: v1 allocates the arena and the weights and leaves residency ALONE.
+        # v2 owns the expert cache -- its own ExpertSlots, its own loader, its own warm start.
         self.v1 = V41Engine(model_dir, max_seq=max_seq, arena_gb=arena_gb, spec=True,
                             expert_format="cb3", keep_free_gb=keep_free_gb,
-                            transient_slots=transient_slots)
+                            transient_slots=transient_slots, warm_start=False)
         self.max_context = max_seq
         self.tokenizer = self.v1.tokenizer
         v2drivers.N_LAYERS = self.v1.args.n_layers
@@ -71,27 +73,43 @@ class V2Engine(_ServerEngine):
         self.leaves.engram = self.engram_src
         self.driver = v2drivers.Engine(
             policy if policy is not None else Policy(), evict=evict,
-            lru_slots=self.v1.store.n_slots - transient_slots,
+            # The ARENA's capacity, read from the arena -- not from v1's store. v2 must not
+            # reach into bookkeeping it does not own, even to ask how big the memory is.
+            lru_slots=self.v1.arena.slots - transient_slots,
             transient_slots=transient_slots, n_workers=n_workers, staging=staging,
             leaves=self.leaves, engram=self.engram_src)
-        # START FROM v1's RESIDENT SET. The engine's warm start has already filled the arena; v2's
-        # ExpertSlots is separate bookkeeping over the SAME slots, so without this every request
-        # would re-read experts whose bytes are already there.
-        self._adopt_resident()
+        self.warm_start(self.v1.warm_rank)
         self._stats: dict = {}
         # Injectable so the generator CONTRACT (bursts, stop ids, max_tokens, the
         # GeneratorExit path) can be tested without a GPU -- that logic is where a
         # server breaks silently, and it has nothing to do with the device.
         self.device = "cuda"
 
-    def _adopt_resident(self) -> None:
-        sl = self.driver.slots
-        for k, slot in self.v1.store.lru.items():
-            sl.lru[k] = slot
-            sl.slot_key[slot] = k
-            sl.gen[slot] = sl.gen.get(slot, 0)
-            sl.evict.on_insert(k, slot, 0)
-        sl.free_lru = [s for s in sl.free_lru if s not in sl.slot_key]
+    def warm_start(self, ranked_keys, log=print) -> int:
+        """Fill v2's OWN cache, through v2's own reserve/submit path.
+
+        This used to be `_adopt_resident`: v1 warm-started its ExpertSlots and v2 copied the map
+        into its own. That is two populated maps over one arena, and every question about residency
+        then had two answers. Here the reads go through the v2 loader, so the slots, the generation
+        counters and the eviction policy are v2's from the first byte -- and the warm start becomes
+        a measurement of v2's own I/O path rather than of v1's.
+        """
+        keys = list(ranked_keys)[: self.driver.slots.lru_slots]
+        t0 = time.perf_counter()
+        by_layer: dict[int, list[int]] = {}
+        for L, e in keys:
+            by_layer.setdefault(int(L), []).append(int(e))
+        n = 0
+        for L, experts in sorted(by_layer.items()):
+            _slot_of, to_load, _to_wait = self.driver.slots.reserve(L, experts, prefill=False)
+            self.driver.loader.submit(to_load)
+            self.driver.loader.quiesce(timeout=1800)
+            self.driver.loader.drain_forgets()
+            n += len(to_load)
+        gb = self.leaves.read_bytes / 1e9
+        log(f"v2 warm start: {n} experts resident of {len(keys)} ranked, {gb:.1f} GB read "
+            f"in {time.perf_counter() - t0:.0f}s")
+        return n
 
     # ------------------------------------------------------------------ prefill
     def _prefill(self, ids: torch.Tensor):
@@ -153,9 +171,8 @@ class V2Engine(_ServerEngine):
                                         locals().get("t_dec0"))
 
     def _collect(self, n_out: int, wall: float, t_prefill, t_dec0) -> dict:
-        st = self.v1.store.stats
         acc = self.leaves.accepted
-        c = self.driver.c
+        c, sl = self.driver.c, self.driver.slots
         out = {
             "engine": "v2",
             "tokens": n_out,
@@ -166,12 +183,14 @@ class V2Engine(_ServerEngine):
             "steps": len(acc),
             # +1: a step commits the accepted drafts AND the bonus token.
             "accept_len_mean": round(sum(acc) / len(acc) + 1, 2) if acc else None,
-            "expert_hit_rate": round(self.v1.store.hit_rate(), 4),
-            "expert_misses": st["misses"],
-            "prefill_expert_misses": st["prefill_misses"],
-            "nvme_gb": round(st["bytes_read"] / 1e9, 2),
-            "nvme_gb_per_token": round(st["bytes_read"] / 1e9 / max(n_out, 1), 3),
-            "load_wait_s": round(st["load_s"], 2),
+            # v2's OWN counters. Reading v1's store here would report the cache v2 does not use:
+            # with warm_start=False that map is empty and every figure would be a zero or a lie.
+            "expert_hit_rate": round(sl.hit_rate, 4),
+            "expert_misses": sl.misses,
+            "prefill_expert_misses": sl.prefill_misses,
+            "nvme_gb": round(self.leaves.read_bytes / 1e9, 2),
+            "nvme_gb_per_token": round(self.leaves.read_bytes / 1e9 / max(n_out, 1), 3),
+            "nvme_read_s": round(self.leaves.read_s, 2),
             "v2_fetches": c.fetches,
             "v2_blocked_s": round(c.blocked_s, 2),
             "v2_compute_s": round(c.compute_s, 2),

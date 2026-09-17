@@ -24,6 +24,7 @@ class _FakeLeaves:
         self._bursts, self.i = bursts, 0
         self.last_burst, self.accepted, self.grammar = [], [], None
         self.attached = None
+        self.read_bytes, self.read_s = 0, 0.0
 
     def attach(self, *a, **kw):
         self.attached = kw
@@ -40,6 +41,9 @@ class _FakeDriver:
         self.leaves, self.closed = leaves, False
         self.c = types.SimpleNamespace(fetches=0, blocked_s=0.0, compute_s=0.0)
         self.policy = types.SimpleNamespace(global_barrier=True, resolve_blocks=True)
+        # v2 owns the cache now, so stats() reads ExpertSlots' own accounting rather than v1's
+        # store. The fake carries the same surface.
+        self.slots = types.SimpleNamespace(hit_rate=1.0, misses=0, prefill_misses=0)
 
     def decode(self, n):
         for _ in range(n):
@@ -65,10 +69,7 @@ def _engine(bursts, first=7):
     e.engram_src = None
     e._stats = {}
     e.v1 = types.SimpleNamespace(
-        model=types.SimpleNamespace(dspark_seed=lambda *a: None),
-        store=types.SimpleNamespace(stats={"misses": 0, "prefill_misses": 0, "bytes_read": 0,
-                                           "load_s": 0.0}, hit_rate=lambda: 1.0),
-        tables={})
+        model=types.SimpleNamespace(dspark_seed=lambda *a: None), tables={})
     lg = torch.zeros(1, 16); lg[0, first] = 10.0
     e._prefill = lambda ids: (lg, None, 0)
     return e
