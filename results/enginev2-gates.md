@@ -250,6 +250,40 @@ constantly and its contents are always correct, so the cache is exonerated as th
 and the decoded tokens still differ at every request. Prefill and the drafter seed inputs are
 identical; the carrier is inside decode. Job 625 traces the first decode step layer by layer.
 
+## Job 625 — the carrier is the PHYSICAL SLOT ASSIGNMENT (2026-09-18)
+
+First decode step, traced layer by layer, request 1 vs request 2, after 620 showed the prefill is
+bitwise identical:
+
+    layer 4:  h_in  IDENTICAL       route  IDENTICAL
+              slots req1 [[2253, 2497, 2252, 2488, 2502, 2246], ...]
+                    req2 [[2253, 2550, 2252, 2541, 2555, 2246], ...]
+              h_out req1 ( 4.13925838470459, 10178.1162109375)
+                    req2 (-0.3770885467529297, 10174.91015625)
+
+Same input, same route, **the same experts** — 615 verified the mappings byte-for-byte — at
+**different physical slots**, and a different output.
+
+**The mechanism is in `tools/fp4_moe.py:389`.** `build_routing_small` does
+`order = torch.argsort(flat, stable=True)` **on the slot numbers**, and block ids follow that sorted
+order. So the order in which a token's K contributions are accumulated is a function of physical
+slot addresses. Move an expert and the same six numbers are summed in a different order: last-ulp
+differences, which is exactly the 0-to-few-ulp margins job 575 measured, and argmax flips wherever a
+margin is tiny.
+
+This reconciles every earlier result without any of them being wrong. v1 is reproducible because its
+slot assignment repeats across requests; v2's churns. The cache contents were always correct (615).
+The policy toggles were always irrelevant (610). The accept path, drafter, RNG, parity, ring, early
+readiness and metadata were all correctly exonerated — the carrier was never in any of them.
+
+It also promotes the transient-promotion gap
+(`test_a_decode_hit_in_the_transient_ring_is_promoted`, currently xfail) from a parity nicety to a
+plausible reason v2's assignment never settles.
+
+**Job 630 tests the kernel alone** — same experts, two slot assignments, no engine, no cache, no
+scheduler — because the engine-level evidence is circumstantial until the kernel itself is shown to
+be slot-order sensitive.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
