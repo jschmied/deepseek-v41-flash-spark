@@ -879,6 +879,56 @@ def _unpack_into(arena, src_slots: torch.Tensor, scratch, dst_slots: torch.Tenso
             s_dst[dst_slots.long()] = s_src[src_slots.long()]
 
 
+def moe_forward_v3_split(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor,
+                         arena: CB3ArenaV2, swiglu_limit: float = 10.0, *,
+                         block_slot, block_pair, NB: int, BM: int, phase_masks,
+                         cfg_up=None, cfg_down=None) -> torch.Tensor:
+    """moe_forward_v3 run in PHASES over the same routing, for the resident-first split.
+
+    The point is to start the resident pairs while this layer's misses are still loading. Jobs
+    400/405 put graph B at 69.4 ms/step of device time and jobs 460/465 put PAIR residency at
+    94-95 %, so most of that work does not depend on the reads it currently waits behind.
+
+    NO KERNEL CHANGE IS NEEDED, which is what makes this safe. `build_routing_small` emits one
+    BM-block per distinct slot and residency is a property of the slot, so every block is wholly
+    resident or wholly missing. Both kernels already early-out on `if slot < 0: return`. So a phase
+    is just `block_slot` with the other phase's blocks set to -1: same `block_pair`, same NB, same
+    tiling, same per-pair arithmetic. Every pair is computed exactly once, in the same program
+    geometry it would have had unsplit, so the result is bitwise identical -- see
+    tools/test_moe_split_bitwise.py, which is the gate on that claim.
+
+    `phase_masks` is a sequence of masked block_slot tensors, applied in order. The caller is
+    expected to wait for the expert reads between them; nothing here enforces that, because the
+    ordering belongs to the driver and this function must stay graph-capturable.
+    """
+    assert x.dtype == torch.bfloat16 and x.shape[1] == DIM and x.is_contiguous()
+    T, K = slots.shape
+    P = T * K
+    dev = x.device
+    bn1, nw1, ns1 = cfg_up or CB3_UP_CFG[BM]
+    bn2, nw2, ns2 = cfg_down or CB3_DOWN_CFG[BM]
+    wgt = weights.reshape(-1)
+    if wgt.dtype != torch.float32 or not wgt.is_contiguous():
+        wgt = wgt.float().contiguous()
+    # Allocated once and written across the phases: every pair lands in exactly one of them, so the
+    # buffer is fully defined by the end for the same reason it is in the unsplit path.
+    h = torch.empty((P, INTER), dtype=torch.bfloat16, device=dev)
+    parts = torch.empty((P, DIM), dtype=torch.float32, device=dev)
+    for mask in phase_masks:
+        _cb3v3_up_kernel[(NB, INTER // bn1)](
+            x, arena.w1_lo, arena.w1_hi, arena.w1_cb, arena.s1, arena.w3_lo, arena.w3_hi,
+            arena.w3_cb, arena.s3, h, wgt, mask, block_pair, x.stride(0), h.stride(0),
+            float(swiglu_limit), TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1,
+            NB512=CB3.block_plan(DIM)[0], NB256=CB3.block_plan(DIM)[1],
+            num_warps=nw1, num_stages=ns1)
+        _cb3v3_down_kernel[(NB, DIM // bn2)](
+            h, arena.w2_lo, arena.w2_hi, arena.w2_cb, arena.s2, parts, mask, block_pair,
+            h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T,
+            NB512=CB3.block_plan(INTER)[0], NB256=CB3.block_plan(INTER)[1],
+            num_warps=nw2, num_stages=ns2)
+    return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
+
+
 def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor,
                         arena: CB3ArenaV2, swiglu_limit: float = 10.0,
                         batch: int | None = None) -> torch.Tensor:
