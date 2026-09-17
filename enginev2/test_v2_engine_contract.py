@@ -229,3 +229,32 @@ def test_decode_rate_excludes_the_prefill_token():
     assert e2.stats()["decode_tok_s"] is None, (
         f"a 1-token generation reported decode_tok_s={e2.stats()['decode_tok_s']}: the prefill "
         f"token is being charged to decode")
+
+
+def test_attach_preserves_an_installed_engram_source():
+    """The engram source belongs to the provider, not to the request.
+
+    `attach()` used to null it, and V2Engine installs the source at construction and then attaches
+    -- so it was wired, wiped, and wiped again on every request. `layer_a`'s
+    `if self.engram is not None: deliver(...)` never ran, the driver still issued the reads and
+    waited on them, and `begin_step` zeroed the rows instead. That is engram_ablate: a DIFFERENT
+    MODEL, not a slower one, and jobs 560 and 565 decoded that way without anything failing.
+    """
+    from enginev2.real import RealLeaves
+
+    class _Src:
+        name = "fake"
+
+        def deliver(self, layer, fd):
+            pass
+
+    rl = RealLeaves.__new__(RealLeaves)      # no CB3 file, no engine: only the attribute contract
+    rl.engram = _Src()
+    rl.engram_ablated = 0
+    # The two lines attach() runs that used to clobber it are gone; assert on the source directly so
+    # this fails if they come back.
+    import inspect
+    src = inspect.getsource(RealLeaves.attach)
+    assert "self.engram = None" not in src, (
+        "attach() clears the engram source again -- decode would silently run ablated")
+    assert isinstance(rl.engram, _Src)

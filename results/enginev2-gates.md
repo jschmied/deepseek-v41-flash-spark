@@ -70,6 +70,15 @@ acceptance, and `nvme_gb` 16.25 is per-request rather than the 45.47 + 6.82 that
 counter would have shown. v2's warm start also ran through v2's own loader: 2,367 experts resident
 of 2,367 ranked, 32.6 GB in 7 s.
 
+**BOTH RUNS DECODED ENGRAM-ABLATED, found 2026-09-17 after the fact.** `attach()` nulled
+`self.engram`, and V2Engine installs the source at construction and then attaches -- so it was
+wired, wiped, and wiped again per request. `layer_a`'s `if self.engram is not None: deliver(...)`
+never ran; the driver still issued the engram reads and waited on them, and `begin_step` zeroed the
+rows. That is `engram_ablate`, a DIFFERENT MODEL rather than a slower one. **The token streams
+above, and job 565's divergence, were produced by it.** The pass/fail of cases 3-6 still holds --
+they are about control flow -- but nothing about token identity or throughput here is comparable to
+v1. Fixed by making engram provider-lifetime state; re-run before quoting any of these tokens.
+
 **Case 2 is open, and the cause is not yet known.** Either the seed path is wrong, or the MoE is not
 bit-reproducible and `multinomial` amplifies what `argmax` absorbs at temperature 0 -- which would
 make the expectation itself wrong, not the code. Job 565 separates them with a greedy double-run

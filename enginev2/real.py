@@ -236,6 +236,14 @@ class RealLeaves(Leaves):
         # is where the line it matched already was, so it changed nothing.
         self.eng = None
         self.fd = None
+        # ENGRAM IS PROVIDER-LIFETIME, NOT REQUEST STATE. attach() used to null it, and V2Engine
+        # installs the source at construction and then attaches -- so the source was wired, wiped,
+        # and wiped again on every request, and layer_a's `if self.engram is not None: deliver(...)`
+        # never ran. The driver still issued the reads and waited on them; begin_step then ZEROED
+        # the rows, which is engram_ablate -- a different model, not a neutral default. Jobs 560 and
+        # 565 decoded that way.
+        self.engram = None
+        self.engram_ablated = 0
         self.accepted: list = []
         self.last_burst: list = []
         self.hist: list = []
@@ -399,8 +407,7 @@ class RealLeaves(Leaves):
         self.stop_ids = frozenset()
         # The engram source, if one is attached. It owns the reads; this owns the dequant+H2D at
         # the consumer, because to_device() makes CUDA calls and may not run on a reader thread.
-        self.engram = None
-        self.engram_ablated = 0
+        # engram is NOT reset here: it belongs to the provider, not to the request.
         self._S = int(self.fd.c.len)
         self.spec = bool(spec)
         self.temperature = float(temperature)
