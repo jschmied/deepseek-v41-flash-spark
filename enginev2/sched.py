@@ -341,13 +341,21 @@ class LoaderService:
         # cudaMemcpyAsync reads out of this buffer until its completion event, so handing it to
         # another reader early corrupts the transfer in flight. The previous revision released it
         # at handoff under D2, which made the v2 arm compare against something unbuildable.
+        # QUEUED -> RUNNING IS ONE CRITICAL SECTION, and it must stay that way. Splitting it across
+        # two acquisitions leaves a window in which this id is in NEITHER `_queued` nor `_running`,
+        # and cancel()'s classifier falls through to "finished": the driver then un-maps the key and
+        # clears the pending marker, the slot becomes an ordinary eviction victim, and the next
+        # reserve() can hand it to another expert while THIS worker goes on to read and H2D into it.
+        # That is the same torn-slot failure the published-vs-landed fix closed, one step earlier in
+        # the lifecycle -- and that fix is what introduced it. There must be no externally visible
+        # state between QUEUED and RUNNING.
+        ident = (slot, gen)
         with self._lk:
-            self._queued.discard((slot, gen))        # past the point of cancelling
-            cancelled = (slot, gen) in self._cancelled
-            self._cancelled.discard((slot, gen))     # consumed either way: no marker outlives its read
-        if not cancelled:
-            with self._lk:
-                self._running.add((slot, gen))
+            self._queued.discard(ident)              # past the point of cancelling
+            cancelled = ident in self._cancelled
+            self._cancelled.discard(ident)           # consumed either way: no marker outlives its read
+            if not cancelled:
+                self._running.add(ident)
         if cancelled:
             # The DRIVER already un-mapped this and cleared its pending mark when it cancelled --
             # synchronously, so the slot was available to the very next reserve() rather than to

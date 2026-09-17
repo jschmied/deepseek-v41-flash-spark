@@ -1668,3 +1668,111 @@ def test_completion_clears_the_running_mark_so_a_later_cancel_is_not_misread():
             assert ld.ready.is_landed(sl, g), f"({sl},{g}) never marked landed"
     finally:
         e.close()
+
+
+# ----------------------------------------------------------------------------------------------
+# QUEUED -> RUNNING MUST BE ATOMIC.
+#
+# cancel() classifies on membership: _queued -> "queued", _running -> "running", neither ->
+# "finished". If the worker leaves _queued in one critical section and enters _running in another,
+# an id is briefly in NEITHER, cancel() calls a read that has not started yet "finished", the driver
+# un-maps it and clears its pending marker, and the slot can be handed to another expert while this
+# worker goes on to write it. Same torn-slot class as published-vs-landed, one step earlier.
+#
+# The behavioural test below can only observe the post-state, so the structural one proves the
+# property directly: both mutations must happen inside the SAME lock acquisition.
+# ----------------------------------------------------------------------------------------------
+
+class _CountingLock:
+    """Wraps the service lock and numbers each acquisition, so a mutation can record which one it
+    happened in. Only the `with` protocol is used by LoaderService."""
+
+    def __init__(self, inner):
+        self._inner, self.gen = inner, 0
+
+    def __enter__(self):
+        self._inner.acquire()
+        self.gen += 1
+        return self
+
+    def __exit__(self, *a):
+        self._inner.release()
+        return False
+
+
+class _RecordingSet(set):
+    def __init__(self, lock, log, name):
+        super().__init__()
+        self._lock, self._log, self._name = lock, log, name
+
+    def add(self, x):
+        self._log.append((self._name, "add", x, self._lock.gen))
+        return super().add(x)
+
+    def discard(self, x):
+        if x in self:
+            self._log.append((self._name, "discard", x, self._lock.gen))
+        return super().discard(x)
+
+
+def test_queued_to_running_happens_in_one_lock_acquisition():
+    e = mk(V2, lru_slots=16, transient_slots=8)
+    try:
+        ld = e.loader
+        log: list = []
+        lk = _CountingLock(ld._lk)
+        ld._lk = lk
+        q, r = _RecordingSet(lk, log, "queued"), _RecordingSet(lk, log, "running")
+        q.update(ld._queued)
+        r.update(ld._running)
+        ld._queued, ld._running = q, r
+
+        slot_of, to_load, _ = e.slots.reserve(0, [0, 1], prefill=False)
+        ld.submit(to_load, speculative=True)
+        ld.quiesce(timeout=30)
+
+        for _, sl, g in to_load:
+            ident = (sl, g)
+            leaves = [x[3] for x in log if x[0] == "queued" and x[2] == ident and x[1] == "discard"]
+            enters = [x[3] for x in log if x[0] == "running" and x[2] == ident and x[1] == "add"]
+            assert leaves and enters, f"no transition recorded for {ident}: {log}"
+            assert leaves[0] == enters[0], (
+                f"{ident} left _queued in lock acquisition {leaves[0]} and entered _running in "
+                f"{enters[0]}. Between them cancel() sees neither set and returns 'finished', which "
+                f"releases the slot while this worker is about to write it.")
+    finally:
+        e.close()
+
+
+def test_a_read_that_has_started_is_never_cancelled_as_finished():
+    """Behavioural half: hold a worker inside read(), then cancel. It must classify as running."""
+    import threading as _th
+    e = mk(V2, lru_slots=16, transient_slots=8)
+    try:
+        ld = e.loader
+        entered, release = _th.Event(), _th.Event()
+        inner = ld.leaves.read
+
+        def blocking_read(key, pool, ctx=None, scored=True):
+            entered.set()
+            release.wait(10)
+            return inner(key, pool, ctx, scored)
+
+        ld.leaves.read = blocking_read
+        slot_of, to_load, _ = e.slots.reserve(0, [0], prefill=False)
+        ld.submit(to_load, speculative=True)
+        assert entered.wait(10), "worker never reached read()"
+
+        key, sl, g = to_load[0]
+        out = ld.cancel([(key, sl, g)])
+        assert out == [(key, sl, g, "running")], (
+            f"got {out}: a read already inside read() was classified as finished, so its slot is "
+            f"released while the read is still in flight")
+        release.set()
+        ld.quiesce(timeout=30)
+    finally:
+        try:
+            release.set()
+        except Exception:
+            pass
+        e.close()
