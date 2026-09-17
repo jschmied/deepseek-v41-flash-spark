@@ -96,8 +96,17 @@ def build(eng, obs=None, prefetch=None):
     src = RealEngramSource(eng, rl) if ENGRAM else None
     rl.engram = src
     e2 = v2drivers.Engine(Policy(), evict=EVICT, lru_slots=eng.store.n_slots - 8,
-                          transient_slots=8, n_workers=8, staging=8, expert_read_qd=8,
-                          h2d_inflight=2, leaves=rl, observer=obs, prefetch=prefetch,
+                          transient_slots=8,
+                          # ENV-OVERRIDABLE. These were fixed at 8/8/8/2 while production runs
+                          # io 48/96, and job 545 then saturated at 2.8 GB/s with the queue full
+                          # (depth-0 1.8 %, mean depth 5.7) against a device that does ~6.3 from
+                          # depth 2. A ceiling measured at one eighth of the shipped concurrency is
+                          # not a device ceiling until it has been swept.
+                          n_workers=int(os.environ.get("N_WORKERS", 8)),
+                          staging=int(os.environ.get("STAGING", 8)),
+                          expert_read_qd=int(os.environ.get("READ_QD", 8)),
+                          h2d_inflight=int(os.environ.get("H2D_INFLIGHT", 2)),
+                          leaves=rl, observer=obs, prefetch=prefetch,
                           engram=src)
     for k, slot in eng.store.lru.items():
         e2.slots.lru[k] = slot
