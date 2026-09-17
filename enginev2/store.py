@@ -399,6 +399,14 @@ class SlotReady:
         # the prediction that issued the read.
         self._ctx: dict[tuple, tuple] = {}   # (slot, gen) -> (producer_ctx, cause_id, scored)
         self._err: dict[tuple, BaseException] = {}
+        # PUBLISHED IS NOT LANDED, and conflating them was a real bug. Since the device-ordered
+        # fast path, set() is called when the H2D has been ENQUEUED and its event published -- the
+        # point at which a consumer may safely queue a wait_event and go on. The bytes are still
+        # moving. Everything that needs the bytes to have actually ARRIVED -- deciding that a slot
+        # may be recycled, counting a prefetch as a timely hit, measuring its lead -- needs this
+        # second mark instead, which is set only after the copy has completed.
+        self._landed: set[tuple] = set()
+        self._landed_ts: dict[tuple, int] = {}
 
     def arm(self, slot: int, gen: int, ctx=NO_CTX, cause_id: int = 0, scored: bool = True) -> None:
         # Still clears nothing -- clearing here is what stranded waiters before. It only RECORDS
@@ -419,8 +427,26 @@ class SlotReady:
             self._cv.notify_all()
 
     def is_done(self, slot: int, gen: int) -> bool:
+        """PUBLISHED, not landed. Do not use this to decide whether a slot's write is over -- see
+        `is_landed`. Cancellation used this and could therefore classify a copy that was still in
+        flight as "finished", un-map its slot and hand it to the next reserve() while the old H2D
+        was still writing it."""
         with self._lk:
             return (slot, gen) in self._done
+
+    def set_landed(self, slot: int, gen: int) -> None:
+        """The copy has physically completed. Called from _complete_h2d, after the event."""
+        with self._lk:
+            self._landed.add((slot, gen))
+            self._landed_ts[(slot, gen)] = now_ns()
+
+    def is_landed(self, slot: int, gen: int) -> bool:
+        with self._lk:
+            return (slot, gen) in self._landed
+
+    def landed_ts(self, slot: int, gen: int):
+        with self._lk:
+            return self._landed_ts.get((slot, gen))
 
     def state(self, slot: int, gen: int) -> str:
         """PENDING / READY / ERROR. `ready_ts` alone cannot tell READY from ERROR -- set() records a

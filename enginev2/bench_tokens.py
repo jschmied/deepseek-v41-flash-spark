@@ -50,7 +50,17 @@ rl = RealLeaves(os.path.expanduser("~/dsv41-cb3/experts-cb3-s3.bin"), eng.arena)
 rl.attach(eng, None, spec=True, temperature=0.0, first_token=first)
 src = RealEngramSource(eng, rl) if ENGRAM else None
 rl.engram = src
-e2 = v2drivers.Engine(Policy(), evict=EVICT, lru_slots=eng.store.n_slots - 8, transient_slots=8,
+# D3 (global_barrier) is the difference between "wait for every demand copy to LAND" and "wait for
+# the slots this layer needs to be PUBLISHED". With it on, the driver blocks until _demand hits 0,
+# which _complete_h2d decrements only after handle.synchronize() -- so the whole device-ordered
+# fast path sits downstream of a full physical barrier and cannot show a benefit. Off, the per-slot
+# published event and await_copies are what order the work, and graph B can be queued while bytes
+# are still in flight. Default keeps Policy(), i.e. V1, so every earlier number stays comparable.
+POL = Policy(global_barrier=os.environ.get("DSV41_GLOBAL_BARRIER", "1") == "1")
+print(f"  policy: global_barrier={POL.global_barrier} resolve_blocks={POL.resolve_blocks} "
+      f"compute_barrier_global={POL.compute_barrier_global} "
+      f"lease_until_completion={POL.lease_until_completion}")
+e2 = v2drivers.Engine(POL, evict=EVICT, lru_slots=eng.store.n_slots - 8, transient_slots=8,
                       n_workers=8, staging=8, expert_read_qd=8, h2d_inflight=2,
                       leaves=rl, engram=src)
 for k, slot in eng.store.lru.items():

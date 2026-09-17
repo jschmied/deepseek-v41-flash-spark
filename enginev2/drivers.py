@@ -458,7 +458,14 @@ class Engine:
                 # READY or LATE? A prefetch whose read is still in flight is a mapping hit that the
                 # consumer still blocks on; counting it with the ready ones would report a win the
                 # engine never got.
-                ready_ts = self.loader.ready.ready_ts(slot, gen) if st == "ready" else None
+                #
+                # LANDED, NOT PUBLISHED. Since the device-ordered fast path, SlotReady.set() fires
+                # when the H2D is ENQUEUED, so `ready_ts` became the enqueue time and a prefetch
+                # whose bytes were still moving counted as a timely hit with an overstated lead.
+                # This statistic is about what the engine actually had in hand, so it takes the
+                # landed mark, which is written only after the copy completes.
+                ready_ts = (self.loader.ready.landed_ts(slot, gen)
+                            if st == "ready" and self.loader.ready.is_landed(slot, gen) else None)
                 if ready_ts is not None:
                     lead = now_ns() - ready_ts
                     if att.scored:

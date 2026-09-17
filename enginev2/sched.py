@@ -282,6 +282,18 @@ class LoaderService:
         # resident: its slot was taken from the cache and it will never be used. The read is paid
         # for either way -- that is the honest cost of being wrong -- but the residency is not.
         self._discard: set = set()
+        # READS THAT HAVE STARTED AND WHOSE BYTES HAVE NOT LANDED. cancel() used
+        # SlotReady.is_done() for this, which stopped meaning "the write is over" the moment the
+        # device-ordered fast path began publishing readiness at H2D ENQUEUE time. A speculative
+        # read could then be classified "finished" while its copy was still running: the driver
+        # un-mapped the key and cleared the pending marker, the slot became an ordinary eviction
+        # victim, and the next reserve() could hand it to another expert whose H2D is issued on a
+        # different worker stream -- write-after-write with nothing ordering the two. That is the
+        # torn-slot class the I/O hardening closed, reopened by a change in what "ready" means.
+        #
+        # So cancellation reads THIS, which is owned by _lk and flipped exactly twice: on when a
+        # worker commits to the read, off in _complete_h2d once the bytes are down.
+        self._running: set = set()
         # ExpertSlots IS NOT THREAD-SAFE -- lru, free_lru and the policy buckets are plain dicts
         # mutated by the driver. Un-mapping from a worker was tolerable while it only happened on
         # the rare error path; routing every discarded prefetch through it made the race routine and
@@ -333,6 +345,9 @@ class LoaderService:
             self._queued.discard((slot, gen))        # past the point of cancelling
             cancelled = (slot, gen) in self._cancelled
             self._cancelled.discard((slot, gen))     # consumed either way: no marker outlives its read
+        if not cancelled:
+            with self._lk:
+                self._running.add((slot, gen))
         if cancelled:
             # The DRIVER already un-mapped this and cleared its pending mark when it cancelled --
             # synchronously, so the slot was available to the very next reserve() rather than to
@@ -459,8 +474,13 @@ class LoaderService:
             # bytes -- silent, and permanent for the life of the process. Deferred to the driver
             # for the same reason as above; drain_forgets() runs before the next reserve().
             with self._lk:
+                # Leave _running here too, or a read that died before its H2D stays "in flight"
+                # forever and every later cancel() of that slot is misclassified as running.
+                self._running.discard((slot, gen))
+                self._discard.discard((slot, gen))
                 self._forget.append((key, slot, gen, False))
             self.ready.set(slot, gen, err=exc)
+            self.ready.set_landed(slot, gen)     # nothing is writing this slot any more
         finally:
             if not deferred:
                 if permit_held:
@@ -497,19 +517,27 @@ class LoaderService:
                 self.h2d_s += dt
             if not (handle is not None and self._dev_orders):
                 self.ready.set(slot, gen)     # already published at enqueue on the fast path
-            # Was this speculation discarded while it was in flight? The read is done and paid for;
-            # refuse it the cache slot. Nothing ever waits on a speculative read, so un-mapping
-            # after completion cannot strand a consumer.
+            self.ready.set_landed(slot, gen)  # the bytes are down: the slot may be recycled
+            # ONE critical section, because these two facts must change together. Leaving _running
+            # and reading _discard separately leaves a window in which cancel() sees neither the
+            # running mark nor a landed slot, calls the read "finished", and un-maps a slot whose
+            # copy this thread has not yet finished accounting for.
             with self._lk:
+                self._running.discard((slot, gen))
                 drop = (slot, gen) in self._discard
                 self._discard.discard((slot, gen))
-            if drop:
-                with self._lk:
+                if drop:
+                    # Was this speculation discarded while it was in flight? The read is paid for;
+                    # refuse it the cache slot. Nothing ever waits on a speculative read, so
+                    # un-mapping after completion cannot strand a consumer.
                     self._forget.append((key, slot, gen, False))
         except BaseException as exc:              # noqa: BLE001
             with self._lk:
+                self._running.discard((slot, gen))   # or a failed copy is "running" forever
+                self._discard.discard((slot, gen))
                 self._forget.append((key, slot, gen, False))
             self.ready.set(slot, gen, err=exc)
+            self.ready.set_landed(slot, gen)         # nothing is writing this slot any more
         finally:
             wctx.__exit__(None, None, None)
             self.h2d_sem.release()
@@ -679,12 +707,16 @@ class LoaderService:
                     # rollback: the read never started, so the displaced tenant's bytes are intact
                     self._forget.append((key, slot, gen, True))
                     out.append((key, slot, gen, "queued"))
-                elif self.ready.is_done(slot, gen):
-                    self._forget.append((key, slot, gen, False))   # the slot WAS overwritten
-                    out.append((key, slot, gen, "finished"))
-                else:
-                    self._discard.add((slot, gen))   # in flight: collected at completion
+                elif (slot, gen) in self._running:
+                    # IN FLIGHT -- the read or its copy is still happening. Collected at completion
+                    # instead, because un-mapping now would release the slot while it is being
+                    # written. NOT `ready.is_done`: that means PUBLISHED since the device-ordered
+                    # fast path, and a published copy is still moving bytes.
+                    self._discard.add((slot, gen))
                     out.append((key, slot, gen, "running"))
+                else:
+                    self._forget.append((key, slot, gen, False))   # landed; the slot WAS overwritten
+                    out.append((key, slot, gen, "finished"))
         return out
 
     def quiesce(self, timeout: float = 60.0) -> None:

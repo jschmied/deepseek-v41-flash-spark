@@ -1592,3 +1592,79 @@ def test_speculation_cannot_evict_the_current_layers_slots():
         sl2.clear_pending(so[i], sl2.gen[so[i]])
     spec2, refused2 = sl2.reserve_speculative([(0, 90), (0, 91), (0, 92)])
     assert len(spec2) == 3 and refused2 == 0, (len(spec2), refused2)
+
+
+# ----------------------------------------------------------------------------------------------
+# PUBLISHED IS NOT LANDED.
+#
+# Since the device-ordered fast path, SlotReady.set() fires when the H2D is ENQUEUED. cancel() used
+# SlotReady.is_done() to mean "the write is over", so a speculative read whose copy was still
+# running could be classified "finished": the driver then un-maps the key, clears the pending
+# marker, and the slot becomes an ordinary eviction victim while an H2D is still writing it. The
+# next tenant's copy is issued on a different worker stream with nothing ordering the two writes --
+# the torn-slot class the I/O hardening closed, reopened by a change in what "ready" means.
+#
+# The whole existing suite passed with that bug present, because every modelled provider completes
+# its h2d inline and so is never published-but-not-landed. These drive the state directly.
+# ----------------------------------------------------------------------------------------------
+
+def test_a_published_but_unlanded_copy_is_cancelled_as_running_not_finished():
+    e = mk(V2, lru_slots=16, transient_slots=8)
+    try:
+        ld = e.loader
+        key, slot, gen = (3, 7), 2, 1
+        # The state a device-ordered provider leaves between enqueue and completion.
+        with ld._lk:
+            ld._running.add((slot, gen))
+        ld.ready.set(slot, gen)                       # PUBLISHED
+        assert ld.ready.is_done(slot, gen)
+        assert not ld.ready.is_landed(slot, gen)
+
+        out = ld.cancel([(key, slot, gen)])
+        assert out == [(key, slot, gen, "running")], (
+            f"got {out}: a copy that is published but still moving bytes was classified as "
+            f"finished, which releases its slot to the next reserve() mid-write")
+        with ld._lk:
+            assert (slot, gen) in ld._discard, "not queued for discard at completion"
+            assert not any(f[1] == slot for f in ld._forget), (
+                "un-mapped immediately -- the slot can now be handed to another expert while the "
+                "old H2D is still writing it")
+    finally:
+        e.close()
+
+
+def test_a_landed_copy_is_still_cancelled_as_finished():
+    """The other half: once the bytes are down the slot really can be released at once, and the
+    fix must not have turned every cancellation into a deferred one."""
+    e = mk(V2, lru_slots=16, transient_slots=8)
+    try:
+        ld = e.loader
+        key, slot, gen = (3, 8), 3, 1
+        ld.ready.set(slot, gen)
+        ld.ready.set_landed(slot, gen)
+        out = ld.cancel([(key, slot, gen)])
+        assert out == [(key, slot, gen, "finished")], out
+        with ld._lk:
+            assert any(f[1] == slot for f in ld._forget), "a landed slot was not un-mapped"
+            assert (slot, gen) not in ld._discard
+    finally:
+        e.close()
+
+
+def test_completion_clears_the_running_mark_so_a_later_cancel_is_not_misread():
+    """_complete_h2d must leave _running, or every later cancellation of that slot is deferred
+    forever and the discard set grows without bound."""
+    e = mk(V2, lru_slots=16, transient_slots=8)
+    try:
+        ld = e.loader
+        uniq = [0, 1]
+        slot_of, to_load, _ = e.slots.reserve(0, uniq, prefill=False)
+        ld.submit(to_load, speculative=True)
+        ld.quiesce(timeout=30)
+        with ld._lk:
+            left = set(ld._running)
+        assert not left, f"_running still holds {left} after quiesce -- completions are not clearing it"
+        for k, sl, g in to_load:
+            assert ld.ready.is_landed(sl, g), f"({sl},{g}) never marked landed"
+    finally:
+        e.close()
