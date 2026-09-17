@@ -18,7 +18,11 @@ working tree of the same repo on a different branch, so every real-graph number 
 described code it did not contain.
 
 Bitwise, `tools/test_moe_split_bitwise.py`: `SPLIT IS BITWISE`, `max |delta| 0.000e+00` at T=6, T=1
-and T=5, both the block form and the masked-slots form.
+and T=5, both the block form and the phase API with shared h/parts. Neither variant masks the
+original `slots` tensor -- both mask `block_slot`. Commit 66aa464 exists *because* masking
+`slots` was tried: its -1 sentinel group exceeded BM and overflowed into the next block's pair
+list, and it passed on T=1 because the second phase was empty. The earlier "masked-slots form"
+label here invited someone to try it again.
 
 ## Job 536 — v2 prefill is bitwise identical to v1's layer-major pass (2026-09-17)
 
