@@ -19,7 +19,11 @@ Run:  ARM=oracle HORIZON=1 DSV41_CB3_CACHE=... python enginev2/ab_oracle_prefetc
 import os, sys, time, collections, torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-V1 = os.path.expanduser("~/git/deepseek-v41-flash-spark")
+# THIS checkout -- see RealLeaves.ROOT in enginev2/real.py. This used to be a hardcoded
+# ~/git/deepseek-v41-flash-spark: a DIFFERENT working tree of the SAME repo, on a different
+# branch, whose engine/ silently shadowed this one. Every real-graph number this branch
+# produced came from code that was not committed here.
+V1 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [V1, os.path.join(V1, "tools")]
 os.chdir(V1)
 
