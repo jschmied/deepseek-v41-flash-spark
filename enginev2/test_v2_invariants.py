@@ -1776,3 +1776,39 @@ def test_a_read_that_has_started_is_never_cancelled_as_finished():
         except Exception:
             pass
         e.close()
+
+
+def test_slot_readiness_does_not_grow_without_bound():
+    """SlotReady kept every (slot, gen) for the life of the process.
+
+    Measured before the fix: 4.0 entries per completed generation (_done, _ts, _landed,
+    _landed_ts, plus _ctx when a producer context was recorded), never pruned. At the engine's
+    19 expert reads per output token that is ~1.9M generations over a 100k-token session -- order
+    of a gigabyte of unified memory, on a box where memory is the largest measured throughput
+    lever. The published-vs-landed split doubled the per-generation cost, so this guards the fix
+    rather than the original design.
+    """
+    e = mk(V2, lru_slots=64, transient_slots=16)
+    try:
+        def one_round(base: int) -> None:
+            for layer in range(4):
+                uniq = [(base * 5 + layer * 3 + i) % 50 for i in range(6)]
+                e.decode_layer(layer) if False else None
+                slot_of, to_load, to_wait = e.slots.reserve(layer, uniq, prefill=False)
+                e.loader.submit(to_load)
+                e.loader.quiesce(timeout=30)
+                e.loader.drain_forgets()
+                for _k, sl, g in to_load:
+                    e.loader.ready.retire(sl, g)
+
+        for r in range(5):
+            one_round(r)
+        early = e.loader.ready.tracked()
+        for r in range(5, 25):
+            one_round(r)
+        late = e.loader.ready.tracked()
+        assert late <= early + 8, (
+            f"SlotReady grew {early} -> {late} over 20 more rounds: retirement is not reaching "
+            f"some path, and this table is unbounded in a long session")
+    finally:
+        e.close()

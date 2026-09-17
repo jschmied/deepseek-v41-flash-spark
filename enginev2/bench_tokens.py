@@ -107,6 +107,10 @@ if c.pairs_total:
           f"MoE split; the unique-key hit rate is NOT it")
     print(f"  pairs/layer-step {c.pairs_total / max(1, c.steps * 40):.1f}, "
           f"non-resident pairs {c.pairs_total - c.pairs_resident}")
+    print(f"  UNIQUE residency {c.uniq_resident}/{c.uniq_total} = "
+          f"{c.uniq_resident / max(1, c.uniq_total) * 100:.1f} %  <- the WEIGHT-BYTES weight; the MoE "
+          f"streams an expert once per launch however many pairs it serves")
+    print(f"  unique/layer-step {c.uniq_total / max(1, c.steps * 40):.1f}")
 gt = rl.gt_report()
 if gt:
     print(gt)

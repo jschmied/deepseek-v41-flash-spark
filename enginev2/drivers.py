@@ -124,6 +124,11 @@ class Counters:
     # resident-first MoE split before this used the unique-key hit rate, which is the wrong weight.
     pairs_total: int = 0
     pairs_resident: int = 0
+    # UNIQUE experts touched and how many were resident. This is the weight-bytes weight: the MoE
+    # emits one block per distinct slot, so cost follows unique experts on a bandwidth-bound kernel
+    # while `pairs_*` follows arithmetic. They differ a lot -- ~11.6 unique per 36 pairs at decode.
+    uniq_total: int = 0
+    uniq_resident: int = 0
 
     @property
     def steps_per_s(self) -> float:
@@ -316,16 +321,33 @@ class Engine:
         # every pair looks resident and this reports 100 %. That was the third wrong version of this
         # one statistic (the first replayed graph A without graph B; the second used the unique-key
         # hit rate as the weight), which is why the assert below exists rather than a comment.
-        _miss_e = {k[0][1] for k in to_load} | {k[0][1] for k in to_wait}
+        _miss_items = list(to_load) + list(to_wait)
         _flat = getattr(route, "flat_cpu", None)
         if _flat:
-            # Every missing expert must be one this layer actually routed to. If the wrong tuple
-            # element is ever taken again, this fails loudly instead of printing a plausible number.
+            # PIN THE WHOLE TUPLE CONTRACT, not just the id. `_miss_e <= set(flat)` catches reading
+            # `slot` as `expert`, but NOT a wrong-LAYER key whose expert id happens to occur in this
+            # layer too -- and that would print a plausible number. This statistic has already had
+            # three wrong implementations, so both halves are asserted.
+            assert all(k[0] == layer for k, _sl, _g in _miss_items), (
+                f"layer {layer}: miss keys from another layer: "
+                f"{[k for k, _s, _g in _miss_items if k[0] != layer][:3]}")
+            _miss_e = {k[1] for k, _sl, _g in _miss_items}
             assert _miss_e <= set(_flat), (
                 f"layer {layer}: miss ids {sorted(_miss_e - set(_flat))[:4]} are not in this "
                 f"layer's route -- the wrong element of (key, slot, gen) is being read")
+            # BOTH WEIGHTS, because they price different things and only one of them binds.
+            #   pairs   -> arithmetic per (token, expert) pair
+            #   unique  -> WEIGHT BYTES, and that is what a bandwidth-bound kernel pays
+            # build_routing_small emits one BM-block per DISTINCT slot, so an expert streams its
+            # 13.77 MB once per launch whether it serves one pair or four. Pair residency therefore
+            # OVERSTATES how much of graph B can move ahead of the reads, because resident experts
+            # are the popular ones and carry more pairs each than the tail misses do. Recording both
+            # so one run prices both models; the kernel microbenchmark decides between them.
+            _uniq = set(_flat)
             self.c.pairs_total += len(_flat)
             self.c.pairs_resident += sum(1 for e in _flat if e not in _miss_e)
+            self.c.uniq_total += len(_uniq)
+            self.c.uniq_resident += len(_uniq - _miss_e)
         # DEMAND work carries the cohort too. Settlement generates real demand misses, and submit
         # and _wait defaulted to scored=True -- so a settlement load_queued / nvme / staging /
         # EXPERT_DATA chain was labelled measured. Test 28 cannot see it: it compares the aggregate
@@ -396,6 +418,16 @@ class Engine:
             self.obs.safe_emit(Event(now_ns(), "layer_b_end", ctx=ctx, scored=self._scoring))
         self.chain.set("h", layer, ctx=ctx, scored=self._scoring)            # B wrote h and pre_mix for the next layer
         self._layer_slots = frozenset()        # B has consumed them; they are ordinary victims again
+        # RETIRE this layer's readiness records. SlotReady kept every (slot, gen) for the life of
+        # the process -- four entries per completed generation, and at 19 reads per output token
+        # that is ~1.9M generations over a 100k-token session. Safe here because SlotReady is
+        # host-side bookkeeping: the driver has passed its wait and enqueued the graph that reads
+        # these slots, so nothing waits on them again, and DEVICE ordering of slot reuse comes from
+        # the provider's per-slot event, not from this table.
+        for _k, _sl, _g in to_load:
+            self.loader.ready.retire(_sl, _g)
+        for _k, _sl, _g in to_wait:          # prefetch hits this layer actually consumed
+            self.loader.ready.retire(_sl, _g)
 
     # ------------------------------------------------------------------ prefetch bookkeeping
     def _replay_step(self) -> int:
@@ -530,6 +562,13 @@ class Engine:
                     self.pf.discarded_running += 1
                 else:
                     self.pf.discarded_finished += 1
+                # A WRONG prediction is never waited on, so its readiness record is dead the moment
+                # cancel() has classified it. Retiring only these here is deliberate: a CORRECT
+                # prediction is consumed by this layer's own wait as a to_wait hit, and dropping its
+                # _ctx before that wait loses the producer attribution -- which is exactly what
+                # test_waits_are_attributed_to_the_blocked_consumer_not_the_producer caught. Correct
+                # predictions are retired after graph B with the rest of the layer.
+                self.loader.ready.retire(_sl, _g)
 
     def _issue_speculation(self, layer: int, uniq, ctx=None) -> None:
         # THE REPLAY POSITION, not the timed step counter. c.steps is deliberately frozen during

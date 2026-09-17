@@ -434,6 +434,36 @@ class SlotReady:
         with self._lk:
             return (slot, gen) in self._done
 
+    def retire(self, slot: int, gen: int) -> None:
+        """Drop every record of (slot, gen). Call ONLY when the last consumer is finished with it.
+
+        Nothing pruned these before, and the class docstring justified that with "the set grows with
+        fetches, not with time... this is a skeleton". At 19 expert reads per output token that is
+        ~1.9M generations over a 100k-token session, and the published-vs-landed split took it from
+        two entries per generation to FOUR (_done, _ts, _landed, _landed_ts, plus _ctx when a
+        producer context was recorded). Measured at 4.0 entries per completed generation -- order of
+        a gigabyte of unified memory on a box where memory is the largest measured throughput lever.
+
+        SAFE BECAUSE THIS IS HOST-SIDE BOOKKEEPING ONLY. Device ordering of slot reuse comes from
+        RealLeaves._last_reader (one CUDA event per slot, re-recorded per write), not from here. A
+        generation is dead to SlotReady once the driver has passed its wait and enqueued the graph
+        that reads it; nothing waits on it again.
+        """
+        k = (slot, gen)
+        with self._lk:
+            self._done.discard(k)
+            self._landed.discard(k)
+            self._ts.pop(k, None)
+            self._landed_ts.pop(k, None)
+            self._ctx.pop(k, None)
+            self._err.pop(k, None)
+
+    def tracked(self) -> int:
+        """How many generations are still held. For the growth test -- if this rises without bound
+        across steps, retirement is not reaching some path."""
+        with self._lk:
+            return len(self._done) + len(self._landed)
+
     def set_landed(self, slot: int, gen: int) -> None:
         """The copy has physically completed. Called from _complete_h2d, after the event."""
         with self._lk:
