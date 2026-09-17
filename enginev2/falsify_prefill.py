@@ -73,7 +73,14 @@ else:
     # A REAL transient ring: prefill lives in it. bench_tokens runs transient_slots=8 because decode
     # never touches the ring; a prefill with 8 raises "transient ring exhausted" on chunk 0 (v1 job
     # 230 recorded exactly that), so the split here mirrors the shipped engine's.
-    e2 = v2drivers.Engine(Policy(), evict="lru",
+    # THE SCHEDULE IS v2's, and this is where that is tested. global_barrier ON makes each chunk's
+    # MoE wait for EVERY chunk's reads, which is what v1's join_pending does. OFF is the v2-native
+    # schedule: chunk k's MoE waits only on chunk k's experts -- the shape prefill_chunked's
+    # docstring calls "the only place D3 is reachable". Both must produce the SAME BYTES, because
+    # changing what you wait for must not change what you compute. If only the OFF arm differs, the
+    # per-chunk readiness condition is unsafe and D3 is not a free toggle at prefill.
+    _gb = os.environ.get("GLOBAL_BARRIER", "1") == "1"
+    e2 = v2drivers.Engine(Policy(global_barrier=_gb), evict="lru",
                           lru_slots=eng.store.n_slots - eng.store.transient_slots,
                           transient_slots=eng.store.transient_slots,
                           n_workers=8, staging=8, expert_read_qd=8, h2d_inflight=2, leaves=rl)
@@ -103,5 +110,5 @@ out = {
     "s_rep": int(s_rep),
 }
 torch.save(out, os.environ["OUT"])
-print(f"  ARM={ARM} wrote {os.environ['OUT']}  c.len={out['c_len']} "
+print(f"  ARM={ARM} gb={os.environ.get('GLOBAL_BARRIER', '1')} wrote {os.environ['OUT']}  c.len={out['c_len']} "
       f"ckpt={out['ckpt_keys']} logits{tuple(logits.shape)}")
