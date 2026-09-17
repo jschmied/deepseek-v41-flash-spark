@@ -53,6 +53,28 @@ Gate 1 (real graphs + provenance) passed. Gate 2 re-ran job 536's comparison in 
     v1 vs v2   : logits / mh / rep_h / rep_pre_mix all 0.000e+00, c.len 541, s_rep 413 -- PASS
     v1 vs v2f  : logits / mh / rep_h / rep_pre_mix all 0.000e+00, c.len 541, s_rep 413 -- PASS
 
+## Job 560 — V2Engine serves real requests (2026-09-17)
+
+First time `V2Engine.generate()` ran on weights. Six cases in one process, so case 6 is a genuine
+second request. Against `be125be`, arena 40 GB.
+
+    1 greedy       24 tokens  hit 0.698  nvme 45.47 GB  accept 1.92  ttft 5.539 s
+    2 sampled      seed 4242 twice -> IDENTICAL FALSE                      <- FAILS, see below
+    3 stop id      stopped at 8 tokens, the stop id is in the output
+    4 max_tokens   asked 7, got 7
+    5 close        closed mid-stream, the epilogue ran
+    6 after close  12 tokens  nvme 16.25 GB  steps 6  accept 2.17  decode 2.41 tok/s
+
+Case 6 is the one the review asked for: a later request reports its OWN nonzero steps and
+acceptance, and `nvme_gb` 16.25 is per-request rather than the 45.47 + 6.82 that a cumulative
+counter would have shown. v2's warm start also ran through v2's own loader: 2,367 experts resident
+of 2,367 ranked, 32.6 GB in 7 s.
+
+**Case 2 is open, and the cause is not yet known.** Either the seed path is wrong, or the MoE is not
+bit-reproducible and `multinomial` amplifies what `argmax` absorbs at temperature 0 -- which would
+make the expectation itself wrong, not the code. Job 565 separates them with a greedy double-run
+that involves no RNG at all. Do not quote case 2 as a defect until it reports.
+
 ## Not yet gated
 
 `V2Engine` has never served a request. Its prefill half is covered above; the API half -- bursts,
