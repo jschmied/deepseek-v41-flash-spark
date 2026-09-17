@@ -84,6 +84,28 @@ bit-reproducible and `multinomial` amplifies what `argmax` absorbs at temperatur
 make the expectation itself wrong, not the code. Job 565 separates them with a greedy double-run
 that involves no RNG at all. Do not quote case 2 as a defect until it reports.
 
+## Job 575 — the x2 divergence is the TARGET, not the accept path (2026-09-17)
+
+Warm graphs (a throwaway generation captures both parities first, so first-use capture is out) and
+a per-step verify trace. Engram live and delivering: `engram_ablated 0`. Greedy, temperature 0, so
+no RNG anywhere. Step 0 of two runs:
+
+| field | run 1 | run 2 |
+|---|---|---|
+| `tok`, `drafts`, `a_n`, `c_len` | identical | identical |
+| `argmax` | 270, **10869**, 18505, 1505, 270, 1205 | 270, **5085**, 7855, 305, 30698, 270 |
+| `margin` | 0.25, 0.125, 0.125, 0.625, 0.0, 0.125 | 0.25, 0.625, 0.125, 0.0, 0.625, 0.25 |
+
+Same block in, same drafts, the same number accepted and the same cache length out — and a
+different target argmax from row 1 onward. **The target forward is not reproducible**, at margins of
+0 to a few ulp on a bf16 logit scale.
+
+That clears two things I had suspected and stated: the accept/commit path (`a_n` and `c_len` match)
+and the drafter (`drafts` match). It does NOT yet say whether the engine is nondeterministic on its
+own or whether v2's scheduling causes it — the MoE reduce is shared, but v2 changes when experts
+land, and an order-dependent reduce would make the target depend on the schedule. Job 570 uses v1
+as the baseline to separate those.
+
 ## Not yet gated
 
 `V2Engine` has never served a request. Its prefill half is covered above; the API half -- bursts,
