@@ -161,6 +161,15 @@ class Policy:
 V1 = Policy()
 V2 = Policy(False, False, False, False)
 
+# EARLY READINESS, as a switch rather than a rewrite. With device-ordered slot reuse the loader
+# publishes a slot as ready the moment its H2D is ENQUEUED, and await_copies() puts the copy event
+# on the compute stream so the DEVICE enforces completion. That is the whole point of the fast path
+# -- and it is also the narrowest place a slot-lifecycle hole could hide, because between the
+# publish and the landing a slot is visible while its bytes are still moving. Setting this to 0
+# publishes only after handle.synchronize() in _complete_h2d, which is slower and unambiguous: if
+# the run becomes reproducible, the dependency chain is the fault, not the arithmetic.
+EARLY_READY = os.environ.get("DSV41_V2_EARLY_READY", "1") == "1"
+
 
 class ComputeStream:
     """The model's compute stream, as the loader threads can see it.
@@ -472,7 +481,8 @@ class LoaderService:
                     # about three thread handoffs per expert, all to learn something CUDA already
                     # knows. Only for a provider that declares device_orders_slot_reuse, because
                     # only that provider implements await_copies.
-                    self.ready.set(slot, gen)
+                    if EARLY_READY:
+                        self.ready.set(slot, gen)
                 self._completions.put(
                     (handle, wctx, staged, key, slot, gen, ctx, cause_id, scored, t0, is_demand))
                 staged = None
@@ -523,7 +533,7 @@ class LoaderService:
             with self._lk:
                 self.h2d_calls += 1
                 self.h2d_s += dt
-            if not (handle is not None and self._dev_orders):
+            if not (handle is not None and self._dev_orders and EARLY_READY):
                 self.ready.set(slot, gen)     # already published at enqueue on the fast path
             self.ready.set_landed(slot, gen)  # the bytes are down: the slot may be recycled
             # ONE critical section, because these two facts must change together. Leaving _running

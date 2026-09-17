@@ -108,6 +108,14 @@ as the baseline to separate those.
 
 ## Not yet gated
 
-`V2Engine` has never served a request. Its prefill half is covered above; the API half -- bursts,
-stop handling, `max_tokens`, the grammar gate against a real gate, penalties, two consecutive
-requests, client close -- has only CPU fakes behind it.
+`V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
+is wired and unexercised, and the grammar gate has only been run against a CPU fake, never against
+`server/tool_grammar.py`.
+
+**And the v2 decode path is not reproducible run to run** (jobs 565, 575), where v1 is. Until that
+is understood, no v2 throughput or quality number should be compared against v1's.
+
+**Note on what "v2" means in these jobs:** `V2Engine` defaults to `Policy()`, which is all-True --
+that is V1 semantics. So every v2 figure here is the V2 cache, loader, provider and driver under V1
+toggles: the V2 EXECUTION PATH, not the V2 SCHEDULE. The all-false `sched.V2` policy has not been
+measured end to end at all.
