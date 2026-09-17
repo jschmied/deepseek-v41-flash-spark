@@ -369,6 +369,10 @@ class RealLeaves(Leaves):
         # The tokens THIS step committed, in order. end_step already computes them and used to
         # keep only the last one; a server has to yield the burst, not the survivor.
         self.last_burst: list = []
+        # INITIALISED HERE TOO, not only in attach(). A caller may read the counters before the
+        # first attach -- V2Engine snapshots them at the top of generate() -- and job 560 died on
+        # exactly that: AttributeError before the engine had served one token.
+        self.accepted: list = []
         # Optional decoding gate (server/tool_grammar.py). Two calls and nothing else: the driver
         # masks the verify block's rows here, the caller observes the committed tokens.
         self.grammar = None
