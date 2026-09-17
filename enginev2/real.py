@@ -26,6 +26,8 @@ import time
 
 import torch
 
+_V41REF = None   # tools/v41_ref, imported once the engine path is set up
+
 from .leaves import Leaves, RouteResult, StagedExpert
 
 ALIGN = 4096
@@ -227,6 +229,9 @@ class RealLeaves(Leaves):
         self._bound_slots: frozenset = frozenset()
         self.reader_waits = 0
         self._engine_on_path()
+        global _V41REF
+        if _V41REF is None:
+            import v41_ref as _V41REF        # tools/ is on the path, sibling-import style
         from engine.cb3_cache import CB3Cache
         self.cache = CB3Cache(cb3_path, device)
         self.arena = arena
@@ -557,6 +562,121 @@ class RealLeaves(Leaves):
             self._gt_seen["S"][layer] = True
         else:
             self._gS[layer].replay()
+
+    # ------------------------------------------------------------------ prefill
+    # A TRANSCRIPTION of engine/model.py::encoder_prefill_layer_major, split at the point where it
+    # resolves. That method is the shipped path (DSV41_LAYER_MAJOR=1, DSV41_SWA_REPLAY=1, neither
+    # set in .env so both default on), and the split falls exactly where the driver needs it:
+    # everything before `store.resolve` is per-chunk attention that PRODUCES the route, everything
+    # after is per-chunk MoE that CONSUMES the slots. v1 keeps the between-state in locals of one
+    # function; here the driver sits in the middle, so it lives in `self._pf`.
+    #
+    # The one deliberate difference: v1 resolves the layer ONCE over `torch.cat(idxs)`, this
+    # resolves per chunk through the driver's reserve/submit. The ring still holds a layer's expert
+    # set for the whole layer, so each expert is still read once per layer -- that is the property
+    # the transpose exists for and it is preserved. Bitwise equality against v1 is the gate.
+
+    def begin_prefill(self, ids, S0: int = 0):
+        """Allocate the per-chunk state a layer-major pass carries. Call once per prompt."""
+        m = self.eng.model
+        a = m.args
+        from engine.model import MAX_CHUNK, Shared
+        P = ids.size(0)
+        assert m.c.len == S0, (m.c.len, S0)
+        bounds = [(lo, min(lo + MAX_CHUNK, P)) for lo in range(0, P, MAX_CHUNK)]
+        hashes = [m.hash_state(ids[lo:hi][None], S0 + lo)[0] if m.hash_state is not None else None
+                  for lo, hi in bounds]
+        H, PM = [], []
+        for lo, hi in bounds:
+            h = m.W.embed[ids[lo:hi]].unsqueeze(1).repeat(1, a.hc_mult, 1)
+            pm = torch.zeros(hi - lo, a.hc_mult, device=m.dev)
+            pm[:, 0] = 1.0
+            H.append(h); PM.append(pm)
+        self._pf = dict(
+            ids=ids, S0=S0, P=P, bounds=bounds, hashes=hashes, H=H, PM=PM,
+            # One Shared per CHUNK, living ACROSS layers: a kv-source layer fills ckv/ik/ratio and
+            # the layers above reuse it. A fresh one per (layer, chunk) trips _compressed's
+            # `sh.ratio == r` assert at the first layer that reuses -- v1 records this trap.
+            SH=[Shared() for _ in bounds],
+            pend={S0 + lo: {} for lo, _ in bounds},
+            tails=[None] * len(bounds),
+            last_L=a.candidate_source_layer,
+            n_experts=a.n_routed_experts,
+            layer=None, ys={}, post={}, wts={}, idxs={},
+        )
+        return len(bounds)
+
+    def prefill_attn(self, layer: int, chunk: int) -> RouteResult:
+        pf = self._pf
+        m = self.eng.model
+        a = m.args
+        if pf["layer"] != layer:                 # first chunk of a new layer
+            pf["layer"] = layer
+            pf["ys"].clear(); pf["post"].clear(); pf["wts"].clear(); pf["idxs"].clear()
+        w = m.W.layers[layer]
+        lo, hi = pf["bounds"][chunk]
+        S0 = pf["S0"]
+        h = pf["H"][chunk]
+        if layer in m.W.engram:
+            li = list(a.engram_layer_ids).index(layer)
+            rows = m.engram_rows(layer, pf["hashes"][chunk][:, li, :])
+            h = _V41REF.engram_forward(h, rows, m.W.engram[layer], a)
+        # Prompt-cache checkpoint pieces. Layer-major never has the whole stack at one position, so
+        # each layer's compressor state is collected as it crosses each boundary and assembled in
+        # finish_prefill(). Without this the prompt cache is silently dead for the next turn.
+        pv = m.c.pending.get(layer)
+        pf["pend"][S0 + lo][layer] = None if pv is None else (pv[0].clone(), pv[1].clone())
+        sh = pf["SH"][chunk]
+        h, attn_pre = m.block_attn(h, pf["PM"][chunk], w, layer, S0 + lo, sh, m.c.win[layer],
+                                   m.freqs_c if w.ratio else m.freqs_w)
+        y, ffn_pre, ffn_post, ffn_comb = m.block_ffn_in(h, attn_pre, w)
+        pf["PM"][chunk] = ffn_pre
+        pf["ys"][chunk] = y
+        pf["post"][chunk] = (h, ffn_post, ffn_comb)
+        i_c, w_c = m.moe_route(y, w, layer, pf["n_experts"])
+        pf["idxs"][chunk] = i_c
+        pf["wts"][chunk] = w_c
+        if layer == pf["last_L"]:
+            n = min(a.window_size, hi - lo)
+            pf["tails"][chunk] = (sh.topk[-n:],
+                                  sh.candidates[-n:] if sh.candidates is not None else None)
+        flat = i_c.flatten().tolist()
+        return RouteResult(uniq=tuple(sorted(set(flat))), opaque=i_c, flat_cpu=flat)
+
+    def prefill_moe(self, layer: int, chunk: int, route: RouteResult, slot_of: dict) -> None:
+        pf = self._pf
+        m = self.eng.model
+        assert pf["layer"] == layer, (pf["layer"], layer)
+        i_c = route.opaque
+        # Shaped like the route, not like the de-duplicated slot list: moe_apply consumes one slot
+        # per SELECTION, so order and multiplicity are functional. route.flat_cpu is the D2H this
+        # provider already paid for in prefill_attn.
+        slots = torch.as_tensor([slot_of[e] for e in route.flat_cpu],
+                                dtype=torch.long, device=i_c.device).view_as(i_c)
+        y = pf["ys"][chunk]
+        out = m.moe_apply(y, slots, pf["wts"][chunk], m.W.layers[layer], self.arena)
+        resid, ffn_post, ffn_comb = pf["post"][chunk]
+        pf["H"][chunk] = _V41REF.hc_post(out, resid, ffn_post, ffn_comb)
+
+    def finish_prefill(self) -> None:
+        """Assemble the prompt-cache checkpoints, advance c.len, and seed the SWA replay buffer.
+
+        v1 does all of this after its layer loop; it is not optional bookkeeping -- skipping the
+        checkpoint assembly leaves a later turn with nothing to resume from.
+        """
+        pf = self._pf
+        m = self.eng.model
+        from engine.model import Shared
+        for n, per_layer in pf["pend"].items():
+            if len(per_layer) == pf["last_L"] + 1:      # every encoder layer passed this boundary
+                m.c._ckpt[n] = dict(per_layer)
+        m.c.len = pf["S0"] + pf["P"]
+        m.stats["tokens"] += pf["P"]
+        for ci, (lo, hi) in enumerate(pf["bounds"]):
+            sh = Shared()
+            sh.topk, sh.candidates = pf["tails"][ci]
+            n = pf["tails"][ci][0].size(0)
+            m._rep_keep(pf["H"][ci][-n:], pf["PM"][ci][-n:], sh, pf["S0"] + hi - n, n)
 
     def bind_slots(self, route: RouteResult, slot_of: dict) -> None:
         """Give graph B its route-aligned slot tensor. This is v1's `self.slots.copy_(slots)`, with

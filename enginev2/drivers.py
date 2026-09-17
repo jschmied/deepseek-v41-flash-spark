@@ -838,7 +838,7 @@ class Engine:
             self.chain.obs = obs
 
     # ------------------------------------------------------------------ prefill
-    def prefill_chunked(self, layer: int, chunks, ctx: OpContext | None = None) -> None:
+    def prefill_chunked(self, layer: int, n_chunks: int, ctx: OpContext | None = None) -> None:
         """Chunked prefill over one layer: the only shape where D3 is reachable.
 
         v1 defers each chunk's reads and does the chunk's attention while they fly, then joins at
@@ -851,12 +851,17 @@ class Engine:
         # as in what they waited for, and D3 was not an isolated toggle. Caught in review
         # 2026-09-15. Both arms now route and submit every chunk up front; the only difference is
         # the readiness condition before each chunk's FFN.
+        # THE ROUTE COMES OUT OF prefill_attn, it is not an argument. The previous version took a
+        # `chunks` list of uniq tuples and reserved from it BEFORE calling prefill_attn -- an order
+        # only a trace-replaying provider can satisfy, since a real one does not know a chunk's
+        # experts until that chunk's attention has run. `n_chunks` replaces it.
         ctx = ctx if ctx is not None else OpContext(self.request_id, self.c.steps, layer)
         pending = []
         per_chunk = []
-        for uniq in chunks:
+        for ci in range(n_chunks):
             self.loader.drain_forgets()
-            slot_of, to_load, to_wait = self.slots.reserve(layer, uniq, prefill=True)
+            route = self._compute(lambda c=ci: self.leaves.prefill_attn(layer, c))
+            slot_of, to_load, to_wait = self.slots.reserve(layer, route.uniq, prefill=True)
             self.c.fetches += len(to_load)
             # SUBMIT ONLY THE NEW READS. `to_wait` is already in flight from an earlier chunk;
             # extending before the submit queued those a second time, so one expert could be read
@@ -864,11 +869,12 @@ class Engine:
             self.loader.submit(to_load, ctx=ctx, scored=self._scoring)
             waits = to_load + to_wait
             pending.extend(waits)
-            per_chunk.append((waits, sorted(set(slot_of.values()))))
-            self._compute(lambda: self.leaves.prefill_attn(layer))
+            per_chunk.append((ci, route, dict(slot_of), waits,
+                              sorted(set(slot_of.values()))))
 
-        for to_load, reads in per_chunk:
+        for ci, route, slot_of, waits, reads in per_chunk:
             # D3 ON: this chunk's FFN waits for EVERY chunk's reads. OFF: only its own.
-            self._wait(pending if self.policy.global_barrier else to_load, ctx,
+            self._wait(pending if self.policy.global_barrier else waits, ctx,
                        scored=self._scoring)
-            self._compute(lambda r=reads: self.leaves.prefill_moe(layer, r), slots=reads)
+            self._compute(lambda c=ci, r=route, m=slot_of: self.leaves.prefill_moe(layer, c, r, m),
+                          slots=reads)

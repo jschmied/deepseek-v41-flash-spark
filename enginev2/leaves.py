@@ -377,10 +377,26 @@ class Leaves:
         """Phase 1 of the split routed MoE. Only called when `resident_first`."""
         raise NotImplementedError
 
-    def prefill_attn(self, layer: int) -> None:
+    def prefill_attn(self, layer: int, chunk: int) -> "RouteResult":
+        """One chunk's attention + FFN-in + router, for `layer`. Returns that chunk's route.
+
+        IT RETURNS THE ROUTE, like `layer_a` does, and for the same reason: the expert ids come OUT
+        of the attention, they are not handed to the driver. The first version of this seam took
+        no chunk index and returned nothing, and `prefill_chunked` reserved slots from a `chunks`
+        argument supplied by the caller -- which can only work for a provider replaying a trace.
+        A real engine cannot know a chunk's `uniq` until it has run that chunk's attention, so the
+        old signature could never have been implemented against one, and never was.
+        """
         raise NotImplementedError
 
-    def prefill_moe(self, layer: int, slots, chunks: int = 1) -> None:
+    def prefill_moe(self, layer: int, chunk: int, route: "RouteResult", slot_of: dict) -> None:
+        """The chunk's routed MoE plus the HC residual, once its experts are resident.
+
+        Takes `slot_of`, NOT the driver's `sorted(set(slot_of.values()))`. See RouteResult: the MoE
+        consumes a slot tensor shaped like the route, so per-expert ORDER and MULTIPLICITY are
+        functional inputs. The de-duplicated slot list is what the driver needs for arena
+        bookkeeping and is not enough to run the kernel.
+        """
         raise NotImplementedError
 
 
@@ -406,6 +422,8 @@ class ModelLeaves(Leaves):
         if not 0.0 <= c_other_in_layer <= 1.0:
             raise ValueError("c_other_in_layer must be in [0, 1]")
         self.c_other_in_layer = c_other_in_layer
+        # (layer, chunk) -> uniq, for prefill replay. Empty until a caller fills it.
+        self.prefill_calls: dict = {}
 
     def layer_a(self, layer: int) -> RouteResult:
         delay(C_PRE / self.scale)
@@ -438,11 +456,18 @@ class ModelLeaves(Leaves):
         if d > 0:
             delay(d / self.scale)
 
-    def prefill_attn(self, layer: int) -> None:
+    def prefill_attn(self, layer: int, chunk: int) -> RouteResult:
         delay(C_PRE / self.scale)
+        # Replayed, exactly like layer_a: the model has no router, so the trace is its route. The
+        # caller loads `prefill_calls` before driving a prefill.
+        uniq = self.prefill_calls[(layer, chunk)]
+        return RouteResult(uniq=uniq)
 
-    def prefill_moe(self, layer: int, slots, chunks: int = 1) -> None:
-        delay(C_DEP * chunks / self.scale)
+    def prefill_moe(self, layer: int, chunk: int, route: RouteResult, slot_of: dict) -> None:
+        # Keeps the mapping for the same reason bind_slots does -- so a provider that ignored the
+        # contract would fail against the real one rather than here.
+        route.opaque = tuple(slot_of[e] for e in route.uniq)
+        delay(C_DEP / self.scale)
 
     def read(self, key: tuple, pool, ctx=None, scored: bool = True) -> StagedExpert:
         sid = pool.acquire(ctx, scored) if ctx is not None else pool.acquire(scored=scored)

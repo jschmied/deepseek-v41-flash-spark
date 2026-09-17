@@ -443,7 +443,10 @@ def test_prefill_chunked_global_barrier_vs_per_chunk():
     for pol in (V1, V2):
         e = mk(pol, lru_slots=16, transient_slots=200, n_workers=8, staging=8)
         try:
-            e.prefill_chunked(0, chunks)
+            # The route now comes OUT of prefill_attn, so the modelled provider replays it from
+            # here instead of the driver being handed it.
+            e.leaves.prefill_calls = {(0, ci): u for ci, u in enumerate(chunks)}
+            e.prefill_chunked(0, len(chunks))
             assert e.arena.violations == [], (pol.name, e.arena.violations[:4])
             assert e.loader.stage.at_rest(), pol.name
         finally:
