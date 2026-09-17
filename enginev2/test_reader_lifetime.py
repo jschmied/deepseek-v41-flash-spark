@@ -73,6 +73,7 @@ class _Bare(RealLeaves):
         self.engram_ablated = 0
         self.trace_verify = None
         self._tv_tok = None
+        self.trace_layers = None
         self._copy_event = {}
         self.copies_awaited = 0
         self._reader_lk = threading.Lock()

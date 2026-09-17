@@ -227,14 +227,41 @@ also what job 590's digest could not have told us on its own.
 Remaining inside `ExpertSlots`: the **LRU order** and the **per-slot generations**, both functional
 and both invisible to a sorted-pairs digest. Job 605 records all three separately.
 
+## Jobs 610, 615, 620 (2026-09-17)
+
+**610 — the V2 policy is a no-op at decode.** `Policy()` (all-true) and `sched.V2` (all-false)
+returned identical hit rate, NVMe GB, steps and accept length to the decimal across three reps
+(1.70/2.08/3.63 vs 1.69/2.06/3.63 tok/s). Consistent with `decode_layer`'s own note that global and
+per-slot waits are structurally the same at decode, since only the current layer has reads
+outstanding. **The V2 schedule has still never shown a benefit anywhere.**
+
+**615 — the arena never lies.** 24 live mappings per checkpoint, each expert re-read from the CB3
+file into a scratch arena and compared plane by plane against the slot the map points at: **zero
+mismatches** after the warm start and after each of three requests. The cache bookkeeping churns
+constantly and its contents are always correct, so the cache is exonerated as the carrier.
+
+**620 — it is decode-local.** Three requests, one process, same prompt:
+
+| compared to req1 | logits | mh | rep_h | rep_pre_mix | s_rep |
+|---|---|---|---|---|---|
+| req2 | 0.000e+00 | 0.000e+00 | 0.000e+00 | 0.000e+00 | equal |
+| req3 | 0.000e+00 | 0.000e+00 | 0.000e+00 | 0.000e+00 | equal |
+
+and the decoded tokens still differ at every request. Prefill and the drafter seed inputs are
+identical; the carrier is inside decode. Job 625 traces the first decode step layer by layer.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
 is wired and unexercised, and the grammar gate has only been run against a CPU fake, never against
 `server/tool_grammar.py`.
 
-**And the v2 decode path is not reproducible run to run** (jobs 565, 575), where v1 is. Until that
-is understood, no v2 throughput or quality number should be compared against v1's.
+**v2 generation is REQUEST-HISTORY DEPENDENT** (jobs 565, 575, 585, 595) where v1 is reproducible
+(570). Job 620 localized it: three requests of one prompt in one process gave **bitwise identical
+prefill** — logits, mh, rep_h, rep_pre_mix all `0.000e+00`, s_rep equal — and still decoded to
+different tokens. So it is decode-local, and prefill is exonerated along with the expert-cache
+contents (615: 24 sampled mappings, zero mismatches). Until it is understood, no v2 throughput or
+quality number should be compared against v1's.
 
 **Note on what "v2" means in these jobs:** `V2Engine` defaults to `Policy()`, which is all-True --
 that is V1 semantics. So every v2 figure here is the V2 cache, loader, provider and driver under V1

@@ -251,6 +251,11 @@ class RealLeaves(Leaves):
         # exactly like an insertion. This can.
         self.trace_verify = None
         self._tv_tok = None
+        # Optional PER-LAYER trace of one decode step: h in, route, bound slots, h out. Set to a
+        # list and layer_a/bind_slots/layer_b append to it. Checksums are computed ON DEVICE and
+        # kept as 0-dim tensors -- no D2H inside the 40-layer loop, because a sync there would
+        # change the host scheduling that is under diagnosis. Read them after the step.
+        self.trace_layers = None
         self.accepted: list = []
         self.last_burst: list = []
         self.hist: list = []
@@ -521,6 +526,11 @@ class RealLeaves(Leaves):
         # inside its layer loop).
         if self.engram is not None:
             self.engram.deliver(layer, self.fd)
+        tl = self.trace_layers
+        if tl is not None:
+            _h = self.fd.h
+            tl.append({"L": layer, "h_in": (_h.float().sum().detach().clone(),
+                                            _h.float().abs().sum().detach().clone())})
         if self.graph_timing:
             self._gt_ev["A"][layer][0].record()
             self._gA[layer].replay()
@@ -529,6 +539,8 @@ class RealLeaves(Leaves):
         else:
             self._gA[layer].replay()
         idx = self.fd.route_idx
+        if tl is not None:
+            tl[-1]["route"] = idx.detach().clone()
         flat = idx.flatten().tolist()          # the one unavoidable D2H: the cache lookup is on the host
         return RouteResult(uniq=tuple(sorted(set(flat))), opaque=idx, flat_cpu=flat)
 
@@ -770,6 +782,9 @@ class RealLeaves(Leaves):
         event recorded after the replay on the same stream. h2d() waits on it before overwriting.
         """
         _g = self._gB2[layer] if self.resident_first else self._gB[layer]
+        tl = self.trace_layers
+        if tl is not None and tl and tl[-1]["L"] == layer:
+            tl[-1]["slots"] = self.fd.slots.detach().clone()
         if self.graph_timing:
             self._gt_ev["B"][layer][0].record()
             _g.replay()
@@ -777,6 +792,10 @@ class RealLeaves(Leaves):
             self._gt_seen["B"][layer] = True
         else:
             _g.replay()
+        if tl is not None and tl and tl[-1]["L"] == layer:
+            _h = self.fd.h
+            tl[-1]["h_out"] = (_h.float().sum().detach().clone(),
+                               _h.float().abs().sum().detach().clone())
         ev = torch.cuda.Event()
         ev.record(torch.cuda.current_stream())
         if len(self._last_reader) < self._arena_slots:
