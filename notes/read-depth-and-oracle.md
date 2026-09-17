@@ -830,6 +830,36 @@ per-pair accumulation order changes and the result is no longer bitwise identica
 the dependency review named -- per-expert output buffers and a fixed-order reduction -- already
 exists in `tools/cb3_moe.py::moe_forward`.
 
+## 24. The early-H2D path, finally exercised -- and it is worth ~1 % (job 420)
+
+Every measurement before this one ran with `Policy()`, i.e. V1, where `global_barrier` is True. That
+makes `_wait()` call `wait_all()`, which blocks on `_demand == 0`, and `_demand` is decremented in
+`_complete_h2d` AFTER `handle.synchronize()`. So the driver already waited for every demand copy to
+LAND before it reached `wait_slots` -- and the early `ready.set()` at enqueue, the published event
+and `await_copies` all sat downstream of a full physical barrier. Found in review, confirmed in the
+code, and it means the device-ordered fast path had never been exercised at all.
+
+Three reps each, order alternated, token equality held throughout (1768 tokens, accept_len 2.95):
+
+| arm | rep 1 | rep 2 | rep 3 | mean |
+|---|---|---|---|---|
+| `global_barrier=True` | 6.54 | 6.66 | 6.58 | 6.593 |
+| `global_barrier=False` | 6.73 | 6.61 | 6.63 | **6.657** |
+
+**+0.97 %.** That is the pre-registered 0-2 % branch: keep the architecture for its correctness
+properties, stop treating it as a speed project.
+
+**AND IT CORRECTS TWO OF MY OWN REPORTS.** The first pair alone read +2.9 % and I said so; with all
+six arms it is +0.97 %. A single pair on this box is not a result -- the sf=0 arms here span 6.54 to
+6.66, which is 1.8 % on its own.
+
+**What it does NOT rescue is job 370's conclusion.** I wrote there that "Python synchronisation is
+not material in the ~0.46 s step". That claim was unsupported: 370 removed host-side machinery that
+sat behind a barrier which dominated it, so the experiment could not have returned anything else.
+The honest combined statement from 370 (locks, 0.08 %) and 420 (the barrier itself, 0.97 %) is that
+**host-side scheduling in this engine is worth about one per cent -- not because locks are cheap,
+but because the step is 269 ms of NVMe read wait out of 443.**
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
