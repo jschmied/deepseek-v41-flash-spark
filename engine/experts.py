@@ -178,6 +178,10 @@ class ExpertStore:
         self.transient_index = {s: i for i, s in enumerate(self.transient_ring)}
         self.transient_pos = 0
         self.transient_map: dict[tuple, int] = {}
+        # See lend_ring_to_lru(). Off unless DSV41_RING_TO_LRU=1, so the shipped default is
+        # bit-identical to before this existed.
+        self._ring_lending = os.environ.get("DSV41_RING_TO_LRU", "0") == "1"
+        self._ring_lent = False
         self._pending: list = []          # (future, key, slot) from resolve(defer=True)
         self._pending_slots: set[int] = set()   # slots those futures are still writing
         self._pending_layer: int | None = None
@@ -444,6 +448,56 @@ class ExpertStore:
         self._use_count[key] = c
         self._last_acc[key] = self._clock
         self._buckets.setdefault(c, OrderedDict())[key] = slot
+
+    # ------------------------------------------------------------------ transient ring lending
+    #
+    # The ring exists for PREFILL: one chunk touches nearly every expert of a layer, and letting
+    # that stream through the LRU would evict the decode working set. During DECODE it is idle --
+    # 400 slots of a 4,565-slot arena doing nothing.
+    #
+    # Measured on the box (job 235, ARENA_GB 60/66/72 = 3,750/4,165/4,581 LRU slots, warm rep):
+    # every +415 slots is -14.0 % NVMe traffic and +12 % decode tok/s, linear across both steps.
+    # One ring is 400 slots, so this is worth about that.
+    #
+    # Shrinking the ring instead does NOT work and is not an alternative: transient_slots=8 starts
+    # and then raises `transient ring exhausted` on the first prefill chunk (job 230).
+    #
+    # OFF BY DEFAULT. Set DSV41_RING_TO_LRU=1 to enable.
+
+    def lend_ring_to_lru(self) -> int:
+        """Prefill is over: hand the idle ring to the LRU region. -> slots lent."""
+        if self._ring_lent or not self._ring_lending:
+            return 0
+        # Last prefill's transient mappings are dead -- decode never reads them, and leaving them
+        # mapped would let a decode reserve() count one as a HIT on a slot the LRU is about to
+        # reuse.
+        for key, slot in list(self.transient_map.items()):
+            if self.slot_key.get(slot) == key:
+                del self.slot_key[slot]
+        self.transient_map.clear()
+        lent = [s for s in self.transient_ring if s not in self._pending_slots]
+        self.free_lru.extend(lent)
+        self._ring_lent = True
+        return len(lent)
+
+    def reclaim_ring(self) -> int:
+        """Prefill is starting: take the ring back, evicting whatever decode put in it."""
+        if not self._ring_lent:
+            return 0
+        ring = set(self.transient_ring)
+        dropped = 0
+        for key, slot in list(self.lru.items()):
+            if slot in ring:
+                del self.lru[key]
+                if self.slot_key.get(slot) == key:
+                    del self.slot_key[slot]
+                if self._afq:
+                    self._afq_drop(key)
+                dropped += 1
+        self.free_lru = [s for s in self.free_lru if s not in ring]
+        self.transient_pos = 0
+        self._ring_lent = False
+        return dropped
 
     def _afq_drop(self, key: tuple) -> None:
         """`key` has left the LRU. Its count and last use stay; only the bucket entry goes."""

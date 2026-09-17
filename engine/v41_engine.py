@@ -782,6 +782,11 @@ class V41Engine:
                 **({"prompt_cache_reused": self._resumed_from,
                     "prompt_tokens_prefilled": _pre} if PROMPT_CACHE else {}),
                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
+                # How many transient slots decode actually got. Reported because without it an A/B
+                # cannot tell "the lending worked" from "the two arms are the same build twice" --
+                # job 240 hit exactly that: the arms differed by the predicted amount and the
+                # evidence that the mechanism was the cause was missing.
+                **({"ring_lent": _st["ring_lent"]} if "ring_lent" in _st else {}),
                 "steps": steps,
                 "accept_len_mean": round(float(np.mean(accepted_hist)) + 1, 2) if accepted_hist else None,
                 **({"nonfinite_attn": int(self.fast.nan_probe[0]), "nan_probes": int(self.fast.nan_probe[1])}
@@ -846,6 +851,10 @@ class V41Engine:
         out_st["t_decode0"] = t_start
         # prefill in chunks
         logits = None
+        # Take the ring back BEFORE any chunk routes: a prefill chunk needs a slot per expert it
+        # touches, and running it with the ring still lent out is exactly the `transient ring
+        # exhausted` failure job 230 hit. No-op unless the ring was lent.
+        self.store.reclaim_ring()
         m.begin_prompt()
         if self.swa_replay:
             # CED + Decoder SWA Bounded Replay: the prompt runs through the encoder half only
@@ -881,6 +890,11 @@ class V41Engine:
         # which is why §10c read 2,860 ms of resolve() per decode step and I explained it as a
         # thrashing request instead of checking the instrument.
         self._snap_prefill()
+        # The ring is idle from here until the next prefill; lend it to the LRU. No-op unless
+        # DSV41_RING_TO_LRU=1. See ExpertStore.lend_ring_to_lru for the measurement.
+        _lent = self.store.lend_ring_to_lru()
+        if _lent:
+            out_st["ring_lent"] = _lent
         pen = penalties if (penalties is not None and penalties.active) else None
         p = sample_probs(logits[-1], temperature, top_p)
         tok = int(torch.multinomial(p, 1)) if temperature > 0 else int(p.argmax())
