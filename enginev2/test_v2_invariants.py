@@ -1875,3 +1875,54 @@ def test_slotready_bounded_on_the_published_first_path():
     assert r.tracked() == 0, (
         f"{r.tracked()} generations retained over 2000 published-first reads -- at 19 expert reads "
         f"per output token this is the unbounded table retire() was written to prevent")
+
+
+def test_sampled_verify_is_distribution_preserving():
+    """Speculative decoding under temperature must emit from the TARGET distribution, not near it.
+
+    This is the property that makes spec decode sound, and the one no performance test can see: a
+    verify that accepted a draft because it happened to be the argmax would draw from a different
+    distribution than the model's, while tokens/s, acceptance length and even NLL all looked
+    ordinary. So drive `_verify_sampled` directly with a drafter distribution `q` deliberately
+    unlike the target `p`, and check the emitted token's empirical distribution against `p`.
+
+    Driven as an unbound call on a duck-typed self: the method needs six attributes and no GPU, and
+    constructing a RealLeaves would need an engine, an arena and a CB3 file to test arithmetic.
+    """
+    import torch as _t
+    from enginev2.real import RealLeaves
+    from engine.v41_engine import sample_probs
+
+    V, N = 8, 20000
+    _t.manual_seed(0)
+    logits = _t.randn(3, V)
+    q = _t.softmax(_t.randn(1, V), -1)          # the drafter's own distribution, not the target's
+
+    class _S: pass
+    s = _S()
+    s.fd = type("FD", (), {"logits": logits})()
+    s.q, s._tv = q, 2                           # one draft position
+    s.temperature, s.top_p, s.stop_ids = 1.0, 1.0, frozenset()
+
+    counts = _t.zeros(V)
+    greedy_counts = _t.zeros(V)
+    target = sample_probs(logits[0].float(), 1.0, 1.0)
+    argmax0 = int(logits[0].argmax())
+    for _ in range(N):
+        d = int(_t.multinomial(q[0], 1))        # the drafter proposes from q
+        s.drafts = _t.tensor([d])
+        a, new, bonus = RealLeaves._verify_sampled(s)
+        counts[new[0] if new else bonus] += 1
+        # What a greedy accept would have produced, for the same draw: accept iff the draft is the
+        # target's argmax, else emit that argmax. Included so this test is shown to DISCRIMINATE --
+        # a distribution check that passes for both implementations gates nothing.
+        greedy_counts[d if d == argmax0 else argmax0] += 1
+
+    tv = 0.5 * (counts / counts.sum() - target).abs().sum().item()
+    tv_greedy = 0.5 * (greedy_counts / greedy_counts.sum() - target).abs().sum().item()
+    assert tv < 0.02, (
+        f"sampled verify diverges from the target distribution: total-variation {tv:.4f} over {N} "
+        f"trials. Rejection sampling against q is what makes this distribution-preserving.")
+    assert tv_greedy > 0.2, (
+        f"the greedy comparison scored tv={tv_greedy:.4f}, so this test would pass for a greedy "
+        f"accept too and gates nothing")

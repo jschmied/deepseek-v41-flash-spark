@@ -339,7 +339,8 @@ class RealLeaves(Leaves):
     # it, so begin_step selects the pair for this step and captures on first sight.
 
     def attach(self, engine, block_ids, engram_rows=None, next_block=None, spec=False,
-               temperature=0.0, first_token=None, stop_ids=()) -> "RealLeaves":
+               temperature=0.0, top_p=1.0, seed=None, first_token=None,
+               stop_ids=()) -> "RealLeaves":
         """Bind to a live V41Engine. The engine owns the weights, caches and captured graphs; this
         provider only replays them."""
         self.eng = engine
@@ -359,6 +360,8 @@ class RealLeaves(Leaves):
         # acceptance) and nothing is ever committed, so there is no tokens/s to report.
         self.spec = False
         self.temperature = 0.0
+        self.top_p = 1.0
+        self.q = None            # the drafter's distribution for this step's drafts
         self.tok = None
         self.drafts = None
         self.tokens_out = 0          # tokens actually COMMITTED -- what tok/s means
@@ -371,6 +374,9 @@ class RealLeaves(Leaves):
         self._S = int(self.fd.c.len)
         self.spec = bool(spec)
         self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        if seed is not None:
+            torch.manual_seed(int(seed))
         self.stop_ids = frozenset(stop_ids)
         if self.spec:
             if first_token is None:
@@ -391,7 +397,10 @@ class RealLeaves(Leaves):
             # v1's order exactly: draft first, then block = [accepted token | drafts]. The
             # drafter's graph replays here, so its ~12.8 ms and its three MTP layers are INSIDE
             # the measurement rather than omitted from it.
-            self.drafts, _q = self.fd.draft(self.tok, int(self.fd.c.len) - 1, self.temperature)
+            # KEEP q. It is the drafter's own distribution over each draft position, and
+            # rejection sampling is defined against it -- throwing it away is what forced the
+            # greedy-only verify below. v1 keeps it for exactly this reason.
+            self.drafts, self.q = self.fd.draft(self.tok, int(self.fd.c.len) - 1, self.temperature)
             self.block_ids = torch.cat(
                 [torch.tensor([self.tok], device=self.fd.dev), self.drafts])
             return
@@ -735,6 +744,42 @@ class RealLeaves(Leaves):
         if self._gF is not None:
             self._gF.replay()
 
+    def _verify_sampled(self):
+        """Rejection sampling over this step's drafts. Returns (n_accepted, new_tokens, bonus).
+
+        One `sample_probs` per examined position, as v1 does -- the loop breaks at the first
+        rejection, so it is at most n_draft calls and usually fewer. `sample_probs` is imported from
+        the v1 engine rather than reimplemented: it is a pure function of logits and applies
+        temperature and nucleus in a specific order, and a subtly different one here would change
+        the output distribution without changing anything measurable.
+        """
+        from engine.v41_engine import sample_probs
+        fd = self.fd
+        lg, q, drafts = fd.logits, self.q, self.drafts
+        n_draft = self._tv - 1
+        a, new, bonus = 0, [], None
+        for i in range(n_draft):
+            pt = sample_probs(lg[i].float(), self.temperature, self.top_p)
+            d = int(drafts[i])
+            r = torch.rand((), device=pt.device)
+            if bool(r < (pt[d] / q[i][d].clamp_min(1e-20)).clamp(max=1.0)):
+                a += 1
+                new.append(d)
+                if d in self.stop_ids:
+                    return a, new, None      # an accepted stop ends the block: no bonus token
+            else:
+                resid = (pt - q[i]).clamp_min(0)
+                if float(resid.sum()) <= 0:
+                    # q dominates p everywhere the draft could land. Falling back to p keeps the
+                    # step productive instead of emitting nothing; v1 does the same.
+                    resid = pt
+                bonus = int(torch.multinomial(resid / resid.sum(), 1))
+                return a, new, bonus
+        # Every draft accepted and none of them a stop: the bonus comes from the row AFTER the last
+        # accepted draft, which is why the verify block is one wider than the draft.
+        pt = sample_probs(lg[a if a < n_draft else n_draft].float(), self.temperature, self.top_p)
+        return a, new, int(torch.multinomial(pt, 1))
+
     def end_step(self, step: int) -> None:
         """KV bookkeeping for Caches.rollback, and advance the cache length."""
         self.gt_drain()          # no-op unless DSV41_GRAPH_TIMING; the step's graphs are done here
@@ -751,18 +796,29 @@ class RealLeaves(Leaves):
         self._S = fd.c.len
         if not self.spec:
             return
-        # VERIFY, as v41_engine does it: greedy accept over the leading drafts, one 7-wide D2H,
-        # then roll the cache back to what was actually committed. This is where steps stop being
-        # free -- a step commits a + 1 tokens, not T.
-        am = fd.logits.argmax(-1)
-        acc = am[:self._tv - 1].eq(self.drafts).to(torch.int32).cumprod(0)
-        a_n = int(acc.sum())
-        cand = am.tolist()
-        new_toks, bonus = cand[:a_n], cand[a_n]
-        for j, t in enumerate(new_toks):
-            if t in self.stop_ids:
-                a_n, new_toks, bonus = j + 1, new_toks[:j + 1], None
-                break
+        # VERIFY. Two paths, and the split is v1's: greedy decoding keeps the lean one (one 7-wide
+        # argmax D2H, no per-position sampling), temperature > 0 takes the SAMPLED one.
+        #
+        # The sampled path is not "greedy plus noise". Accepting a draft because it happens to be
+        # the argmax would draw from a different distribution than the model's, and nothing
+        # downstream could detect it -- tokens/s, acceptance length and even NLL all look ordinary
+        # while the output distribution is quietly wrong. So it is rejection sampling against the
+        # drafter's own q: accept draft d with probability min(1, p[d]/q[d]), and on rejection draw
+        # the bonus from the residual (p - q)+ renormalised. That is the standard construction and
+        # it is what makes speculative decoding distribution-preserving.
+        # Reference: engine/v41_engine.py:1028-1051.
+        if self.temperature > 0:
+            a_n, new_toks, bonus = self._verify_sampled()
+        else:
+            am = fd.logits.argmax(-1)
+            acc = am[:self._tv - 1].eq(self.drafts).to(torch.int32).cumprod(0)
+            a_n = int(acc.sum())
+            cand = am.tolist()
+            new_toks, bonus = cand[:a_n], cand[a_n]
+            for j, t in enumerate(new_toks):
+                if t in self.stop_ids:
+                    a_n, new_toks, bonus = j + 1, new_toks[:j + 1], None
+                    break
         fd.c.rollback(S + a_n + 1)
         self._S = int(fd.c.len)
         self.accepted.append(a_n)
