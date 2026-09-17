@@ -129,6 +129,33 @@ early H2D visibility (580). Job 585 establishes the shape — A B A B, A B B B o
 anything else is guessed at. Graph parity was checked and ruled out before queueing: `parity = S % 2`
 is derived from the cache length, and every request prefills to the same S.
 
+## Job 585 — the shape is A B B' B'' (2026-09-17)
+
+Four 8-token generations in one process, after a warm-up, greedy:
+
+    gen1  [52480, 270, 10869, 294, 18505, 9335, 305, 30123]   steps=4
+    gen2  [52480, 270,  5085, 18505, 9335, 305, 270,  7629]   steps=3
+    gen3  [52480, 270,  5085, 18505, 9335, 305, 270,  1167]   steps=4
+    gen4  [52480, 270,  5085, 18505, 9335, 305, 270, 60944]   steps=4
+
+**gen2-4 share the first seven tokens and differ only in the eighth**; gen1 differs from token 2.
+At 7 tokens, gen1 = gen2 = gen3 exactly — that same seven-token prefix — and only gen4 breaks.
+
+So it is a **one-time transition after the first generation**, plus a smaller effect that reaches
+the tail occasionally. Not a two-state toggle (A B A B) and not steady accumulation (A B C D).
+`S0=9, parity=1` on every generation, confirming parity is constant as predicted.
+
+The one-time transition is the tractable half: v2 keeps ExpertSlots and the physical arena across
+requests, so request 1 deterministically rewrites the LRU order and the expert → slot mapping
+before request 2 starts. v1 carries neither and v1 is reproducible. Job 590 resets one half of the
+state at a time — model caches, or the expert map — and logs a digest of the mapping per request so
+an A → B transition can be lined up against a mapping change rather than inferred.
+
+Note the CB3 kernel writes each (token, top-k) pair to a fixed pair position and reduces in fixed
+K,T order, so slot assignment should NOT affect arithmetic. If restoring the mapping changes the
+answer, the defect is stale or wrong expert bytes, or a mapping-generation hole — not reduction
+order.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
