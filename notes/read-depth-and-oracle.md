@@ -697,7 +697,7 @@ the +39 % of section 19 was never available, independent of any implementation.
 of device time is in pairs whose experts are already resident and could therefore compute while the
 misses load.
 
-### How much of moved device time becomes wall time: about two thirds
+### How much of moved device time becomes wall time: WITHDRAWN, see section 22
 
 The shared expert is the calibration, because it is the one case measured both ways. 10.44 ms of
 device time moved out of graph B produced a **7.07 ms** drop in wall (434.59 -> 427.52). Where it
@@ -715,6 +715,61 @@ This job gives +1.6 % for shared_first (6.49 vs 6.39 tok/s, one rep each, 300 st
 from job 395's matched arms (600 steps). Those disagree and neither has the reps to settle it. Job
 405 replicates both arms twice with the arm order alternated. Until then: shared_first is worth
 somewhere between nothing and 1.6 %, and the reason to keep it is the mechanism, not the number.
+
+## 22. Three nulls that were all measuring the wrong thing (jobs 395, 400, 405)
+
+Job 405 replicates the shared-expert A/B properly -- four arms, 600 steps, arm order alternated per
+rep -- and it is a **null**: sf=1 6.66/6.64 against sf=0 6.65/6.64, **+0.08 %**.
+
+| | sf=0 rep1 | sf=0 rep2 | sf=1 rep1 | sf=1 rep2 |
+|---|---|---|---|---|
+| `layer_a` | 123.00 | 123.07 | 119.46 | 119.96 |
+| `wait_reads` | 268.32 | 270.26 | 268.17 | 268.59 |
+| `shared` | -- | -- | 4.11 | 3.88 |
+| wall/step | 443.30 | 443.62 | 442.28 | 443.76 |
+
+**FIRST: THIS WITHDRAWS THE "TWO THIRDS REALIZATION" CALIBRATION OF SECTION 21.** That came from job
+400's single pair, where `wait_reads` fell 267.2 -> 260.4. With four arms `wait_reads` is flat to
+within 2 ms and the 6.8 ms drop was noise. What actually happens is `layer_a` falls 3.3 ms, the
+`shared` row costs 4.0 ms of host launch, and the wall does not move.
+
+**SECOND, AND IT INVALIDATES WHAT ALL THREE JOBS WERE LABELLED AS.** The driver's `shared()` call
+sat BETWEEN the two `wait_reads` branches:
+
+    if policy.resolve_blocks:   wait(reads)      <-- fires under Policy(), which is V1
+    if leaves.shared_first:     shared(L)
+    if not policy.resolve_blocks: wait(reads)
+
+`bench_tokens` constructs `Policy()`, i.e. V1, where `resolve_blocks` is True. So the wait fired
+first and the shared expert was enqueued AFTER this layer's reads had already landed. **It never
+overlapped anything.** The comment directly above it -- "can run it here, while the reads fly" --
+described the other branch. Three jobs, eight arms and a bitwise gate all measured a reordering
+inside the post-wait region, which is worth nothing, and correctly reported nothing.
+
+The seam now sits ahead of both branches. With that, the two branches became the same statement
+twice and collapsed to one; `resolve_blocks` still shapes the run through `_issue_speculation` and
+the barriers, it is only this ordering that stopped depending on it.
+
+### What survives from those jobs
+
+The graph budget, which did not depend on the placement and replicates across both:
+
+| graph | job 400 | job 405 rep1 / rep2 |
+|---|---|---|
+| A | 46.20 / 46.08 | 46.17 / 46.09 |
+| B with shared | 79.36 | 79.68 / 79.74 |
+| B without | 69.42 | 69.67 / 69.87 |
+| S alone | 10.44 | 10.55 |
+
+**B_r = 69.4-69.9 ms/step** and **graph A = 46.1 ms/step that can never overlap** both stand. So does
+the fact that graph S is 10.0-10.5 ms by two independent instruments.
+
+### The lesson, which is the same one as the four earlier scheduler verdicts
+
+A gate that proves the OUTPUT is bitwise identical says nothing about whether the code under test
+ran in the position you think it did. `falsify_shared_first.py` was right that the split is exact --
+and exactness was never the question the A/B was asking. Job 410 re-runs it against the fixed seam,
+with the outcomes pre-registered.
 
 ## What this closes and what it leaves
 

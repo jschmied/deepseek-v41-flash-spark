@@ -319,23 +319,31 @@ class Engine:
         self._issue_speculation(layer, uniq, ctx)
         hp.exit("resolve")      # everything from the route ids to the slot tensor, all host work
 
-        if self.policy.resolve_blocks:
-            # v1: resolve() ends in list(pool.map(...)). Nothing issues work except a call that
-            # immediately blocks on it, which is why the device cannot be kept busy at any thread
-            # count. Everything after this point runs with the loader already drained.
-            with hp("wait_reads"):
-                self._wait(to_load, ctx, scored=self._scoring)
-
         # The shared expert is expert-INdependent, so a provider that captured it outside graph B
-        # can run it here, while the reads fly. One that did not has it inside layer_b, where it
-        # cannot overlap anything -- see leaves.Leaves.shared_first.
+        # can enqueue it HERE, before any wait, and the device runs it while the reads fly. One
+        # that did not has it inside layer_b, where it cannot overlap anything -- see
+        # leaves.Leaves.shared_first.
+        #
+        # THIS USED TO SIT BETWEEN THE TWO WAIT BRANCHES, which made it dead code under the policy
+        # that actually runs. bench_tokens constructs Policy(), i.e. V1, where resolve_blocks is
+        # True -- so the wait above fired first and the shared expert was enqueued AFTER the reads
+        # had already landed. Jobs 395, 400 and 405 all measured that arrangement and all returned
+        # nulls, which is the correct answer to the question they were really asking and not the
+        # question they were labelled with.
         if self.leaves.shared_first:
             with hp("shared"):
                 self._compute(lambda: self.leaves.shared(layer))
 
-        if not self.policy.resolve_blocks:
-            with hp("wait_reads"):
-                self._wait(to_load, ctx, scored=self._scoring)
+        # v1 (resolve_blocks): resolve() ends in list(pool.map(...)). Nothing issues work except a
+        # call that immediately blocks on it, which is why the device cannot be kept busy at any
+        # thread count. Everything after this point runs with the loader already drained.
+        #
+        # The branch that used to be here chose only WHERE this wait sat relative to the shared
+        # expert above; with that moved ahead of both, the two arms were the same statement twice.
+        # resolve_blocks still shapes the run through _issue_speculation and the barriers -- it is
+        # this ordering that stopped depending on it.
+        with hp("wait_reads"):
+            self._wait(to_load, ctx, scored=self._scoring)
 
         # Graph B. `route` carries the FUNCTIONAL input -- the provider's route-aligned slot tensor,
         # built by bind_slots above. `reads` is safety bookkeeping only: which arena slots this
