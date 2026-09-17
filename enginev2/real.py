@@ -149,16 +149,46 @@ class RealLeaves(Leaves):
     # and the host-side ComputeStream is redundant here -- see Leaves.device_orders_slot_reuse.
     device_orders_slot_reuse = True
 
-    V1 = os.path.expanduser("~/git/deepseek-v41-flash-spark")
+    # THIS checkout, not a second one. This used to be a hardcoded ~/git/deepseek-v41-flash-spark,
+    # which is a different working tree of the SAME repo on a DIFFERENT branch -- so the flags below
+    # mirrored an engine/fastdecode.py that this branch did not contain, and every real-graph number
+    # it produced described code that was never committed here. `check_engine_capture` is the guard
+    # that makes such a substitution impossible to make silently again.
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     @staticmethod
-    def _v1_on_path() -> None:
-        """v1's tools/ do SIBLING imports (`import fp4_moe`), so tools/ has to be on the path in
-        its own right -- importing `tools.cb3_moe` as a package raises ModuleNotFoundError. The
-        same trap as job 195's transition_prefetch."""
-        for p in (RealLeaves.V1, os.path.join(RealLeaves.V1, "tools")):
+    def _engine_on_path() -> None:
+        """tools/ has to be on the path in its OWN right, because those modules do SIBLING imports
+        (`import fp4_moe`) -- importing `tools.cb3_moe` as a package raises ModuleNotFoundError.
+        The same trap as job 195's transition_prefetch."""
+        for p in (RealLeaves.ROOT, os.path.join(RealLeaves.ROOT, "tools")):
             if p not in sys.path:
                 sys.path.insert(0, p)
+
+    # Back-compat alias: the name predates the fix above and is still called by tests.
+    _v1_on_path = _engine_on_path
+
+    @classmethod
+    def check_engine_capture(cls, fd) -> str:
+        """Refuse to run a flag whose graphs the attached engine cannot have captured.
+
+        `shared_first` and `resident_first` MIRROR engine/fastdecode.py rather than being set
+        independently, which is only safe while the engine on the path is the one this branch
+        ships. It was not: enginev2/real.py bound fd.graphs_shared / fd.graphs_split /
+        fd.slot_missing while this branch's own engine/fastdecode.py defined none of the three,
+        and the substitution was invisible because both paths are called `engine`. Fail here,
+        at attach, naming the file -- not 40 layers later inside a capture."""
+        missing = [n for f, n in ((cls.shared_first, "graphs_shared"),
+                                  (cls.resident_first, "graphs_split"),
+                                  (cls.resident_first, "slot_missing")) if f and not hasattr(fd, n)]
+        where = getattr(sys.modules.get(type(fd).__module__), "__file__", "?")
+        if missing:
+            raise RuntimeError(
+                f"RealLeaves mirrors DSV41_SHARED_FIRST={int(cls.shared_first)} "
+                f"DSV41_RESIDENT_FIRST={int(cls.resident_first)}, but the attached "
+                f"{type(fd).__name__} from {where} has no {', '.join(missing)}. That engine cannot "
+                f"have captured the graphs these flags claim. Check which checkout is on sys.path.")
+        return where
 
     def __init__(self, cb3_path: str, arena, device: str = "cuda"):
         import threading
@@ -196,7 +226,7 @@ class RealLeaves(Leaves):
         self._reader_lk = threading.Lock()
         self._bound_slots: frozenset = frozenset()
         self.reader_waits = 0
-        self._v1_on_path()
+        self._engine_on_path()
         from engine.cb3_cache import CB3Cache
         self.cache = CB3Cache(cb3_path, device)
         self.arena = arena
@@ -309,6 +339,8 @@ class RealLeaves(Leaves):
         provider only replays them."""
         self.eng = engine
         self.fd = engine.fast
+        # Startup provenance, printed once: which engine/fastdecode.py is actually bound.
+        self._engine_file = self.check_engine_capture(self.fd)
         self.block_ids = block_ids
         self.engram_rows = engram_rows or {}
         # Multi-step decode needs a rule for the NEXT block. v1's is draft + verify; a harness that
@@ -344,7 +376,7 @@ class RealLeaves(Leaves):
         self._gS = None
         self._gt_ev = None
         self._gt_seen = None
-        self.gt_ms = {"A": 0.0, "B": 0.0, "S": 0.0}
+        self.gt_ms = {"A": 0.0, "B": 0.0, "S": 0.0, "B1": 0.0}
         self.gt_steps = 0
         return self
 
@@ -408,8 +440,8 @@ class RealLeaves(Leaves):
             # read ONCE per step in gt_drain(), so no synchronisation is added inside the step.
             n = len(self._gA)
             self._gt_ev = {k: [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-                               for _ in range(n)] for k in ("A", "B", "S")}
-            self._gt_seen = {k: [False] * n for k in ("A", "B", "S")}
+                               for _ in range(n)] for k in ("A", "B", "S", "B1")}
+            self._gt_seen = {k: [False] * n for k in ("A", "B", "S", "B1")}
         if self.shared_first and not self._gS:
             raise RuntimeError(
                 "shared_first is on but engine/fastdecode.py captured no shared-expert graphs. "
@@ -465,14 +497,22 @@ class RealLeaves(Leaves):
         n = self.gt_steps
         tot = sum(self.gt_ms.values())
         out = [f"  graph device time over {n} steps (per step):"]
+        split = bool(self.gt_ms.get("B1"))
         for k, label in (("A", "graph A  attention+HC+router"),
-                         ("B", "graph B  routed MoE+shared+HC residual"),
+                         ("B1", "graph B1 routed MoE, RESIDENT half (pre-wait)"),
+                         ("B", "graph B2 routed MoE, missing half + rest" if split
+                               else "graph B  routed MoE+shared+HC residual"),
                          ("S", "graph S  shared expert alone")):
             if self.gt_ms[k]:
                 out.append(f"    {label:<40} {self.gt_ms[k] / n:7.2f} ms  {self.gt_ms[k] / tot * 100:5.1f}%")
         out.append(f"    {'TOTAL':<40} {tot / n:7.2f} ms")
-        out.append("    Only graph B can move into the read window: A(L) must finish before this "
-                   "layer's expert ids exist.")
+        if split:
+            out.append("    B1 and S run BEFORE the wait; A(L) never can, and B2 needs the bytes. "
+                       "TOTAL includes B1 -- without it the split appears to delete device time it "
+                       "only moved.")
+        else:
+            out.append("    Only graph B can move into the read window: A(L) must finish before "
+                       "this layer's expert ids exist.")
         return "\n".join(out)
 
     def layer_b_resident(self, layer: int, missing_slots) -> None:
@@ -491,7 +531,17 @@ class RealLeaves(Leaves):
         if missing_slots:
             idx = torch.as_tensor(list(missing_slots), dtype=torch.long, device=fd.slot_missing.device)
             fd.slot_missing[idx] = True
-        self._gB1[layer].replay()
+        # TIMED SEPARATELY, and it has to be. With the split, the events labelled "B" bracket gB2
+        # alone -- the missing half -- so a run with DSV41_RESIDENT_FIRST=1 and
+        # DSV41_GRAPH_TIMING=1 used to under-report device time by exactly the piece the split
+        # moves, and gt_report presented the remainder as the total.
+        if self.graph_timing:
+            self._gt_ev["B1"][layer][0].record()
+            self._gB1[layer].replay()
+            self._gt_ev["B1"][layer][1].record()
+            self._gt_seen["B1"][layer] = True
+        else:
+            self._gB1[layer].replay()
 
     def shared(self, layer: int) -> None:
         """Graph S: the shared expert, into fastdecode's sh_out buffer.

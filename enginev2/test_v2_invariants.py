@@ -1812,3 +1812,63 @@ def test_slot_readiness_does_not_grow_without_bound():
             f"some path, and this table is unbounded in a long session")
     finally:
         e.close()
+
+
+def test_retire_before_landing_does_not_leak():
+    """PUBLISHED-then-RETIRED-then-LANDED must leave nothing behind.
+
+    The growth test above retires only after `quiesce()`, i.e. after the copy has physically
+    completed, which is the one ordering where a purge-on-retire cannot be undone. The driver does
+    not do that. Since the device-ordered fast path, `set()` fires when the H2D is ENQUEUED; with
+    `policy.global_barrier` off, `_wait()` returns on that published readiness, graph B is issued,
+    and the driver retires -- all while the bytes are still moving. `_complete_h2d()` then calls
+    `set_landed()` on every path it has, success and both except arms.
+
+    With an unconditional purge in retire() and an unconditional add in set_landed(), that sequence
+    re-creates `_landed` and `_landed_ts` for a generation nobody will ever retire again: the
+    4-entries-per-read leak comes back as 2 entries per read, on precisely the path the fast policy
+    takes. Retirement is therefore a two-party handshake -- consumer_done AND landed -- and this is
+    the mutation test for it.
+    """
+    r = SlotReady()
+    r.arm(7, 3, cause_id=11)
+    r.set(7, 3)                                   # H2D ENQUEUED, not landed
+    assert not r.is_landed(7, 3), "set() must not imply landed"
+    r.retire(7, 3)                                # the consumer is done; the copy is not
+    assert not r.is_landed(7, 3), (
+        "retire() of a published-but-unlanded generation must not mark it landed")
+    r.set_landed(7, 3)                            # the bytes arrive AFTER the retire
+    assert r.tracked() == 0, (
+        f"tracked()=={r.tracked()} after the copy landed on an already-retired generation: "
+        f"set_landed() re-created records that nothing will ever purge")
+    assert not r.is_landed(7, 3) and r.landed_ts(7, 3) is None
+
+    # And the ordinary ordering still purges, so the handshake did not merely defer the leak.
+    r.arm(7, 4)
+    r.set(7, 4)
+    r.set_landed(7, 4)
+    assert r.is_landed(7, 4)
+    r.retire(7, 4)
+    assert r.tracked() == 0 and r.landed_ts(7, 4) is None
+
+
+def test_slotready_bounded_on_the_published_first_path():
+    """Bounded growth over many reads when every one of them retires BEFORE it lands.
+
+    An end-to-end version of this belongs here too and is deliberately not written: the mock loader
+    completes its copy inside `ready.wait()`, so retire() always sees a landed generation and the
+    rig cannot reach the published-but-unlanded window at all -- it needs the device-ordered fast
+    path (`handle is not None and self._dev_orders`), where `set()` fires at enqueue. A test that
+    cannot fail is worse than no test, so this drives SlotReady through the driver's exact sequence
+    instead, and asserts EXACT zero residue rather than a loose bound.
+    """
+    r = SlotReady()
+    for i in range(2000):
+        slot, gen = i % 64, i
+        r.arm(slot, gen, cause_id=i)
+        r.set(slot, gen)          # published at H2D enqueue
+        r.retire(slot, gen)       # consumer done: graph B issued
+        r.set_landed(slot, gen)   # bytes land afterwards
+    assert r.tracked() == 0, (
+        f"{r.tracked()} generations retained over 2000 published-first reads -- at 19 expert reads "
+        f"per output token this is the unbounded table retire() was written to prevent")

@@ -13,14 +13,21 @@ count), bytes and reads PER COMMITTED TOKEN, and the measured accept length.
 """
 import os, sys, time, statistics as st, torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-V1 = os.path.expanduser("~/git/deepseek-v41-flash-spark")
-sys.path[:0] = [V1, os.path.join(V1, "tools")]
-os.chdir(V1)
+# Resolve `engine` and `tools` from THIS checkout only. This file used to prepend
+# ~/git/deepseek-v41-flash-spark to sys.path and chdir into it, which silently ran a different
+# checkout of the same repo -- on a different branch. That is how this branch produced real-graph
+# resident-first numbers while its own engine/fastdecode.py had no split in it at all. The
+# provenance line below exists so the substitution can never be invisible again.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path[:0] = [ROOT, os.path.join(ROOT, "tools")]
+os.chdir(ROOT)
 
 from engine.v41_engine import V41Engine                    # noqa: E402
 from enginev2.real import RealEngramSource, RealLeaves     # noqa: E402
 from enginev2.sched import Policy                          # noqa: E402
+import engine.fastdecode as _fd_mod                        # noqa: E402
+
+print(f"engine.fastdecode -> {_fd_mod.__file__}")
 
 if "ENGRAM" not in os.environ:
     raise RuntimeError("set ENGRAM=1 (production) or ENGRAM=0 (ablated) explicitly")
@@ -88,6 +95,12 @@ torch.cuda.synchronize()
 # The host profile must cover the TIMED window only. Without this the warm-up's phases are divided
 # by STEPS and every row is scaled by (WARM + STEPS) / STEPS.
 e2.hostprof.reset()
+# SAME REASON, SAME WINDOW: Counters accumulate across decode() calls, so the residency figures
+# below used to cover warm + measured while tok/s, NVMe GB, acceptance and the host profile all
+# covered the measured window alone. Residency evolves precisely DURING cache warming, so pricing
+# the resident-first split on one window and its throughput on another compares two different
+# cache states. Snapshot here and report deltas.
+_res0 = (c0 := e2.c).pairs_total, c0.pairs_resident, c0.uniq_total, c0.uniq_resident, c0.steps
 t0 = time.perf_counter()
 c = e2.decode(STEPS)
 torch.cuda.synchronize()
@@ -101,16 +114,22 @@ print(f"  {STEPS} steps, wall {wall:.2f}s")
 # DSV41_HOST_PROFILE=1 only. The interesting quantity is not any single row but
 # (wall/step - INSTRUMENTED): whatever is left is time the driver spends outside every phase, and
 # if that is near zero the ~69 ms/step of section 14 is inside one of these rows.
-if c.pairs_total:
-    print(f"  PAIR residency {c.pairs_resident}/{c.pairs_total} = "
-          f"{c.pairs_resident / c.pairs_total * 100:.1f} %  <- the weight that prices a resident-first "
-          f"MoE split; the unique-key hit rate is NOT it")
-    print(f"  pairs/layer-step {c.pairs_total / max(1, c.steps * 40):.1f}, "
-          f"non-resident pairs {c.pairs_total - c.pairs_resident}")
-    print(f"  UNIQUE residency {c.uniq_resident}/{c.uniq_total} = "
-          f"{c.uniq_resident / max(1, c.uniq_total) * 100:.1f} %  <- the WEIGHT-BYTES weight; the MoE "
-          f"streams an expert once per launch however many pairs it serves")
-    print(f"  unique/layer-step {c.uniq_total / max(1, c.steps * 40):.1f}")
+_pt = c.pairs_total - _res0[0]; _pr = c.pairs_resident - _res0[1]
+_ut = c.uniq_total - _res0[2]; _ur = c.uniq_resident - _res0[3]
+_cs = c.steps - _res0[4]
+if _pt:
+    # UNIQUE is the weight that prices the split, not PAIR. The MoE streams an expert once per
+    # launch however many pairs it serves, so what phase 1 can compute without the reads is set by
+    # the distinct experts already in the arena -- weight BYTES -- not by the arithmetic. PAIR is
+    # reported next to it because it is what an earlier estimate wrongly used, and keeping both
+    # visible is what stops that estimate being made a fifth time.
+    print(f"  UNIQUE residency {_ur}/{_ut} = {_ur / max(1, _ut) * 100:.1f} %  "
+          f"<- the WEIGHT-BYTES weight; THIS is what prices a resident-first MoE split")
+    print(f"  unique/layer-step {_ut / max(1, _cs * 40):.1f}")
+    print(f"  PAIR residency {_pr}/{_pt} = {_pr / _pt * 100:.1f} %  "
+          f"<- arithmetic, not bytes; not the weight for the split")
+    print(f"  pairs/layer-step {_pt / max(1, _cs * 40):.1f}, non-resident pairs {_pt - _pr}")
+    print(f"  (residency over the {_cs} TIMED steps only; warm-up excluded)")
 _rd = os.environ.get("DSV41_ROUTE_DUMP")
 if _rd and e2._route_dump:
     import pickle

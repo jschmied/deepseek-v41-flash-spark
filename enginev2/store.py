@@ -407,6 +407,15 @@ class SlotReady:
         # second mark instead, which is set only after the copy has completed.
         self._landed: set[tuple] = set()
         self._landed_ts: dict[tuple, int] = {}
+        # RETIREMENT IS A TWO-PARTY HANDSHAKE: consumer_done AND landed. Purging on the consumer's
+        # word alone is only correct when the copy has already completed, and on the early-published
+        # path it has not: set() fires at H2D ENQUEUE, the driver's _wait() returns on published
+        # readiness when policy.global_barrier is off, graph B is issued, retire() purges -- and
+        # _complete_h2d() then calls set_landed(), which blindly re-creates _landed and _landed_ts.
+        # The 4-entries-per-read leak retire() was written to fix comes back as 2 entries per read
+        # on exactly the path the fast policy takes. So a retire that arrives first only parks here;
+        # whichever party arrives second does the purge.
+        self._retire_pending: set[tuple] = set()
 
     def arm(self, slot: int, gen: int, ctx=NO_CTX, cause_id: int = 0, scored: bool = True) -> None:
         # Still clears nothing -- clearing here is what stranded waiters before. It only RECORDS
@@ -451,24 +460,49 @@ class SlotReady:
         """
         k = (slot, gen)
         with self._lk:
-            self._done.discard(k)
-            self._landed.discard(k)
-            self._ts.pop(k, None)
-            self._landed_ts.pop(k, None)
-            self._ctx.pop(k, None)
-            self._err.pop(k, None)
+            if k in self._landed:
+                self._purge(k)
+            else:
+                # Published but not landed. Drop what the consumer is done with, and leave a marker
+                # so set_landed() purges instead of re-creating. Without the marker set_landed()
+                # cannot tell "nobody has retired this yet" from "already retired".
+                self._retire_pending.add(k)
+                self._done.discard(k)
+                self._ts.pop(k, None)
+                self._ctx.pop(k, None)
+                self._err.pop(k, None)
+
+    def _purge(self, k: tuple) -> None:
+        """Drop every record of one generation. Caller holds _lk."""
+        self._done.discard(k)
+        self._landed.discard(k)
+        self._retire_pending.discard(k)
+        self._ts.pop(k, None)
+        self._landed_ts.pop(k, None)
+        self._ctx.pop(k, None)
+        self._err.pop(k, None)
 
     def tracked(self) -> int:
         """How many generations are still held. For the growth test -- if this rises without bound
         across steps, retirement is not reaching some path."""
         with self._lk:
-            return len(self._done) + len(self._landed)
+            # _retire_pending counts: a handshake that never completes is exactly the leak this is
+            # here to catch. Every _complete_h2d path -- success and both except arms -- calls
+            # set_landed(), so a marker that outlives quiescence is a real defect, not a race.
+            return len(self._done) + len(self._landed) + len(self._retire_pending)
 
     def set_landed(self, slot: int, gen: int) -> None:
-        """The copy has physically completed. Called from _complete_h2d, after the event."""
+        """The copy has physically completed. Called from _complete_h2d, after the event.
+
+        If the consumer already retired this generation, this is the SECOND party of the handshake
+        and its job is to purge -- not to record. Recording here is what re-created the leak."""
+        k = (slot, gen)
         with self._lk:
-            self._landed.add((slot, gen))
-            self._landed_ts[(slot, gen)] = now_ns()
+            if k in self._retire_pending:
+                self._purge(k)
+                return
+            self._landed.add(k)
+            self._landed_ts[k] = now_ns()
 
     def is_landed(self, slot: int, gen: int) -> bool:
         with self._lk:

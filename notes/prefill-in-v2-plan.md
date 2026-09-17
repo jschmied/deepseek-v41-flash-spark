@@ -25,26 +25,59 @@ From `engine/model.py`, on `MAX_CHUNK`:
 > length (a 512-token chunk already touches **~370 of 384**), so the NVMe traffic of a prompt is
 > ~chunks x layers x 384 experts
 
+**That comment is about a chunk, and this note read it as if it were about a prompt. It is wrong
+as a byte model for either engine's driver, and the correction changes three of the four
+conclusions below.**
+
+`ExpertSlots.reserve(layer, uniq, prefill=True)` (`enginev2/store.py:717-731`) looks in `self.lru`
+**and then** `self.transient_map` before it allocates anything, and `prefill_chunked`
+(`enginev2/drivers.py:857-867`) reserves every chunk of a layer up front and submits **only
+`to_load`**, the difference -- its own comment records the bug where extending before the submit
+read one expert twice. The transient ring defaults to **400 slots** and a layer has **384**
+experts, so the union over a layer's chunks fits entirely in the ring: whatever chunk 0 loads,
+chunk 1 finds mapped. Each `(layer, expert)` is therefore read **at most once per prompt**:
+
+    40 layers x 384 experts x 13,774,848 B = 211.6 GB       <- upper bound, before LRU hits
+
+not `6 x 40 x 370 x 13.77 MB = 1.2 TB`. And it is strictly less than 211.6 GB, because the LRU is
+consulted first and whatever decode left resident is found there.
+
+**Job 500 refutes the 1.2 TB model by timing alone.** Its 13,200-token prefill in 4 chunks
+completed in **92.5 s**. The chunks-times-layers model predicts 4 x 40 x 370 x 13.77 MB = 815 GB,
+which at the device's measured ~6.3 GB/s is **129 s of pure I/O** -- longer than the whole
+measured prefill, compute included. The model is not merely pessimistic; it is not physically
+realizable on the run we have.
+
 Contrast with what we measured at decode (jobs 460/465/475):
 
 | | decode | prefill |
 |---|---|---|
-| unique experts per layer | 21.7 | ~370 of 384 |
-| residency | 93-95 % | ~0 — it streams |
-| what the arena buys | +10 % (79 -> 86 GB) | nothing; it does not fit |
-| bytes | 262 MB / token | ~chunks x 40 x 370 x 13.77 MB |
+| unique experts per layer | 21.7 | ~370 of 384 per CHUNK, <= 384 per LAYER |
+| residency | 93-95 % | whatever decode left; measured, not assumed |
+| what the arena buys | +10 % (79 -> 86 GB) | the first load of each layer -- see below |
+| bytes | 262 MB / token | <= 40 x 384 x 13.77 MB = 211.6 GB per PROMPT |
 
-A 24k-token prompt at chunk 4096 is 6 x 40 x ~370 x 13.77 MB ~ **1.2 TB** of reads. That is why
-prefill is tens of seconds and why every decode conclusion transfers badly:
+What survives, and what does not:
 
-- **Eviction policy is irrelevant.** `age_over_freq` won +8 % at decode by keeping hot experts. In
-  prefill every expert is touched once per chunk per layer; there is no hot set.
-- **Capacity is irrelevant.** The lever that dominates decode does nothing here.
-- **The resident-first MoE split is irrelevant.** It moves work that depends on already-resident
-  experts; at prefill essentially nothing is resident.
-- **Prediction is trivially perfect and worthless.** The next chunk needs ~all 384 experts of the
-  next layer. You do not need to predict that, and knowing it buys nothing, because the constraint
-  is bytes, not knowledge.
+- **Eviction policy is probably still irrelevant** -- within a layer nothing needs to be evicted
+  (384 fits in 400), and across layers the previous layer's entries are genuinely dead. This one
+  the original argument gets right, for a better reason than it gave.
+- **Capacity is NOT irrelevant.** Every expert already resident in the LRU is a read the first
+  chunk of that layer does not issue. That is a straight subtraction from the 211.6 GB bound, and
+  it is exactly the quantity `prefill_misses` already counts.
+- **The resident-first split is NOT obviously irrelevant** for the same reason: "essentially
+  nothing is resident" was asserted, never measured.
+- **Prediction is still worthless.** The next chunk needs ~all 384 experts of the next layer. This
+  one does not depend on the byte model.
+
+**Nothing further in this plan should be designed until one existing `prefill_chunked()` run is
+instrumented**, per chunk and per layer: new `to_load`, transient hits, LRU hits, union of distinct
+experts per layer, bytes per layer. The shape to expect is many loads on chunk 0, few on chunk 1,
+approaching zero after -- and if that is not what comes back, the dedup argument above is wrong too
+and the whole section needs redoing rather than patching. Queued as job 510.
+
+The part of this note that survives unchanged: prefill is still a different problem from decode,
+and it should allow a much greater read depth.
 
 ## Where prefill time actually goes, per the engine's own notes
 
