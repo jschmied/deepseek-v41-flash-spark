@@ -56,6 +56,9 @@ class _FakeDriver:
         # store. The fake carries the same surface, and it only ever counts UP -- which is the
         # whole point: absolute reads would fold every earlier request into this one.
         self.slots = types.SimpleNamespace(hits=0, misses=0, prefill_misses=0)
+        # V2Engine gives each request its own id; the real Engine sets this in
+        # __init__ and every OpContext carries it.
+        self.request_id = 0
 
     def decode(self, n):
         for _ in range(n):

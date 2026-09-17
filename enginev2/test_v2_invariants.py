@@ -35,6 +35,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 from .drivers import Engine
 from .sched import V1, V2, ComputeStream, LoaderService, Policy
 from .chain import Chain, EngramSource
@@ -1926,3 +1928,54 @@ def test_sampled_verify_is_distribution_preserving():
     assert tv_greedy > 0.2, (
         f"the greedy comparison scored tv={tv_greedy:.4f}, so this test would pass for a greedy "
         f"accept too and gates nothing")
+
+
+@pytest.mark.xfail(strict=True, reason=
+                   "v2 has no _promote_transient; recorded as a known v1-parity gap. NOT fixed "
+                   "while the request-history divergence is being localized -- changing cache "
+                   "semantics mid-investigation would muddy the measurement. strict=True so this "
+                   "turns into an ERROR the moment someone implements it, instead of going quiet.")
+def test_a_decode_hit_in_the_transient_ring_is_promoted():
+    """V1 parity: a decode hit on an expert sitting in the transient ring must be PROMOTED.
+
+    v1 calls `_promote_transient()` (engine/experts.py:636, fired at :733) when a decode request
+    hits a key that a prefill left in the transient ring: the expert moves into the LRU at its
+    existing physical slot and an LRU donor slot is swapped back into the ring. v2's `reserve()`
+    takes the `transient_map` hit and leaves it there, so the key stays in the ring, never joins the
+    LRU, and -- the part that reaches beyond ring position -- never calls `evict.on_hit()` or
+    advances the decode clock.
+
+    Under `age_over_freq` that means a genuine decode access earns NO usage credit while it lives in
+    the ring, which changes which expert is chosen as the next victim. So this is a cache-semantic
+    divergence from v1 that outlives the ring itself.
+
+    The existing suite missed it because its decode streams allocate straight into the LRU and never
+    exercise prefill -> transient -> decode-hit.
+
+    EXPECTED TO FAIL until v2 implements the promotion. It is recorded as a test rather than a note
+    because a note would be read once and a failing test is read every run.
+    """
+    e = mk(V1, lru_slots=32, transient_slots=8)
+    try:
+        key_layer, expert = 0, 5
+        # A prefill puts the expert in the transient ring.
+        slot_of, to_load, _ = e.slots.reserve(key_layer, [expert], prefill=True)
+        e.loader.submit(to_load)
+        e.loader.quiesce(timeout=30)
+        e.loader.drain_forgets()
+        slot = slot_of[expert]
+        assert (key_layer, expert) in e.slots.transient_map, "setup: expected a transient placement"
+        before_ring = set(e.slots.transient_ring)
+
+        # Now DECODE asks for the same expert: v1 would promote it.
+        slot_of2, to_load2, _ = e.slots.reserve(key_layer, [expert], prefill=False)
+        assert slot_of2[expert] == slot, "promotion must keep the physical slot, not re-read"
+        assert not to_load2, "a promotion is not a fetch"
+        assert (key_layer, expert) in e.slots.lru, (
+            "decode hit on a transient-ring expert did not promote it into the LRU; v1 does "
+            "(_promote_transient), and without it the expert earns no usage credit and the "
+            "eviction policy picks different victims than v1 would")
+        assert (key_layer, expert) not in e.slots.transient_map, "promoted key still in the ring"
+        assert set(e.slots.transient_ring) != before_ring, "no LRU donor was swapped into the ring"
+    finally:
+        e.close()

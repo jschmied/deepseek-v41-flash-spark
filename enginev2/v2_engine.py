@@ -152,6 +152,11 @@ class V2Engine(_ServerEngine):
     def generate(self, prompt_ids, *, max_tokens: int = 4096, temperature: float = 1.0,
                  top_p: float = 0.95, stop_token_ids=None, seed=None, grammar=None,
                  penalties=None, ignore_eos: bool = False, **_ignored):
+        # A MONOTONIC REQUEST ID. driver.request_id is set once at construction and every
+        # OpContext carries it, so every request in an observer trace appeared as request 0 --
+        # which makes a multi-request trace unreadable exactly when multi-request behaviour is the
+        # thing under investigation.
+        self.driver.request_id += 1
         stop = set(stop_token_ids or ())
         # SEED BEFORE ANYTHING IS SAMPLED. This used to sit inside attach(), which runs AFTER the
         # first token has been drawn -- so the first token was not reproducible from (prompt, seed),
