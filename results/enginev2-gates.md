@@ -106,6 +106,29 @@ own or whether v2's scheduling causes it — the MoE reduce is shared, but v2 ch
 land, and an order-dependent reduce would make the target depend on the schedule. Job 570 uses v1
 as the baseline to separate those.
 
+## Jobs 570 + 580 — it is NOT a race; it is deterministic state carryover (2026-09-17)
+
+**570**, engram live on both sides: v1 x2 **identical** (13 tokens); v2 x2 **not**; v1 != v2 from
+token 1. v2's very first request in a process differs from v1 immediately.
+
+**580**, the early-readiness discriminator — and the result is not the one the arms were for:
+
+    EARLY_READY=1  run1 [52480, 270, 10869, 294, 18505, 9335, 305, 30123]
+                   run2 [52480, 270,  5085, 18505, 9335, 305, 270, 7629]
+    EARLY_READY=0  run1 [52480, 270, 10869, 294, 18505, 9335, 305, 30123]   <- identical
+                   run2 [52480, 270,  5085, 18505, 9335, 305, 270, 7629]   <- identical
+
+Run 1 is reproducible, run 2 is reproducible, and they differ from each other **the same way in
+both arms**. So publishing readiness only after `handle.synchronize()` changes nothing, which
+retires the slot-lifecycle hypothesis — and, more importantly, the divergence is **not
+nondeterminism at all**. It is state that survives a request, which v1 resets and v2 does not.
+
+That also retires, in order: the accept/commit path (575), the drafter (575), an order-dependent
+expert reduce (reasoned out), first-use graph capture (575, warm), RNG and seeding (565), and now
+early H2D visibility (580). Job 585 establishes the shape — A B A B, A B B B or A B C D — before
+anything else is guessed at. Graph parity was checked and ruled out before queueing: `parity = S % 2`
+is derived from the cache length, and every request prefills to the same S.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
