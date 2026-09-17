@@ -771,6 +771,52 @@ ran in the position you think it did. `falsify_shared_first.py` was right that t
 and exactness was never the question the A/B was asking. Job 410 re-runs it against the fixed seam,
 with the outcomes pre-registered.
 
+## 23. With the seam fixed, the overlap works -- and prices the routed split (job 410)
+
+The same A/B as jobs 395/405, against the corrected placement (shared expert enqueued BEFORE the
+read wait rather than between the two wait branches). 86 GB, 600 steps after 150 warm, arm order
+alternated:
+
+| | sf=0 rep1 / rep2 | sf=1 rep1 / rep2 | delta |
+|---|---|---|---|
+| `layer_a` | 122.77 / 122.38 | 116.34 / 116.91 | **-5.95 ms** |
+| `shared` | -- | 2.33 / 2.08 | +2.20 ms |
+| `wait_reads` | 263.78 / 270.07 | 266.48 / 269.15 | +0.9 ms (flat) |
+| wall/step | 438.87 / 445.12 | 438.03 / 439.53 | -3.22 ms |
+| tok/s | 6.71 / 6.62 | 6.73 / 6.70 | **+0.75 %** |
+
+**THE MECHANISM IS ESTABLISHED.** `layer_a` falls 5.95 ms against within-arm spreads of 0.39 and
+0.57, and the wall follows: -5.95 saved, +2.20 paid in launch, -3.75 predicted against -3.22
+measured. Under the broken seam the same change moved `layer_a` only 3.3 ms and the wall not at all,
+so the placement was the difference.
+
+**THE MAGNITUDE IS NOT SHIPPABLE ON ITS OWN.** +0.75 % sits inside the sf=0 arms' own 1.4 % spread.
+The flag stays off by default; job 415 adds four more reps.
+
+### The conversion rate, which is the number that matters
+
+Graph S is 10.0-10.5 ms of device time (two instruments, jobs 400/405), and moving it bought 5.95 ms
+of critical path -- **about 60 %**. The rest is presumably device time that was already overlapped
+with something, or that falls outside the window.
+
+That rate is the multiplier on the routed-MoE split. At a ~83 % hit rate, 0.83 x 69.7 = 57.9 ms of
+graph B is in pairs whose experts are already resident:
+
+    57.9 ms movable  x  0.60 conversion  -  ~2 ms launch  =  ~33 ms of 442  =  ~7.5 %
+
+This supersedes the 5-12 % of section 21, which rested on a "two thirds" figure taken from a single
+pair where `wait_reads` moved 6.8 ms -- noise, as four arms later showed. The estimate here rests on
+a measurement in which the seam demonstrably works.
+
+### What would have to be true for it to fail
+
+The split needs two kernel launches over disjoint rows of the existing `parts` buffer -- resident
+pairs first, missing pairs after the wait -- then the unchanged `parts.view(K,T,DIM).sum(dim=0)`.
+`block_m` must be pinned so both launches tile pairs exactly as the single launch does, or the
+per-pair accumulation order changes and the result is no longer bitwise identical. The prerequisite
+the dependency review named -- per-expert output buffers and a fixed-order reduction -- already
+exists in `tools/cb3_moe.py::moe_forward`.
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
