@@ -244,6 +244,13 @@ class RealLeaves(Leaves):
         # 565 decoded that way.
         self.engram = None
         self.engram_ablated = 0
+        # Optional per-step verify trace. Set to a list and end_step appends one record per step:
+        # everything the accept decision saw and everything it produced. A token-sequence
+        # comparison cannot tell "the target computed something different" from "the same target
+        # was committed differently" -- two autoregressive trajectories that resynchronise look
+        # exactly like an insertion. This can.
+        self.trace_verify = None
+        self._tv_tok = None
         self.accepted: list = []
         self.last_burst: list = []
         self.hist: list = []
@@ -855,6 +862,7 @@ class RealLeaves(Leaves):
             self.penalties.apply(fd.logits, self.hist)
         if self.grammar is not None:
             self.grammar.mask_rows(fd.logits, [int(self.tok)] + self.drafts.tolist())
+        self._tv_tok = self.tok
         if self.temperature > 0:
             a_n, new_toks, bonus = self._verify_sampled()
         else:
@@ -872,6 +880,22 @@ class RealLeaves(Leaves):
         self.accepted.append(a_n)
         self.tokens_out += a_n + (1 if bonus is not None else 0)
         self.last_burst = list(new_toks) + ([bonus] if bonus is not None else [])
+        if self.trace_verify is not None:
+            lg = fd.logits.float()
+            top2 = lg.topk(2, dim=-1)
+            self.trace_verify.append({
+                "S": int(S),
+                "tok": int(self._tv_tok),
+                "drafts": self.drafts.tolist(),
+                "argmax": lg.argmax(-1).tolist(),
+                # top1 - top2 per row: a target that is nondeterministic in the last ulp can only
+                # flip an argmax where this is tiny, so it separates a real disagreement from noise.
+                "margin": [round(float(x), 6) for x in (top2.values[:, 0] - top2.values[:, 1])],
+                "a_n": int(a_n),
+                "bonus": bonus,
+                "burst": list(self.last_burst),
+                "c_len": int(fd.c.len),
+            })
         self.tok = bonus if bonus is not None else (new_toks[-1] if new_toks else self.tok)
 
 

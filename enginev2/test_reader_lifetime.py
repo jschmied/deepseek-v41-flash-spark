@@ -70,6 +70,9 @@ class _Bare(RealLeaves):
         self.penalties = None
         self.tok = None
         self.tokens_out = 0
+        self.engram_ablated = 0
+        self.trace_verify = None
+        self._tv_tok = None
         self._copy_event = {}
         self.copies_awaited = 0
         self._reader_lk = threading.Lock()
