@@ -372,6 +372,11 @@ class RealLeaves(Leaves):
         # Optional decoding gate (server/tool_grammar.py). Two calls and nothing else: the driver
         # masks the verify block's rows here, the caller observes the committed tokens.
         self.grammar = None
+        # Optional Penalties (engine/v41_engine.py). Same two-call shape as the gate, and applied at
+        # the same point for the same reason. `hist` is the caller's running token list, which the
+        # cycle breaker and the n-gram ban both read.
+        self.penalties = None
+        self.hist: list = []
         self.stop_ids = frozenset()
         # The engram source, if one is attached. It owns the reads; this owns the dequant+H2D at
         # the consumer, because to_device() makes CUDA calls and may not run on a reader thread.
@@ -381,8 +386,9 @@ class RealLeaves(Leaves):
         self.spec = bool(spec)
         self.temperature = float(temperature)
         self.top_p = float(top_p)
-        if seed is not None:
-            torch.manual_seed(int(seed))
+        # NO RESEED HERE. Seeding belongs at the start of a generation, before the first token is
+        # sampled -- attach() runs after it. Reseeding here also restarted the RNG stream mid-
+        # generation, which is not v1's semantics. V2Engine.generate() seeds.
         self.stop_ids = frozenset(stop_ids)
         if self.spec:
             if first_token is None:
@@ -817,6 +823,10 @@ class RealLeaves(Leaves):
         # block[0..i], so it has to see the verify block's rows while they are still logits -- once
         # a draft has been accepted the choice is made. Masking leaves the gate's own state
         # untouched, which is why speculation that is rolled back needs no undo.
+        # PENALTIES FIRST, GRAMMAR LAST. Both write the same rows, and the gate's -inf is a
+        # legality statement that a penalty must not be able to soften. v1 orders them the same way.
+        if self.penalties is not None:
+            self.penalties.apply(fd.logits, self.hist)
         if self.grammar is not None:
             self.grammar.mask_rows(fd.logits, [int(self.tok)] + self.drafts.tolist())
         if self.temperature > 0:

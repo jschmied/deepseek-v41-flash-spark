@@ -34,6 +34,9 @@ class _FakeLeaves:
         self.last_burst = self._bursts[self.i] if self.i < len(self._bursts) else []
         self.i += 1
         self.accepted.append(max(0, len(self.last_burst) - 1))
+        # counters that only ever go up, like the real ones
+        self.read_bytes += 1_000_000_000
+        self.read_s += 0.5
 
 
 class _FakeDriver:
@@ -42,23 +45,32 @@ class _FakeDriver:
         self.c = types.SimpleNamespace(fetches=0, blocked_s=0.0, compute_s=0.0)
         self.policy = types.SimpleNamespace(global_barrier=True, resolve_blocks=True)
         # v2 owns the cache now, so stats() reads ExpertSlots' own accounting rather than v1's
-        # store. The fake carries the same surface.
-        self.slots = types.SimpleNamespace(hit_rate=1.0, misses=0, prefill_misses=0)
+        # store. The fake carries the same surface, and it only ever counts UP -- which is the
+        # whole point: absolute reads would fold every earlier request into this one.
+        self.slots = types.SimpleNamespace(hits=0, misses=0, prefill_misses=0)
 
     def decode(self, n):
         for _ in range(n):
             self.leaves.step()
+            self.slots.hits += 3
+            self.slots.misses += 1
+            self.c.fetches += 1
 
 
 class _Gate:
-    def __init__(self):
-        self.seen = []
+    """Records what it was shown, and can actually forbid a token."""
+
+    def __init__(self, ban=None):
+        self.seen, self.ban, self.mask_calls = [], ban, []
 
     def observe(self, ids):
         self.seen.extend(ids)
 
     def mask_rows(self, logits, block_ids):
-        return 0
+        self.mask_calls.append(block_ids)
+        if self.ban is not None:
+            logits[..., self.ban] = float("-inf")
+        return 1
 
 
 def _engine(bursts, first=7):
@@ -124,3 +136,52 @@ def test_grammar_is_observed_once_per_settled_token_in_order():
     list(e.generate([5], max_tokens=100, temperature=0.0, top_p=1.0,
                     stop_token_ids=set(), seed=None, grammar=gate))
     assert gate.seen == [7, 1, 2, 3], gate.seen
+
+
+def test_grammar_constrains_the_FIRST_token_not_just_reports_it():
+    """The gate must mask the prefill row BEFORE the first token is sampled.
+
+    The first version sampled from `logits[-1]` and attached the grammar afterwards, so `observe()`
+    saw the first token while `mask_rows()` never had a chance to constrain it: an illegal token
+    could be SELECTED and then merely reported. That matters more now that a request WITHOUT tools
+    also carries a plain-text gate, whose entire job is to keep one token out of a completion that
+    has no legal use for it.
+    """
+    e = _engine([[1]], first=7)          # logits favour 7; the gate forbids it
+    gate = _Gate(ban=7)
+    out = list(e.generate([5], max_tokens=2, temperature=0.0, top_p=1.0,
+                          stop_token_ids=set(), seed=None, grammar=gate))
+    assert out[0] != [7], "the banned token was selected as the first token"
+    assert gate.mask_calls and gate.mask_calls[0] is None, (
+        "the prefill row must be masked as a single row (block_ids=None)")
+
+
+def test_same_seed_gives_the_same_first_token():
+    """Seeding used to happen inside attach(), which runs AFTER the first token is drawn."""
+    firsts = []
+    for _ in range(2):
+        e = _engine([[1]], first=7)
+        g = e.generate([5], max_tokens=1, temperature=1.0, top_p=1.0,
+                       stop_token_ids=set(), seed=1234)
+        firsts.append(next(g))
+        g.close()
+    assert firsts[0] == firsts[1], f"same prompt and seed gave {firsts}"
+
+
+def test_stats_are_per_request_not_cumulative():
+    """Counters live for the life of the process and the warm start moves them before request 1."""
+    e = _engine([[1, 2], [3, 4]])
+    list(e.generate([5], max_tokens=100, temperature=0.0, top_p=1.0,
+                    stop_token_ids=set(), seed=None))
+    first = e.stats()
+    e.leaves._bursts, e.leaves.i = [[8]], 0       # a second, shorter request
+    list(e.generate([5], max_tokens=100, temperature=0.0, top_p=1.0,
+                    stop_token_ids=set(), seed=None))
+    second = e.stats()
+    # Request 1 runs three steps: two bursts plus the one that returns empty and ends it.
+    assert first["nvme_gb"] == 3.0 and first["steps"] == 3, first
+    # Request 2 runs two. Cumulative reads would report 5.0 here.
+    assert second["nvme_gb"] == 2.0, (
+        f"request 2 reported {second['nvme_gb']} GB -- it is carrying request 1's reads")
+    assert second["steps"] == 2, second
+    assert second["expert_misses"] == 2, second

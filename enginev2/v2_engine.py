@@ -51,6 +51,10 @@ class V2Engine(_ServerEngine):
 
     eos_token_id = 1
     supports_grammar = True
+    #: presence/frequency penalties, the cycle breaker and no_repeat_ngram. The server
+    #: only builds and passes Penalties for an engine that says yes, so leaving this
+    #: False meant the API validated those fields and then silently dropped them.
+    supports_penalties = True
     #: DSpark drafts 6 tokens and the verify block is one wider.
     context_margin = 8
 
@@ -127,21 +131,51 @@ class V2Engine(_ServerEngine):
     # ------------------------------------------------------------------ the ABC
     def generate(self, prompt_ids, *, max_tokens: int = 4096, temperature: float = 1.0,
                  top_p: float = 0.95, stop_token_ids=None, seed=None, grammar=None,
-                 ignore_eos: bool = False, **_ignored):
+                 penalties=None, ignore_eos: bool = False, **_ignored):
         stop = set(stop_token_ids or ())
+        # SEED BEFORE ANYTHING IS SAMPLED. This used to sit inside attach(), which runs AFTER the
+        # first token has been drawn -- so the first token was not reproducible from (prompt, seed),
+        # and the reseed then restarted the RNG stream mid-generation, which is not v1's semantics
+        # either. v1 seeds before prefill; so does this now.
+        if seed is not None:
+            torch.manual_seed(int(seed))
         ids = torch.tensor(list(prompt_ids), dtype=torch.long, device=self.device)
         t0 = time.perf_counter()
         n_out = 0
+        # PER-REQUEST WINDOW. Every counter below lives for the life of the process, and warm_start()
+        # drives reserve()/submit() before request 1 even arrives -- so absolute reads would put the
+        # warm start in request 1 and requests 1..N-1 in request N, and nvme_gb_per_token would be
+        # nonsense. Snapshot here, report deltas. This is the same windowing mistake that cost the
+        # host-phase profile and the residency figures earlier today; making it structural is the
+        # only fix that holds.
+        base = self._counters()
         try:
             logits, mh, s_rep = self._prefill(ids)
             t_prefill = time.perf_counter() - t0
-            p = sample_probs(logits[-1].float(), temperature, top_p)
+            # THE GATE CONSTRAINS THE FIRST TOKEN TOO. Sampling first and attaching the grammar
+            # afterwards let observe() see the token while mask_rows() never had a chance to
+            # constrain it -- so an illegal token could be SELECTED and then merely reported. That
+            # matters more now that a request without tools also carries a plain-text gate whose
+            # whole job is to keep the DSML bar out of a completion that has no legal use for it.
+            row = logits[-1:].float()
+            hist: list = []
+            pen = penalties if (penalties is not None and penalties.active) else None
+            if pen is not None:
+                pen.apply(row, hist)
+            if grammar is not None:
+                grammar.mask_rows(row, None)
+            p = sample_probs(row[0], temperature, top_p)
             first = int(torch.multinomial(p, 1)) if temperature > 0 else int(p.argmax())
             self.v1.model.dspark_seed(mh, s_rep)
             self.leaves.attach(self.v1, None, spec=True, temperature=temperature, top_p=top_p,
-                               seed=seed, first_token=first, stop_ids=stop)
+                               first_token=first, stop_ids=stop)
             self.leaves.grammar = grammar
+            self.leaves.penalties = pen
+            self.leaves.hist = hist
             n_out = 1
+            hist.append(first)
+            if pen is not None:
+                pen.observe([first])
             if grammar is not None:
                 grammar.observe([first])
             yield [first]
@@ -156,6 +190,9 @@ class V2Engine(_ServerEngine):
                 if n_out + len(burst) > max_tokens:
                     burst = burst[:max_tokens - n_out]
                 n_out += len(burst)
+                hist.extend(burst)
+                if pen is not None:
+                    pen.observe(burst)
                 if grammar is not None:
                     grammar.observe(burst)
                 yield burst
@@ -166,12 +203,26 @@ class V2Engine(_ServerEngine):
             # generator and raises GeneratorExit at the pending yield, so the lines after the loop
             # never run. The engine has to be usable for the next request either way.
             self.leaves.grammar = None
+            self.leaves.penalties = None
+            self.leaves.hist = []
             wall = time.perf_counter() - t0
             self._stats = self._collect(n_out, wall, locals().get("t_prefill"),
-                                        locals().get("t_dec0"))
+                                        locals().get("t_dec0"), base)
 
-    def _collect(self, n_out: int, wall: float, t_prefill, t_dec0) -> dict:
-        acc = self.leaves.accepted
+    def _counters(self) -> dict:
+        """Everything cumulative, sampled at one instant. See the note in generate()."""
+        sl, c = self.driver.slots, self.driver.c
+        return {"hits": sl.hits, "misses": sl.misses, "prefill_misses": sl.prefill_misses,
+                "read_bytes": self.leaves.read_bytes, "read_s": self.leaves.read_s,
+                "fetches": c.fetches, "blocked_s": c.blocked_s, "compute_s": c.compute_s,
+                "steps": len(self.leaves.accepted),
+                "engram_rows": (sum(t.stats["rows"] for t in self.v1.tables.values())
+                                if self.engram_src is not None else 0)}
+
+    def _collect(self, n_out: int, wall: float, t_prefill, t_dec0, base: dict) -> dict:
+        now = self._counters()
+        d = {k: now[k] - base[k] for k in now}
+        acc = self.leaves.accepted[base["steps"]:]
         c, sl = self.driver.c, self.driver.slots
         out = {
             "engine": "v2",
@@ -183,22 +234,22 @@ class V2Engine(_ServerEngine):
             "steps": len(acc),
             # +1: a step commits the accepted drafts AND the bonus token.
             "accept_len_mean": round(sum(acc) / len(acc) + 1, 2) if acc else None,
-            # v2's OWN counters. Reading v1's store here would report the cache v2 does not use:
-            # with warm_start=False that map is empty and every figure would be a zero or a lie.
-            "expert_hit_rate": round(sl.hit_rate, 4),
-            "expert_misses": sl.misses,
-            "prefill_expert_misses": sl.prefill_misses,
-            "nvme_gb": round(self.leaves.read_bytes / 1e9, 2),
-            "nvme_gb_per_token": round(self.leaves.read_bytes / 1e9 / max(n_out, 1), 3),
-            "nvme_read_s": round(self.leaves.read_s, 2),
-            "v2_fetches": c.fetches,
-            "v2_blocked_s": round(c.blocked_s, 2),
-            "v2_compute_s": round(c.compute_s, 2),
+            # ALL DELTAS over this request. v2's own counters, not v1's store -- with
+            # warm_start=False that map is empty and every figure would be a zero reported as a fact.
+            "expert_hit_rate": (round(d["hits"] / max(1, d["hits"] + d["misses"] + d["prefill_misses"]), 4)),
+            "expert_misses": d["misses"],
+            "prefill_expert_misses": d["prefill_misses"],
+            "nvme_gb": round(d["read_bytes"] / 1e9, 2),
+            "nvme_gb_per_token": round(d["read_bytes"] / 1e9 / max(n_out, 1), 3),
+            "nvme_read_s": round(d["read_s"], 2),
+            "v2_fetches": d["fetches"],
+            "v2_blocked_s": round(d["blocked_s"], 2),
+            "v2_compute_s": round(d["compute_s"], 2),
             "policy": {"global_barrier": self.driver.policy.global_barrier,
                        "resolve_blocks": self.driver.policy.resolve_blocks},
         }
         if self.engram_src is not None:
-            out["engram_rows"] = sum(t.stats["rows"] for t in self.v1.tables.values())
+            out["engram_rows"] = d["engram_rows"]
         return out
 
     def stats(self) -> dict:

@@ -1106,6 +1106,20 @@ def make_engine(args: argparse.Namespace, tok: Tok, enc) -> Engine:
         # and it wins over the flags so a JSON override is never silently ignored.
         kwargs.update(json.loads(args.engine_kwargs) if args.engine_kwargs else {})
         return V41Engine(model_dir=args.model_dir, **kwargs)
+    if args.engine == "v2":
+        # enginev2: the same weights, arena and leaf math, driven by v2's scheduler. It reuses
+        # V41Engine as a resource holder (weights, tokenizer, KV caches, graph capture, arena
+        # sizing) and owns the expert cache, the loader and the schedule itself.
+        try:
+            from enginev2.v2_engine import V2Engine  # type: ignore
+        except ImportError as e:
+            raise SystemExit(
+                "--engine v2 needs enginev2/v2_engine.py (class V2Engine, an engine_api.Engine "
+                f"subclass) at the repo root ({REPO_ROOT}); it is not importable: {e}. "
+                "Use --engine mock to run the HTTP layer alone.")
+        kwargs = {"max_seq": args.max_seq, "arena_gb": args.arena_gb}
+        kwargs.update(json.loads(args.engine_kwargs) if args.engine_kwargs else {})
+        return V2Engine(model_dir=args.model_dir, **kwargs)
     raise SystemExit(f"unknown engine {args.engine!r}")
 
 
@@ -1117,7 +1131,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--served-model-name", default="deepseek-v4.1-flash")
     p.add_argument("--default-thinking", choices=["off", "on"], default="off")
     p.add_argument("--default-effort", type=int, default=75, help="reasoning effort 1-100 when thinking is on")
-    p.add_argument("--engine", choices=["mock", "v41"], default="mock")
+    p.add_argument("--engine", choices=["mock", "v41", "v2"], default="mock")
     p.add_argument("--engine-kwargs", default="",
                    help="JSON object passed to V41Engine(model_dir=..., **kwargs); overrides the flags below")
     p.add_argument("--max-seq", type=int, default=32768,
