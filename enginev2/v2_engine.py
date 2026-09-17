@@ -1,0 +1,193 @@
+"""`V2Engine` -- the v2 driver behind the server's `Engine` ABC.
+
+THE ENDPOINT LIST IS NOT THE WORK. `server/app.py` implements /v1/chat/completions, SSE streaming,
+/v1/completions, chat-template rendering, thinking/reasoning, tools and DSML parsing, xgrammar
+constraints, stop strings, usage accounting, /health and /v1/models against a THREE-METHOD abstract
+class in `server/engine_api.py`, and `MockEngine` runs that whole half with no GPU. So everything
+those endpoints need from v2 is this file.
+
+What it reuses from v1, deliberately: the weights, tokenizer, CB3 arena and expert store
+(`V41Engine` as a resource holder), and the leaf math `RealLeaves` already calls. What it does NOT
+reuse is v1's control: `_generate`, `_decode_loop`, its prefill branch and its stats assembly are
+replaced by v2's driver, which is the point of v2 existing.
+
+Contract notes that are easy to get wrong and are handled here:
+
+  * The server DRAINS the generator after a stop id or max_tokens (up to 4 more bursts, ignored) so
+    the engine's epilogue runs. On a stop STRING or a client disconnect it CLOSES the generator
+    instead, raising GeneratorExit at the pending yield -- so cleanup is in a `finally` and the
+    engine must be usable for the next request afterwards.
+  * `grammar` is passed to ANY engine with `supports_grammar`, not only when the request carries
+    tools: a request without tools gets a plain-text gate that keeps the DSML bar out of a
+    completion with no legal use for it. Calling it unconditionally is correct.
+  * `context_margin` is the DSpark draft block the engine needs BEYOND prompt + max_tokens.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import time
+
+import torch
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (ROOT, os.path.join(ROOT, "tools")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from engine.v41_engine import V41Engine, sample_probs          # noqa: E402
+from enginev2 import drivers as v2drivers                      # noqa: E402
+from enginev2.real import RealEngramSource, RealLeaves         # noqa: E402
+from enginev2.sched import Policy                              # noqa: E402
+
+try:                                                            # the ABC lives in the server tree
+    from server.engine_api import Engine as _ServerEngine
+except Exception:                                               # noqa: BLE001
+    _ServerEngine = object
+
+
+class V2Engine(_ServerEngine):
+    """Single-sequence generation on the v2 driver."""
+
+    eos_token_id = 1
+    supports_grammar = True
+    #: DSpark drafts 6 tokens and the verify block is one wider.
+    context_margin = 8
+
+    def __init__(self, model_dir: str, *, max_seq: int = 32768, arena_gb=None,
+                 cb3_path: str | None = None, keep_free_gb: float = 20.0,
+                 transient_slots: int = 400, evict: str = "lru",
+                 engram: bool = True, policy: Policy | None = None,
+                 n_workers: int = 48, staging: int = 48):
+        self.v1 = V41Engine(model_dir, max_seq=max_seq, arena_gb=arena_gb, spec=True,
+                            expert_format="cb3", keep_free_gb=keep_free_gb,
+                            transient_slots=transient_slots)
+        self.max_context = max_seq
+        self.tokenizer = self.v1.tokenizer
+        v2drivers.N_LAYERS = self.v1.args.n_layers
+        cb3 = cb3_path or os.environ["DSV41_CB3_CACHE"]
+        self.leaves = RealLeaves(cb3, self.v1.arena)
+        self.engram_src = RealEngramSource(self.v1, self.leaves) if engram else None
+        self.leaves.engram = self.engram_src
+        self.driver = v2drivers.Engine(
+            policy if policy is not None else Policy(), evict=evict,
+            lru_slots=self.v1.store.n_slots - transient_slots,
+            transient_slots=transient_slots, n_workers=n_workers, staging=staging,
+            leaves=self.leaves, engram=self.engram_src)
+        # START FROM v1's RESIDENT SET. The engine's warm start has already filled the arena; v2's
+        # ExpertSlots is separate bookkeeping over the SAME slots, so without this every request
+        # would re-read experts whose bytes are already there.
+        self._adopt_resident()
+        self._stats: dict = {}
+        # Injectable so the generator CONTRACT (bursts, stop ids, max_tokens, the
+        # GeneratorExit path) can be tested without a GPU -- that logic is where a
+        # server breaks silently, and it has nothing to do with the device.
+        self.device = "cuda"
+
+    def _adopt_resident(self) -> None:
+        sl = self.driver.slots
+        for k, slot in self.v1.store.lru.items():
+            sl.lru[k] = slot
+            sl.slot_key[slot] = k
+            sl.gen[slot] = sl.gen.get(slot, 0)
+            sl.evict.on_insert(k, slot, 0)
+        sl.free_lru = [s for s in sl.free_lru if s not in sl.slot_key]
+
+    # ------------------------------------------------------------------ prefill
+    def _prefill(self, ids: torch.Tensor):
+        """Run the prompt and return (logits, mh, s_rep). Bitwise-gated against v1 (job 536)."""
+        m = self.v1.model
+        m.c.rollback(0)
+        m.begin_prompt()
+        m.c.checkpoint(0)
+        n_chunks = self.leaves.begin_prefill(ids, 0)
+        for L in range(m.args.candidate_source_layer + 1):
+            self.driver.prefill_chunked(L, n_chunks)
+        self.leaves.finish_prefill()
+        return m.decoder_replay(need_logits=True)
+
+    # ------------------------------------------------------------------ the ABC
+    def generate(self, prompt_ids, *, max_tokens: int = 4096, temperature: float = 1.0,
+                 top_p: float = 0.95, stop_token_ids=None, seed=None, grammar=None,
+                 ignore_eos: bool = False, **_ignored):
+        stop = set(stop_token_ids or ())
+        ids = torch.tensor(list(prompt_ids), dtype=torch.long, device=self.device)
+        t0 = time.perf_counter()
+        n_out = 0
+        try:
+            logits, mh, s_rep = self._prefill(ids)
+            t_prefill = time.perf_counter() - t0
+            p = sample_probs(logits[-1].float(), temperature, top_p)
+            first = int(torch.multinomial(p, 1)) if temperature > 0 else int(p.argmax())
+            self.v1.model.dspark_seed(mh, s_rep)
+            self.leaves.attach(self.v1, None, spec=True, temperature=temperature, top_p=top_p,
+                               seed=seed, first_token=first, stop_ids=stop)
+            self.leaves.grammar = grammar
+            n_out = 1
+            if grammar is not None:
+                grammar.observe([first])
+            yield [first]
+            if first in stop and not ignore_eos:
+                return
+            t_dec0 = time.perf_counter()
+            while n_out < max_tokens:
+                self.driver.decode(1)
+                burst = self.leaves.last_burst
+                if not burst:
+                    break                      # a step that committed nothing cannot make progress
+                if n_out + len(burst) > max_tokens:
+                    burst = burst[:max_tokens - n_out]
+                n_out += len(burst)
+                if grammar is not None:
+                    grammar.observe(burst)
+                yield burst
+                if not ignore_eos and any(t in stop for t in burst):
+                    return
+        finally:
+            # CLEANUP BELONGS HERE, not after the loop: a stop STRING or a disconnect closes the
+            # generator and raises GeneratorExit at the pending yield, so the lines after the loop
+            # never run. The engine has to be usable for the next request either way.
+            self.leaves.grammar = None
+            wall = time.perf_counter() - t0
+            self._stats = self._collect(n_out, wall, locals().get("t_prefill"),
+                                        locals().get("t_dec0"))
+
+    def _collect(self, n_out: int, wall: float, t_prefill, t_dec0) -> dict:
+        st = self.v1.store.stats
+        acc = self.leaves.accepted
+        c = self.driver.c
+        out = {
+            "engine": "v2",
+            "tokens": n_out,
+            "wall_s": round(wall, 3),
+            "ttft_s": round(t_prefill, 3) if t_prefill else None,
+            "decode_tok_s": (round(n_out / (time.perf_counter() - t_dec0), 2)
+                             if t_dec0 and n_out else None),
+            "steps": len(acc),
+            # +1: a step commits the accepted drafts AND the bonus token.
+            "accept_len_mean": round(sum(acc) / len(acc) + 1, 2) if acc else None,
+            "expert_hit_rate": round(self.v1.store.hit_rate(), 4),
+            "expert_misses": st["misses"],
+            "prefill_expert_misses": st["prefill_misses"],
+            "nvme_gb": round(st["bytes_read"] / 1e9, 2),
+            "nvme_gb_per_token": round(st["bytes_read"] / 1e9 / max(n_out, 1), 3),
+            "load_wait_s": round(st["load_s"], 2),
+            "v2_fetches": c.fetches,
+            "v2_blocked_s": round(c.blocked_s, 2),
+            "v2_compute_s": round(c.compute_s, 2),
+            "policy": {"global_barrier": self.driver.policy.global_barrier,
+                       "resolve_blocks": self.driver.policy.resolve_blocks},
+        }
+        if self.engram_src is not None:
+            out["engram_rows"] = sum(t.stats["rows"] for t in self.v1.tables.values())
+        return out
+
+    def stats(self) -> dict:
+        return dict(self._stats)
+
+    def close(self) -> None:
+        try:
+            self.driver.close()
+        finally:
+            self.leaves.close()
+            self.v1.close()

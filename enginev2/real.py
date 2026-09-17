@@ -366,6 +366,12 @@ class RealLeaves(Leaves):
         self.drafts = None
         self.tokens_out = 0          # tokens actually COMMITTED -- what tok/s means
         self.accepted = []           # per step, so accept_len is measured rather than assumed
+        # The tokens THIS step committed, in order. end_step already computes them and used to
+        # keep only the last one; a server has to yield the burst, not the survivor.
+        self.last_burst: list = []
+        # Optional decoding gate (server/tool_grammar.py). Two calls and nothing else: the driver
+        # masks the verify block's rows here, the caller observes the committed tokens.
+        self.grammar = None
         self.stop_ids = frozenset()
         # The engram source, if one is attached. It owns the reads; this owns the dequant+H2D at
         # the consumer, because to_device() makes CUDA calls and may not run on a reader thread.
@@ -807,6 +813,12 @@ class RealLeaves(Leaves):
         # the bonus from the residual (p - q)+ renormalised. That is the standard construction and
         # it is what makes speculative decoding distribution-preserving.
         # Reference: engine/v41_engine.py:1028-1051.
+        # GRAMMAR MASK BEFORE THE DECISION, not after. The gate masks row i for the state after
+        # block[0..i], so it has to see the verify block's rows while they are still logits -- once
+        # a draft has been accepted the choice is made. Masking leaves the gate's own state
+        # untouched, which is why speculation that is rolled back needs no undo.
+        if self.grammar is not None:
+            self.grammar.mask_rows(fd.logits, [int(self.tok)] + self.drafts.tolist())
         if self.temperature > 0:
             a_n, new_toks, bonus = self._verify_sampled()
         else:
@@ -823,6 +835,7 @@ class RealLeaves(Leaves):
         self._S = int(fd.c.len)
         self.accepted.append(a_n)
         self.tokens_out += a_n + (1 if bonus is not None else 0)
+        self.last_burst = list(new_toks) + ([bonus] if bonus is not None else [])
         self.tok = bonus if bonus is not None else (new_toks[-1] if new_toks else self.tok)
 
 
