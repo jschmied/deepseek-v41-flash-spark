@@ -118,6 +118,12 @@ class Counters:
     achieved_gbs: float = 0.0
     device_busy_s: float = 0.0
     copies_awaited: int = 0       # H2Ds turned into a GPU dependency instead of a host block
+    # Token-expert PAIRS seen, and how many were already resident. moe_forward's cost scales with
+    # P = T*K pairs (36 per layer at T=6/top-6), not with the ~11.6 unique experts a layer touches:
+    # a resident expert serving four tokens is four pairs of work. Every estimate of the
+    # resident-first MoE split before this used the unique-key hit rate, which is the wrong weight.
+    pairs_total: int = 0
+    pairs_resident: int = 0
 
     @property
     def steps_per_s(self) -> float:
@@ -299,6 +305,17 @@ class Engine:
                 self.obs.safe_emit(Event(now_ns(), "cache_pending_hit", ctx=ctx, value=len(to_wait),
                                          scored=self._scoring))
         self.c.fetches += len(to_load)
+        # PAIR RESIDENCY, measured where it is actually true: after reserve() has classified this
+        # layer's experts and before anything is loaded. A standalone probe cannot get this --
+        # replaying graph A per layer without graph B between them leaves `h` unpropagated, so every
+        # layer past the first routes from a residual stream that never passed through its
+        # predecessors. That probe reported 22.6 unique experts per layer against the engine's
+        # ~11.6, which is how the error announced itself.
+        _miss_e = {k[1] for k in to_load} | {k[1] for k in to_wait}
+        _flat = getattr(route, "flat_cpu", None)
+        if _flat:
+            self.c.pairs_total += len(_flat)
+            self.c.pairs_resident += sum(1 for e in _flat if e not in _miss_e)
         # DEMAND work carries the cohort too. Settlement generates real demand misses, and submit
         # and _wait defaulted to scored=True -- so a settlement load_queued / nvme / staging /
         # EXPERT_DATA chain was labelled measured. Test 28 cannot see it: it compares the aggregate
