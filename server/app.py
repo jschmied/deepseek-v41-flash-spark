@@ -1117,7 +1117,10 @@ def make_engine(args: argparse.Namespace, tok: Tok, enc) -> Engine:
                 "--engine v2 needs enginev2/v2_engine.py (class V2Engine, an engine_api.Engine "
                 f"subclass) at the repo root ({REPO_ROOT}); it is not importable: {e}. "
                 "Use --engine mock to run the HTTP layer alone.")
-        kwargs = {"max_seq": args.max_seq, "arena_gb": args.arena_gb}
+        # trace_stats is NOT optional in practice: without it V41Engine ranks experts by id and
+        # v2 would warm the arena with experts 0..k of every layer instead of the measured hot set.
+        kwargs = {"max_seq": args.max_seq, "arena_gb": args.arena_gb,
+                  "trace_stats": args.trace_stats}
         kwargs.update(json.loads(args.engine_kwargs) if args.engine_kwargs else {})
         return V2Engine(model_dir=args.model_dir, **kwargs)
     raise SystemExit(f"unknown engine {args.engine!r}")

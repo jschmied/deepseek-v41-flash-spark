@@ -28,6 +28,10 @@ class _FakeLeaves:
 
     def attach(self, *a, **kw):
         self.attached = kw
+        # THE REAL attach() RESETS THESE. The fake not doing so hid a bug where request 2 reported
+        # steps=0, because _collect sliced a request-local list against a cumulative base.
+        self.accepted = []
+        self.last_burst = []
         return self
 
     def step(self):
@@ -185,3 +189,43 @@ def test_stats_are_per_request_not_cumulative():
         f"request 2 reported {second['nvme_gb']} GB -- it is carrying request 1's reads")
     assert second["steps"] == 2, second
     assert second["expert_misses"] == 2, second
+
+
+def test_second_request_reports_its_own_steps_and_acceptance():
+    """`accepted` is reset by attach() on every request, so it is already request-local.
+
+    Slicing it against a cumulative base made request 2 report steps=0 and accept_len_mean=None:
+    the base held request 1's length while the list had been emptied underneath it. The fake had to
+    learn to reset too, or it could not model the engine it stands in for.
+    """
+    e = _engine([[1, 2], [3, 4]])
+    list(e.generate([5], max_tokens=100, temperature=0.0, top_p=1.0,
+                    stop_token_ids=set(), seed=None))
+    first = e.stats()
+    e.leaves._bursts, e.leaves.i = [[8], [9]], 0
+    list(e.generate([5], max_tokens=100, temperature=0.0, top_p=1.0,
+                    stop_token_ids=set(), seed=None))
+    second = e.stats()
+    assert first["steps"] == 3 and first["accept_len_mean"] is not None, first
+    assert second["steps"] == 3, (
+        f"request 2 reported steps={second['steps']} -- its acceptance history was sliced away")
+    assert second["accept_len_mean"] is not None, second
+
+
+def test_decode_rate_excludes_the_prefill_token():
+    """The first token comes out of prefill and is charged to TTFT, not to decode."""
+    e = _engine([[1, 2, 3]])
+    list(e.generate([5], max_tokens=4, temperature=0.0, top_p=1.0,
+                    stop_token_ids=set(), seed=None))
+    s = e.stats()
+    assert s["tokens"] == 4, s
+    assert s["decode_tok_s"] is not None
+    # The discriminating case: ONE emitted token is pure prefill, so there is no decode rate to
+    # report. The old expression divided that single token by the decode clock and returned a
+    # number. `is not None` above would pass either way and gates nothing on its own.
+    e2 = _engine([[1]])
+    list(e2.generate([5], max_tokens=1, temperature=0.0, top_p=1.0,
+                     stop_token_ids=set(), seed=None))
+    assert e2.stats()["decode_tok_s"] is None, (
+        f"a 1-token generation reported decode_tok_s={e2.stats()['decode_tok_s']}: the prefill "
+        f"token is being charged to decode")

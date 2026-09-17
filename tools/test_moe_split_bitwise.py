@@ -64,7 +64,7 @@ for T, K in ((6, 6), (1, 6), (5, 6)):
     C3.moe_v3_phase(x, slots, wgt, arena, hbuf, pbuf, routing=(bs_mis, block_pair, NB))
     out2 = C3.moe_v3_reduce(pbuf, T, K)
     same2 = torch.equal(ref, out2)
-    print(f"        masked-slots form (shared h/parts, one reduce): exact match {same2}  "
+    print(f"        phase API (shared h/parts, one reduce): exact match {same2}  "
           f"max |delta| {(ref.float() - out2.float()).abs().max():.3e}")
     fails += 0 if same2 else 1
     n_res = int(blk_res.sum())

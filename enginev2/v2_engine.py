@@ -62,12 +62,14 @@ class V2Engine(_ServerEngine):
                  cb3_path: str | None = None, keep_free_gb: float = 20.0,
                  transient_slots: int = 400, evict: str = "lru",
                  engram: bool = True, policy: Policy | None = None,
-                 n_workers: int = 48, staging: int = 48):
+                 n_workers: int = 48, staging: int = 48,
+                 trace_stats=None, hot_profile=None):
         # warm_start=False: v1 allocates the arena and the weights and leaves residency ALONE.
         # v2 owns the expert cache -- its own ExpertSlots, its own loader, its own warm start.
         self.v1 = V41Engine(model_dir, max_seq=max_seq, arena_gb=arena_gb, spec=True,
                             expert_format="cb3", keep_free_gb=keep_free_gb,
-                            transient_slots=transient_slots, warm_start=False)
+                            transient_slots=transient_slots, warm_start=False,
+                            trace_stats=trace_stats, hot_profile=hot_profile)
         self.max_context = max_seq
         self.tokenizer = self.v1.tokenizer
         v2drivers.N_LAYERS = self.v1.args.n_layers
@@ -82,7 +84,20 @@ class V2Engine(_ServerEngine):
             lru_slots=self.v1.arena.slots - transient_slots,
             transient_slots=transient_slots, n_workers=n_workers, staging=staging,
             leaves=self.leaves, engram=self.engram_src)
-        self.warm_start(self.v1.warm_rank)
+        # THE RANKING IS THE RESIDENCY. Without `trace_stats`, V41Engine falls back to
+        # [(L, e) for e in range(384) for L in range(40)] -- expert-ID order -- and warming the
+        # first arena-sized slice of THAT fills the cache with experts 0..k of every layer instead
+        # of the measured hot set. It would load, serve, and quietly give up the entire residency
+        # advantage. Fail loudly instead of warming the wrong thing.
+        rank = self.v1.warm_rank
+        if trace_stats is not None:
+            naive = [(L, e) for e in range(384) for L in range(40)]
+            if list(rank[:64]) == naive[:64]:
+                raise RuntimeError(
+                    "trace_stats was supplied but warm_rank is the unranked expert-ID fallback: "
+                    "the hot-expert ranking was lost on the way in, and the arena would be warmed "
+                    "with experts 0..k of every layer instead of the measured working set.")
+        self.warm_start(rank)
         self._stats: dict = {}
         # Injectable so the generator CONTRACT (bursts, stop ids, max_tokens, the
         # GeneratorExit path) can be tested without a GPU -- that logic is where a
@@ -215,22 +230,26 @@ class V2Engine(_ServerEngine):
         return {"hits": sl.hits, "misses": sl.misses, "prefill_misses": sl.prefill_misses,
                 "read_bytes": self.leaves.read_bytes, "read_s": self.leaves.read_s,
                 "fetches": c.fetches, "blocked_s": c.blocked_s, "compute_s": c.compute_s,
-                "steps": len(self.leaves.accepted),
                 "engram_rows": (sum(t.stats["rows"] for t in self.v1.tables.values())
                                 if self.engram_src is not None else 0)}
 
     def _collect(self, n_out: int, wall: float, t_prefill, t_dec0, base: dict) -> dict:
         now = self._counters()
         d = {k: now[k] - base[k] for k in now}
-        acc = self.leaves.accepted[base["steps"]:]
+        # `accepted` is RESET BY attach() on every request, so it is already request-local. Slicing
+        # it against a cumulative base made request 2 report steps=0 and accept_len_mean=None: the
+        # base was request 1's length, and the list had been emptied underneath it.
+        acc = self.leaves.accepted
         c, sl = self.driver.c, self.driver.slots
         out = {
             "engine": "v2",
             "tokens": n_out,
             "wall_s": round(wall, 3),
             "ttft_s": round(t_prefill, 3) if t_prefill else None,
-            "decode_tok_s": (round(n_out / (time.perf_counter() - t_dec0), 2)
-                             if t_dec0 and n_out else None),
+            # n_out - 1: the first token comes out of PREFILL and is charged to TTFT. Counting it
+            # as decode overstates the rate by 1/n, which is ~11 % on a 10-token test generation.
+            "decode_tok_s": (round(max(n_out - 1, 0) / (time.perf_counter() - t_dec0), 2)
+                             if t_dec0 and n_out > 1 else None),
             "steps": len(acc),
             # +1: a step commits the accepted drafts AND the bonus token.
             "accept_len_mean": round(sum(acc) / len(acc) + 1, 2) if acc else None,
