@@ -672,6 +672,50 @@ replay costs about the same whatever it contains. The routed MoE would pay that 
 larger body of work, so the ratio there is far better. Whether the work itself is large is what job
 400 measures, and it is the question that decides the whole overlap family.
 
+## 21. The decode GPU budget, per graph (job 400)
+
+CUDA events around each graph replay, drained once per step. 86 GB, 300 steps after 100 warm. The
+two arms are internally consistent, which is what says the instrument works: graph B is 79.36 ms
+with the shared expert inside it and 69.42 ms with it split out, a difference of 9.94 ms against
+the 10.44 ms that graph S measures directly.
+
+| graph | contents | ms / step | share |
+|---|---|---|---|
+| A | attention + HC + router | 46.1 | 37 % |
+| B | routed MoE + HC residual (sf=1) | **69.4** | 55 % |
+| S | shared expert alone | 10.4 | 8 % |
+| total | | 125.8 | |
+
+Against job 355's node-traced ~102 ms/step for the whole step -- a different instrument on a
+profiled run -- this is the right order, and it is the first per-graph split we have had.
+
+**GRAPH A IS 37 % OF THE DEVICE TIME AND CANNOT EVER OVERLAP.** A(L) must finish before layer L's
+expert ids exist, so it cannot hide behind the reads it itself causes. That is the structural reason
+the +39 % of section 19 was never available, independent of any implementation.
+
+**B_r = 69.4 ms IS THE CEILING ON EVERY OVERLAP PROJECT LEFT.** At the ~83 % hit rate, about 58 ms
+of device time is in pairs whose experts are already resident and could therefore compute while the
+misses load.
+
+### How much of moved device time becomes wall time: about two thirds
+
+The shared expert is the calibration, because it is the one case measured both ways. 10.44 ms of
+device time moved out of graph B produced a **7.07 ms** drop in wall (434.59 -> 427.52). Where it
+shows up is worth noting: `layer_a` fell only 2.30 ms while `wait_reads` fell 6.84 ms. Work pushed
+into the read window SHORTENS THE MEASURED WAIT rather than the compute phase, which is exactly what
+overlap looks like from the driver's side, and it is why reading `layer_a` alone understated it.
+
+So the routed split is worth roughly 0.83 x 69.4 x 2/3 = **~38 ms of 434, or 5-12 %** once the
+second kernel for the missing pairs and the un-movable HC residual are paid for. Worth building; not
+the 13.5 % the device time alone suggests.
+
+### The shared-expert gain, restated
+
+This job gives +1.6 % for shared_first (6.49 vs 6.39 tok/s, one rep each, 300 steps) against +0.2 %
+from job 395's matched arms (600 steps). Those disagree and neither has the reps to settle it. Job
+405 replicates both arms twice with the arm order alternated. Until then: shared_first is worth
+somewhere between nothing and 1.6 %, and the reason to keep it is the mechanism, not the number.
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
