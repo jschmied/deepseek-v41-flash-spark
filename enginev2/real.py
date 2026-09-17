@@ -825,6 +825,27 @@ class RealLeaves(Leaves):
         pt = sample_probs(lg[a if a < n_draft else n_draft].float(), self.temperature, self.top_p)
         return a, new, int(torch.multinomial(pt, 1))
 
+    def discard_tail(self, n: int) -> None:
+        """Un-commit the last `n` tokens of the step just finished.
+
+        `V2Engine` truncates the EMITTED burst at max_tokens, but the step has already committed the
+        whole speculative burst -- so without this the engine's cache holds tokens the caller never
+        received. Harmless while every request begins with `rollback(0)`, and a real defect the
+        moment prompt-cache reuse lands: the resumed cache would carry text no client ever saw.
+
+        THIS DOES NOT UNDO THE EXPERT READS. Those bytes moved, and the residency they perturbed
+        stays perturbed. So this fixes cache correctness, NOT the request-to-request tail variation
+        seen in job 585 -- do not credit it with that.
+
+        One position per token, which holds because a step's cache advance equals its burst length
+        on the path that can be truncated (max_tokens reached, so no stop token shortened it).
+        """
+        if n <= 0:
+            return
+        fd = self.fd
+        fd.c.rollback(int(fd.c.len) - int(n))
+        self._S = int(fd.c.len)
+
     def end_step(self, step: int) -> None:
         """KV bookkeeping for Caches.rollback, and advance the cache length."""
         self.gt_drain()          # no-op unless DSV41_GRAPH_TIMING; the step's graphs are done here

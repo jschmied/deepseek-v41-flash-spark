@@ -208,7 +208,12 @@ class V2Engine(_ServerEngine):
                 if not burst:
                     break                      # a step that committed nothing cannot make progress
                 if n_out + len(burst) > max_tokens:
-                    burst = burst[:max_tokens - n_out]
+                    # The step already COMMITTED the whole burst; hand the extra positions back so
+                    # the cache agrees with what the caller received. See discard_tail: it does not
+                    # undo the expert reads, only the cache.
+                    keep = max_tokens - n_out
+                    self.leaves.discard_tail(len(burst) - keep)
+                    burst = burst[:keep]
                 n_out += len(burst)
                 hist.extend(burst)
                 if pen is not None:

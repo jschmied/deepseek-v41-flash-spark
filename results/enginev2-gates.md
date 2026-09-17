@@ -190,6 +190,43 @@ residency by an amount that depends on acceptance length — 585 had `steps=3` f
 others. Job 595 asks for 16 tokens and compares the first 8, putting the truncation far past the
 compared prefix.
 
+## Job 600 — `--engine v2` serves HTTP (2026-09-17)
+
+The whole surface, first time through `server/app.py`:
+
+    /health OK
+    /v1/models  deepseek-v4.1-flash, max_model_len 8192
+    request 1   completion_tokens=2 prompt_tokens=11  'Hello!'
+    request 2   completion_tokens=2 prompt_tokens=11  'Hello!'
+    streaming   7 SSE data lines, usage frame present
+    x_engine_stats  engine=v2 tokens=8 ttft=3.111s decode=1.62 tok/s steps=3
+                    accept_len_mean=3.0 expert_hit_rate=0.6348 misses=769 prefill_misses=187
+
+Chat completions, SSE, usage accounting, `/health` and `/v1/models` all work, and the stats are
+per-request deltas rather than lifetime counters. Note both requests returned the same two tokens:
+they hit EOS before reaching the divergence point, so this does NOT contradict the reproducibility
+defect — it bounds it to longer generations.
+
+## Job 595 — the transient ring is not the carrier either (2026-09-17)
+
+    control   req1 ring=0   [52480, 260, 9162, 294, 5085, 89673, 4061, 305]
+              req2 ring=400 map=95a595dd5819 hits=5889 miss=5008
+                            [52480, 270, 3615, 294, 270, 30123, 18505, 343]
+    ringcold  req1 ring=0   [52480, 260, 9162, 294, 5085, 89673, 4061, 305]
+              req2 ring=0   map=95a595dd5819 hits=5889 miss=5008
+                            [52480, 270, 5085, 18505, 9335, 305, 270, 5085]
+
+Cooling the ring does not restore request 1 — it produces a third answer. And request 1 ALSO ran
+with `ring=0`, so an empty ring is not what distinguishes it.
+
+**The sharper datum is the pair the arms accidentally produced.** Control req2 and ringcold req2
+have the **same LRU pairs digest, the same hits and the same misses** at the start of the request,
+and return different tokens. So the `(layer, expert, slot)` pairing is not the carrier — which is
+also what job 590's digest could not have told us on its own.
+
+Remaining inside `ExpertSlots`: the **LRU order** and the **per-slot generations**, both functional
+and both invisible to a sorted-pairs digest. Job 605 records all three separately.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`

@@ -25,6 +25,10 @@ class _FakeLeaves:
         self.last_burst, self.accepted, self.grammar = [], [], None
         self.attached = None
         self.read_bytes, self.read_s = 0, 0.0
+        self.discarded = []
+
+    def discard_tail(self, n):
+        self.discarded.append(n)
 
     def attach(self, *a, **kw):
         self.attached = kw
@@ -258,3 +262,25 @@ def test_attach_preserves_an_installed_engram_source():
     assert "self.engram = None" not in src, (
         "attach() clears the engram source again -- decode would silently run ablated")
     assert isinstance(rl.engram, _Src)
+
+
+def test_truncating_at_max_tokens_un_commits_the_extra():
+    """max_tokens truncates the EMITTED burst; the step already committed the whole thing.
+
+    Without handing the extra positions back the engine's cache holds tokens the caller never
+    received -- harmless while each request starts with rollback(0), and wrong the moment
+    prompt-cache reuse lands.
+    """
+    e = _engine([[1, 2, 3]])
+    out = list(e.generate([5], max_tokens=3, temperature=0.0, top_p=1.0,
+                          stop_token_ids=set(), seed=None))
+    assert sum(len(b) for b in out) == 3, out
+    # first token + 2 of the 3-token burst => 1 position handed back
+    assert e.leaves.discarded == [1], e.leaves.discarded
+
+
+def test_no_discard_when_the_burst_fits():
+    e = _engine([[1, 2]])
+    list(e.generate([5], max_tokens=8, temperature=0.0, top_p=1.0,
+                    stop_token_ids=set(), seed=None))
+    assert e.leaves.discarded == [], e.leaves.discarded
