@@ -91,6 +91,9 @@ print(f"  {STEPS} steps, wall {wall:.2f}s")
 # DSV41_HOST_PROFILE=1 only. The interesting quantity is not any single row but
 # (wall/step - INSTRUMENTED): whatever is left is time the driver spends outside every phase, and
 # if that is near zero the ~69 ms/step of section 14 is inside one of these rows.
+gt = rl.gt_report()
+if gt:
+    print(gt)
 hp = e2.hostprof.report(STEPS)
 if hp:
     print(hp)

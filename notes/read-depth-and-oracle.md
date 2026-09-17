@@ -584,12 +584,22 @@ arriving as 575 buffered preads. The IOPS concern is answered: the engram reads 
 table at all, because `RealLeaves.shared_first = False` -- `engine/fastdecode.py` captures the shared
 expert inside graph B, so the driver's shared-expert fork is inert on the real provider.
 
-**4. THE PRIZE, from measured phases rather than a model.** `layer_a` carries essentially all the
-GPU work (~102 ms/step by job 355's node trace, plus launch and sync latency) and it is STRICTLY
-SERIAL against the 293 ms of read wait: A(L) -> wait(L) -> B(L) -> A(L+1), with the host blocked in
-between. Perfect overlap of compute with the read wait would give
+**4. THE PRIZE -- AND THE +39 % FIGURE IS WITHDRAWN.** `layer_a` carries essentially all the GPU
+work (~102 ms/step by job 355's node trace, plus launch and sync latency) and it is strictly serial
+against the read wait. I computed the prize as
 
     max(269, 123) + 24 + 12 + 13 = 318 ms   against 442 ms today   = +39 %
+
+**That arm is not physically realizable, which is exactly the check the heartbeat protocol demands
+and I did not make.** The chain is A(L) -> reads(L) -> B(L) -> A(L+1), and graph A must FINISH
+before this layer's expert ids exist -- so graph A can never overlap the reads it itself causes.
+Only graph B's work can move into the read window. The bound is therefore graph B's cost, not total
+GPU time, and job 400 measures it with CUDA events around each graph replay.
+
+Job 395 already pins one component: graph S, the shared expert alone, is **2.7 ms/step**, measured
+as the drop in `layer_a` when it left graph B (122.2/122.4 -> 119.6/119.6, against a 0.23 ms
+within-arm spread). If graph B is mostly its routed MoE and the MoE at T=6 is small, the whole
+overlap family is worth single-digit percent and this section's headline needs rewriting down.
 
 That supersedes the "every compute/IO overlap project, bounded at 3.8 % combined" line in the
 closing section, which came from the loader-overlap family on a modelled provider. The 3.8 % bound
@@ -622,13 +632,53 @@ are unaffected. Cross-JOB absolutes are not comparable: 385's 86 GB arms ran at 
 against 62 us in job 380, i.e. the device was in the slow mode of section 5. Within-job, the arena
 effect replicates: **+9.3 % in 385 against +10.1 % in 381.**
 
+## 20. The shared expert can overlap the read wait, and it is worth 0.2 % (job 395)
+
+`DSV41_SHARED_FIRST=1` captures the shared expert as its own graph so the driver can replay it
+after the route is resolved and the reads are submitted, but BEFORE it blocks on them. Gated
+bitwise against the unsplit engine in a two-process comparison (`falsify_shared_first.py`):
+logits, h, pre_mix and y all at 0.000e+00.
+
+86 GB, 600 steps after 150 warm, `age_over_freq`. **One of the four arms ran with the device in its
+fast mode** -- engram 61 us per row against 114/115/114 in the other three -- so that arm is excluded
+and the comparison uses matched modes only:
+
+| arm | wall/step | tok/s | `layer_a` | `shared` | engram us/row |
+|---|---|---|---|---|---|
+| sf=0 rep 1 | 442.65 | 6.66 | 122.21 | -- | 114 |
+| sf=0 rep 2 | 446.89 | 6.59 | 122.44 | -- | 115 |
+| sf=1 rep 2 | 443.64 | 6.64 | **119.55** | 1.64 | 114 |
+| sf=1 rep 1 (EXCLUDED, fast device) | 437.86 | 6.73 | 119.61 | 1.76 | 61 |
+
+**THE MECHANISM WORKS. THE QUANTITY DOES NOT MATTER.** `layer_a` falls by 2.7 ms in both sf=1 arms
+against a 0.23 ms within-arm spread, so the shared expert's GPU work definitively left the critical
+path -- that is the overlap, and it is not ambiguous. But it costs 1.6-1.8 ms of launch in the new
+`shared` row, so the net is ~1 ms/step, about 0.2 %, which is inside the 4.2 ms spread of the
+baseline arm. Keep the flag -- it is free, off by default, and it is the only working demonstration
+that anything CAN be hidden under the read wait -- but claim no speed-up for it.
+
+### The one-off fast arm, and a wrong turn I took on it
+
+Three of the four arms in order gave 114, 61, 115 us per engram row, which correlates with the ARM
+(sf=1 fast) and not with time. I wrote that down as possibly causal and queued an order-reversed
+control. The fourth arm came back at 114 us with sf=1, which kills that reading: one fast run in
+four is the device bimodality of section 5 (one fast in five, same signature), and the control was
+withdrawn before it ran. **Three points that fit a story are not the story.**
+
+### What it says about the routed MoE
+
+Moving 2.7 ms of GPU out of the critical path cost 1.7 ms of launch -- a 63 % tax, because a graph
+replay costs about the same whatever it contains. The routed MoE would pay that tax ONCE for a much
+larger body of work, so the ratio there is far better. Whether the work itself is large is what job
+400 measures, and it is the question that decides the whole overlap family.
+
 ## What this closes and what it leaves
 
 - Closed here: the engine-footprint explanation for the read penalty (refuted by its own bare stage).
 - Bounded here: every compute/IO overlap project, at 3.8 % combined. NOT every scheduler toggle --
   see the correction in section 1; an NVMe/H2D overlap lever is outside that arithmetic.
   **SUPERSEDED for the real engine by section 19**: that 3.8 % came from the loader-overlap family on
-  a modelled provider. Measured phases on the real one put compute/read-wait overlap at +39 %.
+  a modelled provider. Measured phases on the real one put it higher, but see the withdrawal in section 19: the realisable bound is graph B's cost, not total GPU time.
 - Closed by sections 8-9: prediction of expert IDENTITY, by any of co-occurrence, recurrence, or
   the DSpark drafter. Routing entropy 8.52/8.58 says there is almost nothing to infer.
 - Live, and non-predictive: CONCURRENCY. More requests in flight means more misses per layer to

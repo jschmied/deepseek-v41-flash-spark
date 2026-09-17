@@ -136,6 +136,12 @@ class RealLeaves(Leaves):
     """
 
     shared_first = os.environ.get("DSV41_SHARED_FIRST") == "1"
+    # DEVICE time per graph, which is what bounds the overlap. The host-phase profiler cannot answer
+    # this: `layer_b` there is an ENQUEUE and reads ~2 ms, while `layer_a` is a wall span containing
+    # graph A's own work AND the drain of the previous layer's graph B. Only graph B's work can be
+    # moved into the read window -- A(L) must finish before the layer's expert ids exist -- so the
+    # realisable overlap is bounded by B, not by total GPU time.
+    graph_timing = os.environ.get("DSV41_GRAPH_TIMING") == "1"
     # layer_b records a CUDA event and h2d waits on it per slot, so the DEVICE orders slot reuse
     # and the host-side ComputeStream is redundant here -- see Leaves.device_orders_slot_reuse.
     device_orders_slot_reuse = True
@@ -332,6 +338,11 @@ class RealLeaves(Leaves):
             self.tok = int(first_token)
             self._tv = int(self.fd.ids.numel())
         self._gA = self._gB = self._gF = None
+        self._gS = None
+        self._gt_ev = None
+        self._gt_seen = None
+        self.gt_ms = {"A": 0.0, "B": 0.0, "S": 0.0}
+        self.gt_steps = 0
         return self
 
     def select_block(self, step: int) -> None:
@@ -380,6 +391,13 @@ class RealLeaves(Leaves):
             fd.prepare_pending_buffers()   # capture's warm-up overwrites the buffers
         self._gA, self._gB, self._gF = fd.graphs[parity][0], fd.graphs[parity][1], fd.graphs[parity][2]
         self._gS = fd.graphs_shared.get(parity) if self.shared_first else None
+        if self.graph_timing and self._gt_ev is None:
+            # Two events per graph per layer, reused every step. Recorded on the compute stream and
+            # read ONCE per step in gt_drain(), so no synchronisation is added inside the step.
+            n = len(self._gA)
+            self._gt_ev = {k: [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                               for _ in range(n)] for k in ("A", "B", "S")}
+            self._gt_seen = {k: [False] * n for k in ("A", "B", "S")}
         if self.shared_first and not self._gS:
             raise RuntimeError(
                 "shared_first is on but engine/fastdecode.py captured no shared-expert graphs. "
@@ -400,10 +418,50 @@ class RealLeaves(Leaves):
         # inside its layer loop).
         if self.engram is not None:
             self.engram.deliver(layer, self.fd)
-        self._gA[layer].replay()
+        if self.graph_timing:
+            self._gt_ev["A"][layer][0].record()
+            self._gA[layer].replay()
+            self._gt_ev["A"][layer][1].record()
+            self._gt_seen["A"][layer] = True
+        else:
+            self._gA[layer].replay()
         idx = self.fd.route_idx
         flat = idx.flatten().tolist()          # the one unavoidable D2H: the cache lookup is on the host
         return RouteResult(uniq=tuple(sorted(set(flat))), opaque=idx, flat_cpu=flat)
+
+    def gt_drain(self) -> None:
+        """Read the step's graph timings. Called ONCE per step, after the step's work is complete.
+
+        elapsed_time() requires the events to have completed, so this is a synchronisation point --
+        which is why it exists only under DSV41_GRAPH_TIMING and why the numbers it produces are
+        device time for the graphs, not a wall-clock budget for the step. Compare them against each
+        other, never against a profiled step's wall.
+        """
+        if not self.graph_timing or self._gt_ev is None:
+            return
+        torch.cuda.synchronize()
+        for k, evs in self._gt_ev.items():
+            for i, (a, b) in enumerate(evs):
+                if self._gt_seen[k][i]:
+                    self.gt_ms[k] += a.elapsed_time(b)
+                    self._gt_seen[k][i] = False
+        self.gt_steps += 1
+
+    def gt_report(self) -> str:
+        if not self.graph_timing or not self.gt_steps:
+            return ""
+        n = self.gt_steps
+        tot = sum(self.gt_ms.values())
+        out = [f"  graph device time over {n} steps (per step):"]
+        for k, label in (("A", "graph A  attention+HC+router"),
+                         ("B", "graph B  routed MoE+shared+HC residual"),
+                         ("S", "graph S  shared expert alone")):
+            if self.gt_ms[k]:
+                out.append(f"    {label:<40} {self.gt_ms[k] / n:7.2f} ms  {self.gt_ms[k] / tot * 100:5.1f}%")
+        out.append(f"    {'TOTAL':<40} {tot / n:7.2f} ms")
+        out.append("    Only graph B can move into the read window: A(L) must finish before this "
+                   "layer's expert ids exist.")
+        return "\n".join(out)
 
     def shared(self, layer: int) -> None:
         """Graph S: the shared expert, into fastdecode's sh_out buffer.
@@ -412,7 +470,13 @@ class RealLeaves(Leaves):
         waits on them -- which is the whole point: this is the only compute in the layer that does
         not depend on the expert bytes, so it is the only thing that can fill the wait.
         """
-        self._gS[layer].replay()
+        if self.graph_timing:
+            self._gt_ev["S"][layer][0].record()
+            self._gS[layer].replay()
+            self._gt_ev["S"][layer][1].record()
+            self._gt_seen["S"][layer] = True
+        else:
+            self._gS[layer].replay()
 
     def bind_slots(self, route: RouteResult, slot_of: dict) -> None:
         """Give graph B its route-aligned slot tensor. This is v1's `self.slots.copy_(slots)`, with
@@ -451,7 +515,13 @@ class RealLeaves(Leaves):
         device after this returns, and the only honest statement of "this slot is free again" is an
         event recorded after the replay on the same stream. h2d() waits on it before overwriting.
         """
-        self._gB[layer].replay()
+        if self.graph_timing:
+            self._gt_ev["B"][layer][0].record()
+            self._gB[layer].replay()
+            self._gt_ev["B"][layer][1].record()
+            self._gt_seen["B"][layer] = True
+        else:
+            self._gB[layer].replay()
         ev = torch.cuda.Event()
         ev.record(torch.cuda.current_stream())
         if len(self._last_reader) < self._arena_slots:
@@ -466,6 +536,7 @@ class RealLeaves(Leaves):
 
     def end_step(self, step: int) -> None:
         """KV bookkeeping for Caches.rollback, and advance the cache length."""
+        self.gt_drain()          # no-op unless DSV41_GRAPH_TIMING; the step's graphs are done here
         fd = self.fd
         S, T = self._S, fd.ids.numel()
         for L in fd.kvl_buf:
