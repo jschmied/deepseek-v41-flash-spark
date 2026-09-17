@@ -264,15 +264,21 @@ bitwise identical:
 Same input, same route, **the same experts** — 615 verified the mappings byte-for-byte — at
 **different physical slots**, and a different output.
 
-**The mechanism is in `tools/fp4_moe.py:389`.** `build_routing_small` does
-`order = torch.argsort(flat, stable=True)` **on the slot numbers**, and block ids follow that sorted
-order. So the order in which a token's K contributions are accumulated is a function of physical
-slot addresses. Move an expert and the same six numbers are summed in a different order: last-ulp
-differences, which is exactly the 0-to-few-ulp margins job 575 measured, and argmax flips wherever a
-margin is tiny.
+**~~The mechanism is `build_routing_small`'s argsort by slot.~~ WITHDRAWN — job 630 refutes it.**
+Same experts written to descending and shuffled slot addresses give **bitwise identical** output
+(0.000e+00 both ways), so the MoE is slot-order invariant and the reduce really is in fixed K,T
+order. I stated the root cause was found on the strength of reading the argsort; it was not.
 
-This reconciles every earlier result without any of them being wrong. v1 is reproducible because its
-slot assignment repeats across requests; v2's churns. The cache contents were always correct (615).
+(The first version of that kernel test was also wrong — it permuted the LOOKUP, routing each expert
+to another expert's bytes, which is a different computation rather than a reordering. It produced a
+23 % delta that would have "confirmed" the hypothesis. Caught only because the magnitude was far too
+large for a last-ulp reordering.)
+
+What survives from 625 is the OBSERVATION, not my explanation of it: identical `h_in`, identical
+route, different slots, different `h_out`. With the kernel invariant and the route equal, the bytes
+at those slots must have differed — and job 615's audit covered 24 of ~2,367 mappings, about 1 %,
+which can easily miss a handful of stale or torn slots. Job 635 audits the slots the step ACTUALLY
+BOUND, layer by layer, instead of a random sample. The cache contents were always correct (615).
 The policy toggles were always irrelevant (610). The accept path, drafter, RNG, parity, ring, early
 readiness and metadata were all correctly exonerated — the carrier was never in any of them.
 
