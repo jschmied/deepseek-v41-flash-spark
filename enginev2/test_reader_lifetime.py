@@ -59,6 +59,17 @@ class _Bare(RealLeaves):
         # Mirrors RealLeaves.__init__. This fixture reimplements that constructor, so it drifts
         # whenever state is added -- it has now broken twice that way. Anything new there belongs
         # here too, or the test stops covering the code it names.
+        # Per-request state RealLeaves.__init__ declares. Third drift; the guard test below is
+        # what caught it each time.
+        self.eng = None
+        self.fd = None
+        self.accepted = []
+        self.last_burst = []
+        self.hist = []
+        self.grammar = None
+        self.penalties = None
+        self.tok = None
+        self.tokens_out = 0
         self._copy_event = {}
         self.copies_awaited = 0
         self._reader_lk = threading.Lock()

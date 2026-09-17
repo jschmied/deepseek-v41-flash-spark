@@ -98,6 +98,11 @@ class V2Engine(_ServerEngine):
                     "the hot-expert ranking was lost on the way in, and the arena would be warmed "
                     "with experts 0..k of every layer instead of the measured working set.")
         self.warm_start(rank)
+        # BIND ONCE, HERE. _prefill() drives the leaves before a request can know its first token,
+        # and attach(spec=True) requires that token -- so the spec attach cannot come first.
+        # A non-spec attach binds eng/fd and runs the capture-provenance check; generate() then
+        # re-attaches per request with the token and the sampling parameters.
+        self.leaves.attach(self.v1, None)
         self._stats: dict = {}
         # Injectable so the generator CONTRACT (bursts, stop ids, max_tokens, the
         # GeneratorExit path) can be tested without a GPU -- that logic is where a

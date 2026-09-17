@@ -228,6 +228,21 @@ class RealLeaves(Leaves):
         self._reader_lk = threading.Lock()
         self._bound_slots: frozenset = frozenset()
         self.reader_waits = 0
+        # PER-REQUEST STATE, DECLARED HERE. attach() resets these on every request, but a caller
+        # may legitimately touch them before the first attach -- V2Engine snapshots counters at the
+        # top of generate() and prefills before it can know the first token, so it cannot attach in
+        # spec mode any earlier. Job 560 died twice on exactly that: once on `accepted`, once on
+        # `eng`. An earlier "fix" anchored on `self.accepted = []` and landed INSIDE attach(), which
+        # is where the line it matched already was, so it changed nothing.
+        self.eng = None
+        self.fd = None
+        self.accepted: list = []
+        self.last_burst: list = []
+        self.hist: list = []
+        self.grammar = None
+        self.penalties = None
+        self.tok = None
+        self.tokens_out = 0
         self._engine_on_path()
         global _V41REF
         if _V41REF is None:
