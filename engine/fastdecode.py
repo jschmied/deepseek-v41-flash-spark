@@ -168,7 +168,7 @@ class FastDecoder:
             self.mb_mis = torch.empty(_P, dtype=torch.int32, device=dev)
             # Which ARENA slot currently holds an expert this layer is still waiting for. The host
             # writes it from `to_load` before phase 1; the graph reads it. One bool per slot.
-            self.slot_missing = torch.zeros(self.m.store.arena.slots, dtype=torch.bool, device=dev)
+            self.slot_missing = torch.zeros(self.m.arena.slots, dtype=torch.bool, device=dev)
             self._moe_bm = _BM
         self.route_idx = torch.zeros(T, a.n_activated_experts, dtype=torch.long, device=dev)
         self.route_w = torch.zeros(T, a.n_activated_experts, dtype=torch.float32, device=dev)
@@ -447,7 +447,7 @@ class FastDecoder:
         self.mb_pair.copy_(bp)
         self.mb_res.copy_(torch.where(mis, torch.full_like(bs, -1), bs))
         self.mb_mis.copy_(torch.where(mis, bs, torch.full_like(bs, -1)))
-        C3.moe_v3_phase(self.y, self.slots, self.route_w, self.m.store.arena,
+        C3.moe_v3_phase(self.y, self.slots, self.route_w, self.m.arena,
                         self.moe_h, self.moe_parts, self.a.swiglu_limit,
                         block_m=self._moe_bm, routing=(self.mb_res, self.mb_pair, _NB))
 
@@ -462,7 +462,7 @@ class FastDecoder:
         a = self.a
         w = self.W.layers[L]
         T, K = self.slots.shape
-        C3.moe_v3_phase(self.y, self.slots, self.route_w, self.m.store.arena,
+        C3.moe_v3_phase(self.y, self.slots, self.route_w, self.m.arena,
                         self.moe_h, self.moe_parts, a.swiglu_limit,
                         block_m=self._moe_bm, routing=(self.mb_mis, self.mb_pair, T * K))
         out = C3.moe_v3_reduce(self.moe_parts, T, K).float()
@@ -474,7 +474,7 @@ class FastDecoder:
     def _layer_b(self, L):
         a = self.a
         w = self.W.layers[L]
-        out = self.m.moe_fn(self.y, self.slots, self.route_w, self.m.store.arena, a.swiglu_limit).float()
+        out = self.m.moe_fn(self.y, self.slots, self.route_w, self.m.arena, a.swiglu_limit).float()
         # Same two operands, same order, same dtypes as the unsplit version -- the shared term was
         # merely computed earlier. float32 copy_ is exact, so this stays bit-identical.
         out += (self.sh_out if SHARED_FIRST

@@ -344,6 +344,12 @@ class Shared:
 class Model:
     def __init__(self, W: Weights, store, caches: Caches, moe_fn, act_quant: bool = False):
         self.W, self.store, self.c, self.moe_fn = W, store, caches, moe_fn
+        # THE ARENA IS THE MODEL'S, not the expert store's. It is a buffer the LOADER writes
+        # into and the MoE kernels read, and which loader that is has stopped being v1's:
+        # enginev2 reimplemented the read, the H2D, the slot map and the scheduling, and
+        # reached it as `m.store.arena` only because of where the attribute happened to sit.
+        # Same object the store was handed; nothing owns it twice.
+        self.arena = getattr(store, "arena", None)
         self.args = W.args
         self.dev = W.device
         a = self.args
@@ -977,7 +983,7 @@ class Model:
                 main_hiddens.append(h.float().mean(dim=1))
             freqs = self.freqs_c if w.ratio else self.freqs_w
             h, pre_mix = self.block(h, pre_mix, w, L, S, sh, self.c.win[L], freqs, True, self.store,
-                                    self.store.arena, a.n_routed_experts, win_lo=S)
+                                    self.arena, a.n_routed_experts, win_lo=S)
             self._tap("h", L, h); self._tap("pre_mix", L, pre_mix)
         self.last_h, self.last_pre_mix = h, pre_mix
         logits = None
@@ -1028,7 +1034,7 @@ class Model:
                 main_hiddens.append(h.float().mean(dim=1))
             freqs = self.freqs_c if w.ratio else self.freqs_w
             h, pre_mix = self.block(h, pre_mix, w, L, S, sh, self.c.win[L], freqs, prefill, self.store,
-                                    self.store.arena, a.n_routed_experts)
+                                    self.arena, a.n_routed_experts)
             self._tap("h", L, h); self._tap("pre_mix", L, pre_mix)
         self.c.len = S + T
         self.stats["tokens"] += T
