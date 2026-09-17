@@ -163,6 +163,14 @@ def parse_sampling(body: dict) -> dict:
     tg = body.get("tool_grammar", True)
     if not isinstance(tg, bool):
         raise APIError(400, "`tool_grammar` must be a boolean", param="tool_grammar")
+    # Per-request so the value can be swept without restarting the engine: the n that stops a
+    # degenerate loop depends on the register being generated, and CSS repeats short runs
+    # legitimately where prose does not.
+    nrn = body.get("no_repeat_ngram", int(os.environ.get("DSV41_NO_REPEAT_NGRAM", "0")))
+    if nrn is None:
+        nrn = 0
+    if isinstance(nrn, bool) or not isinstance(nrn, int) or not (0 <= nrn <= 128):
+        raise APIError(400, "`no_repeat_ngram` must be an integer in [0, 128]", param="no_repeat_ngram")
     return {
         "max_tokens": mt,
         "temperature": _num(body, "temperature", DEFAULT_TEMPERATURE, 0.0, 2.0),
@@ -173,6 +181,7 @@ def parse_sampling(body: dict) -> dict:
         # code is legitimately repetitive and wants them at 0 (NOTES 2026-09-12).
         "presence_penalty": _num(body, "presence_penalty", float(os.environ.get("DSV41_PRESENCE_PENALTY", "0")), -2.0, 2.0),
         "frequency_penalty": _num(body, "frequency_penalty", float(os.environ.get("DSV41_FREQUENCY_PENALTY", "0")), -2.0, 2.0),
+        "no_repeat_ngram": nrn,
         "stop": stops,
         "seed": seed,
         "ignore_eos": ignore_eos,
@@ -437,6 +446,7 @@ class GenerationResult:
         self.tool_calls: List[dict] = []
         self.router: Optional[OutputRouter] = None
         self.stats: dict = {}
+        self.degenerate = False   # cut off because it had stopped saying anything new
 
 
 class State:
@@ -462,7 +472,7 @@ class State:
         if getattr(engine, "supports_grammar", False):
             self.grammars = make_factory(
                 tok, engine.eos_token_id if self.eos_id is None else self.eos_id,
-                enabled=os.environ.get("DSV41_TOOL_GRAMMAR", "0") == "1")  # off until the end-to-end gates on real weights have run; see NOTES 2026-09-11
+                enabled=os.environ.get("DSV41_TOOL_GRAMMAR", "1") == "1")  # on by default: the close-marker guard depends on it
 
     def stop_ids(self) -> Set[int]:
         ids = {self.engine.eos_token_id}
@@ -500,14 +510,21 @@ class State:
         pen = None
         if getattr(self.engine, "supports_penalties", False):
             from engine.v41_engine import Penalties
-            pen = Penalties(presence=sampling["presence_penalty"], frequency=sampling["frequency_penalty"])
+            pen = Penalties(presence=sampling["presence_penalty"], frequency=sampling["frequency_penalty"],
+                            no_repeat_ngram=sampling["no_repeat_ngram"])
             if pen.active:
                 gen_kwargs["penalties"] = pen
         # The gate constrains nothing until the model opens a tool-calls block, so it costs a
-        # dictionary lookup per step on a request that never calls a tool.
+        # dictionary lookup per step on a request that never calls a tool. A request with no
+        # tools (or with tool-call detection off) gets the plain-text gate instead: there is no
+        # block it could legally open, so the DSML bar has no legal use in its completion at all
+        # and a drifting router cannot leak a DSML tag into the text.
         gate = None
-        if tools and detect_tool_calls and self.grammars is not None and sampling["tool_grammar"]:
-            gate = self.grammars.for_tools(tools)
+        if self.grammars is not None and sampling["tool_grammar"]:
+            if tools and detect_tool_calls:
+                gate = self.grammars.for_tools(tools)
+            else:
+                gate = self.grammars.plain()
         if gate is not None:
             gen_kwargs["grammar"] = gate
         if ignore_eos:
@@ -518,6 +535,19 @@ class State:
         else:
             gen = self.engine.generate(prompt_ids, **gen_kwargs)
         hit_eos = False
+        # A generation that has stopped saying anything new will not recover on
+        # its own, and the budget it burns is real: six rejected tool calls in a
+        # row once drove the reasoning into "Let me. Maybe. Wait." for thousands
+        # of tokens. Watch a rolling window and stop.
+        #
+        # The threshold is deliberately far below anything healthy. The
+        # generation gate treats 0.3-0.7 distinct tokens as normal and 0.15 as
+        # degenerate; this fires at 0.10 over 256 tokens, which is 25 distinct
+        # tokens in 256 and is not reachable by text that is still going
+        # somewhere. 0 turns it off.
+        degen_ratio = float(os.environ.get("DSV41_DEGEN_RATIO", "0.10"))
+        degen_window = int(os.environ.get("DSV41_DEGEN_WINDOW", "256"))
+        degenerate = False
         try:
             for burst in gen:
                 burst = list(burst)
@@ -531,6 +561,14 @@ class State:
                 result.gen_ids.extend(burst)
                 for ev in router.feed(detok.push(burst)):
                     yield ev
+                if degen_ratio > 0 and len(result.gen_ids) >= degen_window:
+                    w = result.gen_ids[-degen_window:]
+                    if len(set(w)) / degen_window < degen_ratio:
+                        degenerate = True
+                        log.warning("stopping: last %d tokens have %d distinct (%.3f < %.2f); "
+                                    "the generation is repeating itself",
+                                    degen_window, len(set(w)), len(set(w)) / degen_window, degen_ratio)
+                        break
                 if hit_eos or router.stopped or len(result.gen_ids) >= max_tokens:
                     break
             if not router.stopped:
@@ -551,6 +589,10 @@ class State:
 
         if hit_eos or router.stopped:
             result.finish_reason = "stop"
+        elif degenerate:
+            # not "stop": the model did not choose to end, it was cut off
+            result.finish_reason = "length"
+            result.degenerate = True
         elif len(result.gen_ids) >= max_tokens:
             result.finish_reason = "length"
         if thinking:
@@ -559,8 +601,19 @@ class State:
             except ValueError:
                 result.reasoning_tokens = len(result.gen_ids)
 
+        # A response whose every token was reasoning, cut off for repeating
+        # itself, reaches the caller as a valid 200 with an empty message. An
+        # agent has nothing to act on and stops without saying anything, which
+        # is how this failure presented: silence, not an error. Say what
+        # happened, in the one field the caller is certain to read.
+        if result.degenerate and not (router.content or "").strip() and not router.tool_text:
+            note = ("[stopped: the model began repeating itself and was cut off before it "
+                    "produced an answer. Lower the reasoning effort, or turn thinking off.]")
+            router.content += note
+            log.warning("degenerate generation had no content; returned a note instead of nothing")
+
         if detect_tool_calls:
-            result.tool_calls = self._parse_tool_calls(router, thinking)
+            result.tool_calls = self._parse_tool_calls(router, thinking, tools)
             if result.tool_calls:
                 result.finish_reason = "tool_calls"
 
@@ -610,7 +663,7 @@ class State:
                     args[k] = v
                 else:
                     try:
-                        args[k] = json.loads(v)
+                        args[k] = cls._loads_lenient(v)
                     except Exception:  # noqa: BLE001 - a malformed literal is still worth sending as text
                         args[k] = v
             consumed = {pm.group("k") for pm in cls._RE_PARAM_SPEC.finditer(body)}
@@ -621,7 +674,79 @@ class State:
             out.append({"function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
         return out
 
-    def _parse_tool_calls(self, router: OutputRouter, thinking: bool) -> List[dict]:
+    @staticmethod
+    def _schemas(tools: Optional[List[dict]]) -> Dict[str, set]:
+        """{tool name: the parameter names its schema declares}."""
+        out: Dict[str, set] = {}
+        for t in tools or []:
+            fn = (t or {}).get("function") or {}
+            name = fn.get("name")
+            props = ((fn.get("parameters") or {}).get("properties") or {})
+            if name:
+                out[name] = set(props)
+        return out
+
+    @staticmethod
+    def _loads_lenient(v: str):
+        """json.loads, then one repair pass for the escape the model gets wrong.
+
+        A raw backslash before a character that is not a JSON escape ("\H") is
+        invalid, and the model emits it when a value contains one. Doubling the
+        stray backslashes is a faithful repair: the intent was a literal
+        backslash, and every valid escape is left alone.
+        """
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError as e:
+            if "escape" not in str(e).lower():
+                raise
+            fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', v)
+            return json.loads(fixed)
+
+    @classmethod
+    def _repair_args(cls, name: str, args: dict, schemas: Dict[str, set]) -> dict:
+        """Make a parsed call match the schema the caller actually published.
+
+        Two failures seen end to end, both of which the client rejects and
+        neither of which the model recovers from -- it retries, the errors pile
+        into the context, and the reasoning degenerates:
+
+          * the whole argument object wrapped in one invented parameter, e.g.
+            {"arguments": "{\"questions\": [...]}"} where the schema says
+            `questions`. Unwrap it.
+          * parameter names the schema does not declare. Drop them, once the
+            wrapper case has been ruled out, rather than forwarding a call that
+            can only fail.
+
+        With no schema for this tool, nothing is changed.
+        """
+        want = schemas.get(name)
+        if not want or not isinstance(args, dict):
+            return args
+        if set(args) <= want:
+            return args
+        # one invented key whose contents are the real arguments
+        if len(args) == 1:
+            (only_k, only_v), = args.items()
+            if only_k not in want:
+                inner = only_v
+                if isinstance(inner, str):
+                    try:
+                        inner = cls._loads_lenient(inner)
+                    except Exception:  # noqa: BLE001
+                        inner = None
+                if isinstance(inner, dict) and inner and set(inner) <= want:
+                    log.warning("tool %s: arguments were wrapped in %r; unwrapped", name, only_k)
+                    return inner
+        unknown = sorted(set(args) - want)
+        if unknown:
+            log.warning("tool %s: dropping parameter(s) not in its schema: %s",
+                        name, ", ".join(unknown))
+            return {k: v for k, v in args.items() if k in want}
+        return args
+
+    def _parse_tool_calls(self, router: OutputRouter, thinking: bool,
+                          tools: Optional[List[dict]] = None) -> List[dict]:
         if not router.tool_text:
             return []
         text = ""
@@ -653,7 +778,16 @@ class State:
             if tc.get("namespace"):
                 name = f"{tc['namespace']}::{name}"
             args = fn.get("arguments", "{}")
-            if not isinstance(args, str):
+            parsed_args = args
+            if isinstance(parsed_args, str):
+                try:
+                    parsed_args = self._loads_lenient(parsed_args)
+                except Exception:  # noqa: BLE001 - leave an unparseable blob alone
+                    parsed_args = None
+            if isinstance(parsed_args, dict):
+                parsed_args = self._repair_args(name, parsed_args, self._schemas(tools))
+                args = json.dumps(parsed_args, ensure_ascii=False)
+            elif not isinstance(args, str):
                 args = json.dumps(args, ensure_ascii=False)
             calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                           "function": {"name": name, "arguments": args}})
