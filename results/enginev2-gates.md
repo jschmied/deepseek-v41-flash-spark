@@ -308,6 +308,32 @@ map to `(layer, expert)`? Still-mapped and wrong is a real defect; re-mapped is 
 are an artifact. It also re-audits after a further step, since recycling should raise the recycled
 count while a genuine defect should not care.
 
+## Job 640 — the defect is real and it is in the TRANSIENT RING (2026-09-18)
+
+    right after step 1:  checked=769  wrong=99  STILL-MAPPED=99  recycled=0
+    after a second step: checked=769  wrong=99  STILL-MAPPED=99  recycled=0
+
+        layer=4 expert=287 slot=2497 key=(4, 287)
+        layer=4 expert=194 slot=2488 key=(4, 194)
+        layer=5 expert=176 slot=2509 key=(5, 176)
+
+Every one of the 99 is **still mapped** to the expert whose bytes it does not contain, none were
+recycled, and the count is stable across a further step. The within-step-recycling confound is
+ruled out: **v2 hands graph B slots whose contents are not the expert the map says they hold.**
+
+**All bad slots are ≥ 2367.** With `ARENA_GB=40` the arena is 2,767 slots and `lru_slots` is 2,367,
+so 0..2366 is the LRU and **2367..2766 is the transient ring**. Only ring slots are wrong — which
+is also why job 615 found nothing: it sampled `slots.lru`, the clean half.
+
+Two further inferences of mine died on inspection and are recorded so they are not re-tried:
+the kernel does **not** reduce in slot order (630), and v2 has **not** forgotten v1's
+`_pending_slots` guard — `reserve()` passes `frozenset(used) | inflight` into
+`_transient_slot_for`, so in-flight slots are protected.
+
+The ring is written only by `reserve(prefill=True)` and read by decode taking a `transient_map`
+hit. Job 645 audits the ring immediately after prefill and again after one decode step, which
+separates a prefill-path defect from a decode-path one.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
