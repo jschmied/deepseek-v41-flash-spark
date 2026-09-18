@@ -88,9 +88,19 @@ class CB3Cache:
             dst = getattr(arena, name)[slot]
             dst.copy_(staged[lo:hi].view_as(dst.reshape(-1)).reshape(dst.shape),
                       non_blocking=non_blocking)
+        packed = bool(getattr(arena, "packed_scales", False))
         for name, rows in (("s1", arena.s1.shape[1]), ("s3", arena.s3.shape[1]),
                            ("s2", arena.s2.shape[1])):
             lo, hi = self.planes[name]
-            src = staged[lo:hi].to(self.device, non_blocking=non_blocking)
-            getattr(arena, name)[slot].copy_(self._unpack_scales(src, name, rows),
-                                             non_blocking=non_blocking)
+            dst = getattr(arena, name)[slot]
+            if packed:
+                # THE POINT OF CHANGE A. The record already holds `ue8m0-3bit-rowbase-v1`, so a
+                # packed arena wants those bytes verbatim: three device-side `_unpack_scales` calls
+                # per miss disappear, and the plane shrinks 160 -> 61 B/row (s1/s3) and 72 -> 28
+                # (s2). This does NOT make the slot one contiguous H2D -- the arena is still twelve
+                # plane-major tensors, and record-major storage is a separate change.
+                dst.copy_(staged[lo:hi].view_as(dst.reshape(-1)).reshape(dst.shape),
+                          non_blocking=non_blocking)
+            else:
+                src = staged[lo:hi].to(self.device, non_blocking=non_blocking)
+                dst.copy_(self._unpack_scales(src, name, rows), non_blocking=non_blocking)

@@ -16,6 +16,7 @@ import contextlib
 import os
 
 import torch
+import scale_codec as SC   # the packer the builder and the engine share
 import triton
 import triton.language as tl
 
@@ -45,25 +46,45 @@ SG1, SG2 = DIM // 32, INTER // 32
 # 18,800,640 (0.769x), i.e. 3.26-3.28 bit/weight.
 CB3_BYTES_PER_SLOT = (2 * (INTER * (DIM // 4 + DIM // 8 + 8) + INTER * SG1)
                       + DIM * (INTER // 4 + INTER // 8 + 8) + DIM * SG2)
+# Packed scale planes shrink the slot by exactly the three scale planes' difference: 4.936 % more
+# slots for the same arena bytes. The engine divides its arena budget by this, so it MUST follow the
+# layout or the capacity gain never materialises.
+CB3_BYTES_PER_SLOT_PACKED = (CB3_BYTES_PER_SLOT
+                             - 2 * INTER * (SG1 - (1 + SG1 * 3 // 8))
+                             - DIM * (SG2 - (1 + SG2 * 3 // 8)))
 
 
 class CB3Arena:
-    def __init__(self, slots: int, device: torch.device | str = "cuda"):
+    # PACKED SCALE PLANES (change A). False keeps the historical layout -- one UE8M0 byte per group
+    # -- so every existing caller, checkpoint path and test is untouched. True stores the file's own
+    # `ue8m0-3bit-rowbase-v1`: a u8 row base plus 3 bits per group. Nine of the twelve planes are
+    # already byte-identical to the on-disk record; the scale planes are the entire 679,936 B/slot
+    # difference, so packing them is +4.936 % capacity (5,949 -> 6,243 slots at 86 GB).
+    #
+    # Gated locally before any of this reached an engine: registers (up 250->254 with 0 spills
+    # either way, down 128->148 with its 4 existing spills ELIMINATED), bitwise identical on
+    # T=1 / T=6 / T=6 high-distinct / T=24, and latency-neutral.
+    packed_scales = False
+
+    def __init__(self, slots: int, device: torch.device | str = "cuda", packed_scales: bool = False):
         self.slots = slots
         self.device = torch.device(device)
+        self.packed_scales = packed_scales
+        sg1 = packed_row_bytes(SG1) if packed_scales else SG1
+        sg2 = packed_row_bytes(SG2) if packed_scales else SG2
         u8 = dict(dtype=torch.uint8, device=self.device)
         self.w1_lo = torch.empty((slots, INTER, DIM // 4), **u8)
         self.w1_hi = torch.empty((slots, INTER, DIM // 8), **u8)
         self.w1_cb = torch.empty((slots, INTER, 8), **u8)
-        self.s1 = torch.empty((slots, INTER, SG1), **u8)
+        self.s1 = torch.empty((slots, INTER, sg1), **u8)
         self.w3_lo = torch.empty((slots, INTER, DIM // 4), **u8)
         self.w3_hi = torch.empty((slots, INTER, DIM // 8), **u8)
         self.w3_cb = torch.empty((slots, INTER, 8), **u8)
-        self.s3 = torch.empty((slots, INTER, SG1), **u8)
+        self.s3 = torch.empty((slots, INTER, sg1), **u8)
         self.w2_lo = torch.empty((slots, DIM, INTER // 4), **u8)
         self.w2_hi = torch.empty((slots, DIM, INTER // 8), **u8)
         self.w2_cb = torch.empty((slots, DIM, 8), **u8)
-        self.s2 = torch.empty((slots, DIM, SG2), **u8)
+        self.s2 = torch.empty((slots, DIM, sg2), **u8)
         self.sim = None  # engine.codebook_sim.CodebookSim(3), set by the caller
 
     @property
@@ -142,6 +163,8 @@ def _cb3_up_kernel(
     KL: tl.constexpr = K // 4
     KH: tl.constexpr = K // 8
     SG: tl.constexpr = K // 32
+    # Packed rows are [base u8][3 B per 8 groups]; unpacked are one byte per group.
+    SSTRIDE: tl.constexpr = (1 + SG * 3 // 8) if PACKED else SG
     mb = tl.program_id(0)
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
@@ -161,8 +184,8 @@ def _cb3_up_kernel(
     hi1 = hi1_ptr + slot * (N * KH) + offs_n[:, None] * KH
     lo3 = lo3_ptr + slot * (N * KL) + offs_n[:, None] * KL
     hi3 = hi3_ptr + slot * (N * KH) + offs_n[:, None] * KH
-    s1t = s1_ptr + slot * (N * SG) + offs_n[:, None] * SG + offs_q[None, :]
-    s3t = s3_ptr + slot * (N * SG) + offs_n[:, None] * SG + offs_q[None, :]
+    s1t = s1_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE + offs_q[None, :]
+    s3t = s3_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE + offs_q[None, :]
     cw1 = _cbword(cb1_ptr + slot * (N * 8) + offs_n[:, None] * 8 + offs_c[None, :], BN)
     cw3 = _cbword(cb3_ptr + slot * (N * 8) + offs_n[:, None] * 8 + offs_c[None, :], BN)
     acc_g = tl.zeros([BM, BN], dtype=tl.float32)
@@ -188,6 +211,8 @@ def _cb3_down_kernel(
     KL: tl.constexpr = K // 4
     KH: tl.constexpr = K // 8
     SG: tl.constexpr = K // 32
+    # Packed rows are [base u8][3 B per 8 groups]; unpacked are one byte per group.
+    SSTRIDE: tl.constexpr = (1 + SG * 3 // 8) if PACKED else SG
     mb = tl.program_id(0)
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
@@ -204,7 +229,7 @@ def _cb3_down_kernel(
     xk = 2 * tl.arange(0, 16)[None, :]
     lo2 = lo2_ptr + slot * (N * KL) + offs_n[:, None] * KL
     hi2 = hi2_ptr + slot * (N * KH) + offs_n[:, None] * KH
-    s2t = s2_ptr + slot * (N * SG) + offs_n[:, None] * SG + offs_q[None, :]
+    s2t = s2_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE + offs_q[None, :]
     cw2 = _cbword(cb2_ptr + slot * (N * 8) + offs_n[:, None] * 8 + offs_c[None, :], BN)
     acc = tl.zeros([BM, BN], dtype=tl.float32)
     for q in range(0, SG // 4):
@@ -344,6 +369,8 @@ def _cb3v2_up_kernel(
     KL: tl.constexpr = K // 4
     KH: tl.constexpr = K // 8
     SG: tl.constexpr = K // 32
+    # Packed rows are [base u8][3 B per 8 groups]; unpacked are one byte per group.
+    SSTRIDE: tl.constexpr = (1 + SG * 3 // 8) if PACKED else SG
     mb = tl.program_id(0)
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
@@ -361,8 +388,8 @@ def _cb3v2_up_kernel(
     hi1 = hi1_ptr + slot * (N * KH) + offs_n[:, None] * KH + tl.arange(0, 32)[None, :]
     lo3 = lo3_ptr + slot * (N * KL) + offs_n[:, None] * KL + tl.arange(0, 64)[None, :]
     hi3 = hi3_ptr + slot * (N * KH) + offs_n[:, None] * KH + tl.arange(0, 32)[None, :]
-    s1t = s1_ptr + slot * (N * SG) + offs_n[:, None] * SG + tl.arange(0, 8)[None, :]
-    s3t = s3_ptr + slot * (N * SG) + offs_n[:, None] * SG + tl.arange(0, 8)[None, :]
+    s1t = s1_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE + tl.arange(0, 8)[None, :]
+    s3t = s3_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE + tl.arange(0, 8)[None, :]
     cw1 = _cbword(cb1_ptr + slot * (N * 8) + offs_n[:, None] * 8 + tl.arange(0, 8)[None, :], BN)
     cw3 = _cbword(cb3_ptr + slot * (N * 8) + offs_n[:, None] * 8 + tl.arange(0, 8)[None, :], BN)
     acc_g = tl.zeros([BM, BN], dtype=tl.float32)
@@ -388,6 +415,8 @@ def _cb3v2_down_kernel(
     KL: tl.constexpr = K // 4
     KH: tl.constexpr = K // 8
     SG: tl.constexpr = K // 32
+    # Packed rows are [base u8][3 B per 8 groups]; unpacked are one byte per group.
+    SSTRIDE: tl.constexpr = (1 + SG * 3 // 8) if PACKED else SG
     mb = tl.program_id(0)
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
@@ -402,7 +431,7 @@ def _cb3v2_down_kernel(
     xk = 2 * tl.arange(0, 16)[None, :]
     lo2 = lo2_ptr + slot * (N * KL) + offs_n[:, None] * KL + tl.arange(0, 64)[None, :]
     hi2 = hi2_ptr + slot * (N * KH) + offs_n[:, None] * KH + tl.arange(0, 32)[None, :]
-    s2t = s2_ptr + slot * (N * SG) + offs_n[:, None] * SG + tl.arange(0, 8)[None, :]
+    s2t = s2_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE + tl.arange(0, 8)[None, :]
     cw2 = _cbword(cb2_ptr + slot * (N * 8) + offs_n[:, None] * 8 + tl.arange(0, 8)[None, :], BN)
     acc = tl.zeros([BM, BN], dtype=tl.float32)
     for b in range(0, K // 256):
@@ -487,12 +516,24 @@ class CB3ArenaV2(CB3Arena):
             wg = w.view(torch.uint8).to(dev, non_blocking=non_blocking)
             sg = s.view(torch.uint8).to(dev, non_blocking=non_blocking)
             lo, hi, cb = fp4_to_cb3_v2(wg, sg, sim)
-            lo_t[slot].copy_(lo); hi_t[slot].copy_(hi); cb_t[slot].copy_(cb); s_t[slot].copy_(sg)
+            lo_t[slot].copy_(lo); hi_t[slot].copy_(hi); cb_t[slot].copy_(cb)
+            # A packed arena stores the file's own codec, so the checkpoint path packs here. The
+            # codec is exactly lossless on this checkpoint (scale_codec's survey: intra-row exponent
+            # range never exceeds 7 over all 149,422,080 rows), and job 790 re-checked that on 87
+            # real RESIDENT planes rather than trusting the file, which round-trips by construction.
+            s_t[slot].copy_(SC.pack_torch(sg) if self.packed_scales else sg)
+
+    def _s(self, plane, groups: int):
+        """Scales as the reference path wants them: one byte per group, whatever the arena stores."""
+        return SC.unpack_torch(plane, groups) if self.packed_scales else plane
 
     def dequant_slot(self, slot: int):
-        w1 = dequant_cb3_v2(self.w1_lo[slot], self.w1_hi[slot], self.w1_cb[slot], self.s1[slot])
-        w2 = dequant_cb3_v2(self.w2_lo[slot], self.w2_hi[slot], self.w2_cb[slot], self.s2[slot])
-        w3 = dequant_cb3_v2(self.w3_lo[slot], self.w3_hi[slot], self.w3_cb[slot], self.s3[slot])
+        w1 = dequant_cb3_v2(self.w1_lo[slot], self.w1_hi[slot], self.w1_cb[slot],
+                            self._s(self.s1[slot], SG1))
+        w2 = dequant_cb3_v2(self.w2_lo[slot], self.w2_hi[slot], self.w2_cb[slot],
+                            self._s(self.s2[slot], SG2))
+        w3 = dequant_cb3_v2(self.w3_lo[slot], self.w3_hi[slot], self.w3_cb[slot],
+                            self._s(self.s3[slot], SG1))
         return w1, w2, w3
 
 
@@ -608,9 +649,63 @@ def _pair_dot(x_base, xk, mask_m, Lk, Hm, A, B, sA, sB, KPAR: tl.constexpr):
     return acc
 
 
+# --------------------------------------------------------------- packed scale planes (change A)
+# The arena stores UE8M0 group scales one byte per group; the on-disk CB3 record stores them as
+# `ue8m0-3bit-rowbase-v1` -- one u8 row base plus 3 bits per group, eight groups to a 24-bit LE
+# word. That difference is the ENTIRE 679,936 B/slot gap between the 14,454,784 B arena slot and the
+# 13,774,848 B record (nine of twelve planes are byte-identical): 4.936 % of capacity, 5,949 ->
+# 6,243 slots at 86 GB, which job 715's measured slope prices at ~+16 % decode.
+#
+# Gates already passed: job 790 packed and unpacked 87 real RESIDENT planes with 0 mismatches --
+# stronger than the manifest, which round-trips by construction because the file is built with this
+# codec. Job 810: bitwise identical, +0.3 % standalone. Job 860: ZERO register cost in this
+# consumption shape, shared memory down, and hoisting the row base made no difference, so the
+# simpler per-block form is used here.
+#
+# THE OPEN GATE: _cb3v3_up_kernel compiles at n_regs=250 of a 255 cap with 0 spills, and
+# _cb3v3_down_kernel already spills 4 (job 850). A 40-register probe cannot predict a 250-register
+# kernel, so the decisive number is these kernels' own n_regs under PACKED=True.
+#
+# NOT part of this change: making the arena slot byte-identical to the record so a miss is one H2D.
+# That needs record-major backing storage and per-slot strides in every kernel -- a separate change
+# with its own benchmark. A stands on capacity alone.
+
+
+def _packed(arena) -> bool:
+    """Does this arena hold packed scale planes? Declared by the ARENA, not by a module global, so a
+    packed arena and an unpacked one can coexist in one process -- which is exactly what the bitwise
+    gate needs, and what a module flag would have made impossible."""
+    return bool(getattr(arena, "packed_scales", False))
+
+
+def packed_row_bytes(groups: int) -> int:
+    """Bytes per row of a packed scale plane: one u8 base plus 3 bits per group."""
+    assert groups % 8 == 0, groups
+    return 1 + groups * 3 // 8
+
+
 @triton.jit
-def _cb3v3_block_dot(x_base, xk, mask_m, lo_ptr, hi_ptr, s_ptr, A, B,
-                     BN: tl.constexpr, BW: tl.constexpr):
+def _scales_blk(s_row, blk, N_S: tl.constexpr, PACKED: tl.constexpr, BN: tl.constexpr):
+    """Block `blk`'s N_S scales as a [BN, N_S] uint8 tile of UE8M0 exponents.
+
+    `s_row` is the ROW pointer in BOTH layouts, not a pre-offset one: the packed form needs the row
+    base byte at offset 0 as well as the block's own bytes, and only the row pointer addresses both.
+    """
+    if PACKED:
+        base = tl.load(s_row).to(tl.int32)                       # [BN, 1] -- one byte per ROW
+        g = tl.arange(0, N_S)[None, :]
+        o = 1 + blk * (N_S // 8 * 3) + (g // 8) * 3
+        b0 = tl.load(s_row + o).to(tl.int32)
+        b1 = tl.load(s_row + o + 1).to(tl.int32)
+        b2 = tl.load(s_row + o + 2).to(tl.int32)
+        w = b0 | (b1 << 8) | (b2 << 16)                          # 24-bit LE, value i at bit 3*i
+        return (((w >> ((g % 8) * 3)) & 7) + base).to(tl.uint8)
+    return tl.load(s_row + blk * N_S + tl.arange(0, N_S)[None, :])
+
+
+@triton.jit
+def _cb3v3_block_dot(x_base, xk, mask_m, lo_ptr, hi_ptr, s_row, blk, A, B,
+                     BN: tl.constexpr, BW: tl.constexpr, PACKED: tl.constexpr):
     """One packing block: BW logical K from a [BN, BW/4] lo tile and a [BN, BW/8] hi tile.
     BW=512 -> 128 B + 64 B row tiles (218 / 185 GB/s on GB10); BW=256 -> 64 B + 32 B, and the 32 B
     hi tile caps at 101 GB/s, which is why 512 is used wherever K allows it."""
@@ -623,7 +718,8 @@ def _cb3v3_block_dot(x_base, xk, mask_m, lo_ptr, hi_ptr, s_ptr, A, B,
         L4, L5 = _split2(Lc, BN, 16)
         L6, L7 = _split2(Ld, BN, 16)
         H0, H1, H2, H3 = _split4(H, BN, 16)
-        s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15 = _split16(tl.load(s_ptr), BN)
+        s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15 = \
+            _split16(_scales_blk(s_row, blk, 16, PACKED, BN), BN)
         acc = _pair_dot(x_base, xk, mask_m, L0, H0, A, B, s0, s1, 0)
         acc += _pair_dot(x_base + 64, xk, mask_m, L1, H0, A, B, s2, s3, 1)
         acc += _pair_dot(x_base + 128, xk, mask_m, L2, H1, A, B, s4, s5, 0)
@@ -637,7 +733,7 @@ def _cb3v3_block_dot(x_base, xk, mask_m, lo_ptr, hi_ptr, s_ptr, A, B,
         H = tl.load(hi_ptr)   # [BN, 32]
         L0, L1, L2, L3 = _split4(L, BN, 16)
         H0, H1 = _split2(H, BN, 16)
-        s0, s1, s2, s3, s4, s5, s6, s7 = _split8(tl.load(s_ptr), BN)
+        s0, s1, s2, s3, s4, s5, s6, s7 = _split8(_scales_blk(s_row, blk, 8, PACKED, BN), BN)
         acc = _pair_dot(x_base, xk, mask_m, L0, H0, A, B, s0, s1, 0)
         acc += _pair_dot(x_base + 64, xk, mask_m, L1, H0, A, B, s2, s3, 1)
         acc += _pair_dot(x_base + 128, xk, mask_m, L2, H1, A, B, s4, s5, 0)
@@ -659,11 +755,12 @@ def _cb3v3_up_kernel(
     wgt_ptr, block_slot_ptr, block_pair_ptr,
     stride_x, stride_h, limit,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, NB512: tl.constexpr, NB256: tl.constexpr,
-):
+    BM: tl.constexpr, BN: tl.constexpr, NB512: tl.constexpr, NB256: tl.constexpr, PACKED: tl.constexpr = False):
     KL: tl.constexpr = K // 4
     KH: tl.constexpr = K // 8
     SG: tl.constexpr = K // 32
+    # Packed rows are [base u8][3 B per 8 groups]; unpacked are one byte per group.
+    SSTRIDE: tl.constexpr = (1 + SG * 3 // 8) if PACKED else SG
     mb = tl.program_id(0)
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
@@ -681,8 +778,8 @@ def _cb3v3_up_kernel(
     hi1 = hi1_ptr + slot * (N * KH) + offs_n[:, None] * KH
     lo3 = lo3_ptr + slot * (N * KL) + offs_n[:, None] * KL
     hi3 = hi3_ptr + slot * (N * KH) + offs_n[:, None] * KH
-    s1t = s1_ptr + slot * (N * SG) + offs_n[:, None] * SG
-    s3t = s3_ptr + slot * (N * SG) + offs_n[:, None] * SG
+    s1t = s1_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE
+    s3t = s3_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE
     A1, B1 = _cb_ab(cb1_ptr + slot * (N * 8) + offs_n[:, None] * 8, BN)
     A3, B3 = _cb_ab(cb3_ptr + slot * (N * 8) + offs_n[:, None] * 8, BN)
     acc_g = tl.zeros([BM, BN], dtype=tl.float32)
@@ -690,8 +787,8 @@ def _cb3v3_up_kernel(
     l1a = lo1 + tl.arange(0, 128)[None, :]; h1a = hi1 + tl.arange(0, 64)[None, :]; s1a = s1t + tl.arange(0, 16)[None, :]
     l3a = lo3 + tl.arange(0, 128)[None, :]; h3a = hi3 + tl.arange(0, 64)[None, :]; s3a = s3t + tl.arange(0, 16)[None, :]
     for b in range(0, NB512):
-        acc_g += _cb3v3_block_dot(x_base + b * 512, xk, mask_m[:, None], l1a + b * 128, h1a + b * 64, s1a + b * 16, A1, B1, BN, 512)
-        acc_u += _cb3v3_block_dot(x_base + b * 512, xk, mask_m[:, None], l3a + b * 128, h3a + b * 64, s3a + b * 16, A3, B3, BN, 512)
+        acc_g += _cb3v3_block_dot(x_base + b * 512, xk, mask_m[:, None], l1a + b * 128, h1a + b * 64, s1t, b, A1, B1, BN, 512, PACKED)
+        acc_u += _cb3v3_block_dot(x_base + b * 512, xk, mask_m[:, None], l3a + b * 128, h3a + b * 64, s3t, b, A3, B3, BN, 512, PACKED)
     if NB256 > 0:
         o: tl.constexpr = NB512 * 512
         l1b = lo1 + (NB512 * 128 + tl.arange(0, 64))[None, :]; h1b = hi1 + (NB512 * 64 + tl.arange(0, 32))[None, :]
@@ -699,8 +796,8 @@ def _cb3v3_up_kernel(
         l3b = lo3 + (NB512 * 128 + tl.arange(0, 64))[None, :]; h3b = hi3 + (NB512 * 64 + tl.arange(0, 32))[None, :]
         s3b = s3t + (NB512 * 16 + tl.arange(0, 8))[None, :]
         for b in range(0, NB256):
-            acc_g += _cb3v3_block_dot(x_base + o + b * 256, xk, mask_m[:, None], l1b + b * 64, h1b + b * 32, s1b + b * 8, A1, B1, BN, 256)
-            acc_u += _cb3v3_block_dot(x_base + o + b * 256, xk, mask_m[:, None], l3b + b * 64, h3b + b * 32, s3b + b * 8, A3, B3, BN, 256)
+            acc_g += _cb3v3_block_dot(x_base + o + b * 256, xk, mask_m[:, None], l1b + b * 64, h1b + b * 32, s1t, NB512 * 2 + b, A1, B1, BN, 256, PACKED)
+            acc_u += _cb3v3_block_dot(x_base + o + b * 256, xk, mask_m[:, None], l3b + b * 64, h3b + b * 32, s3t, NB512 * 2 + b, A3, B3, BN, 256, PACKED)
     gate = tl.minimum(acc_g, limit)
     up = tl.minimum(tl.maximum(acc_u, -limit), limit)
     wgt = tl.load(wgt_ptr + offs_m, mask=mask_m, other=0.0)
@@ -714,11 +811,12 @@ def _cb3v3_down_kernel(
     block_slot_ptr, block_pair_ptr,
     stride_h, stride_y,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr, NB512: tl.constexpr, NB256: tl.constexpr,
-):
+    BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr, NB512: tl.constexpr, NB256: tl.constexpr, PACKED: tl.constexpr = False):
     KL: tl.constexpr = K // 4
     KH: tl.constexpr = K // 8
     SG: tl.constexpr = K // 32
+    # Packed rows are [base u8][3 B per 8 groups]; unpacked are one byte per group.
+    SSTRIDE: tl.constexpr = (1 + SG * 3 // 8) if PACKED else SG
     mb = tl.program_id(0)
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
@@ -733,18 +831,18 @@ def _cb3v3_down_kernel(
     xk = 2 * tl.arange(0, 16)[None, :]
     lo2 = lo2_ptr + slot * (N * KL) + offs_n[:, None] * KL
     hi2 = hi2_ptr + slot * (N * KH) + offs_n[:, None] * KH
-    s2t = s2_ptr + slot * (N * SG) + offs_n[:, None] * SG
+    s2t = s2_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE
     A2, B2 = _cb_ab(cb2_ptr + slot * (N * 8) + offs_n[:, None] * 8, BN)
     acc = tl.zeros([BM, BN], dtype=tl.float32)
     l2a = lo2 + tl.arange(0, 128)[None, :]; h2a = hi2 + tl.arange(0, 64)[None, :]; s2a = s2t + tl.arange(0, 16)[None, :]
     for b in range(0, NB512):
-        acc += _cb3v3_block_dot(h_base + b * 512, xk, mask_m[:, None], l2a + b * 128, h2a + b * 64, s2a + b * 16, A2, B2, BN, 512)
+        acc += _cb3v3_block_dot(h_base + b * 512, xk, mask_m[:, None], l2a + b * 128, h2a + b * 64, s2t, b, A2, B2, BN, 512, PACKED)
     if NB256 > 0:
         o: tl.constexpr = NB512 * 512
         l2b = lo2 + (NB512 * 128 + tl.arange(0, 64))[None, :]; h2b = hi2 + (NB512 * 64 + tl.arange(0, 32))[None, :]
         s2b = s2t + (NB512 * 16 + tl.arange(0, 8))[None, :]
         for b in range(0, NB256):
-            acc += _cb3v3_block_dot(h_base + o + b * 256, xk, mask_m[:, None], l2b + b * 64, h2b + b * 32, s2b + b * 8, A2, B2, BN, 256)
+            acc += _cb3v3_block_dot(h_base + o + b * 256, xk, mask_m[:, None], l2b + b * 64, h2b + b * 32, s2t, NB512 * 2 + b, A2, B2, BN, 256, PACKED)
     row = ((offs_m % TOPK) * NTOK + offs_m // TOPK).to(tl.int64)
     tl.store(y_ptr + row[:, None] * stride_y + offs_n[None, :], acc, mask=mask_m[:, None])
 
@@ -781,10 +879,10 @@ def moe_forward_v3(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, 
     _cb3v3_up_kernel[(NB, INTER // bn1)](
         x, arena.w1_lo, arena.w1_hi, arena.w1_cb, arena.s1, arena.w3_lo, arena.w3_hi, arena.w3_cb, arena.s3, h,
         wgt, block_slot, block_pair, x.stride(0), h.stride(0), float(swiglu_limit),
-        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, NB512=CB3.block_plan(DIM)[0], NB256=CB3.block_plan(DIM)[1], num_warps=nw1, num_stages=ns1)
+        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, NB512=CB3.block_plan(DIM)[0], NB256=CB3.block_plan(DIM)[1], num_warps=nw1, num_stages=ns1, PACKED=_packed(arena))
     _cb3v3_down_kernel[(NB, DIM // bn2)](
         h, arena.w2_lo, arena.w2_hi, arena.w2_cb, arena.s2, parts, block_slot, block_pair,
-        h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, NB512=CB3.block_plan(INTER)[0], NB256=CB3.block_plan(INTER)[1], num_warps=nw2, num_stages=ns2)
+        h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, NB512=CB3.block_plan(INTER)[0], NB256=CB3.block_plan(INTER)[1], num_warps=nw2, num_stages=ns2, PACKED=_packed(arena))
     return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
 
 
@@ -859,7 +957,11 @@ def _cb3_unpack_kernel(LO, HI, CB, OUT, SRC, DST, N,
 def _unpack_into(arena, src_slots: torch.Tensor, scratch, dst_slots: torch.Tensor | None = None) -> None:
     """CB3 slots `src_slots` (int32 [B]) -> packed-FP4 scratch slots `dst_slots` (default 0..B-1).
 
-    Scales are copied rather than unpacked: the UE8M0 bytes are the same in both formats. An
+    Scales are copied rather than unpacked when the arena is UNPACKED: the UE8M0 bytes are then the
+    same in both formats. A PACKED arena must EXPAND them -- the FP4 scratch always holds one byte
+    per group, so a verbatim copy would drop 61-byte rows into 160-byte ones. That shape mismatch is
+    how the bitwise gate found this site at all: moe_forward_v3 delegates here whenever
+    P >= PREFILL_MIN_P, so it sits on the prefill path even though the decode kernels never reach it. An
     explicit `dst_slots` is what lets the layer-scoped cache leave already-unpacked experts alone
     and drop the new ones into whatever slots are free.
     """
@@ -876,7 +978,12 @@ def _unpack_into(arena, src_slots: torch.Tensor, scratch, dst_slots: torch.Tenso
             _cb3_unpack_kernel[(B, triton.cdiv(N, BN))](
                 lo, hi, cb, out, src_slots, dst_slots, N, KL=K // 4, KH=K // 8, KB=K // 2,
                 BN=BN, NB512=n512, NB256=n256, num_warps=4, num_stages=2)
-            s_dst[dst_slots.long()] = s_src[src_slots.long()]
+            if _packed(arena):
+                src = s_src[src_slots.long()]                       # [B, rows, packed_row_bytes]
+                s_dst[dst_slots.long()] = SC.unpack_torch(
+                    src.reshape(-1, src.shape[-1]), s_dst.shape[-1]).reshape(src.shape[0], src.shape[1], -1)
+            else:
+                s_dst[dst_slots.long()] = s_src[src_slots.long()]
 
 
 def moe_v3_phase(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena: CB3ArenaV2,
@@ -923,12 +1030,12 @@ def moe_v3_phase(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, ar
         x, arena.w1_lo, arena.w1_hi, arena.w1_cb, arena.s1, arena.w3_lo, arena.w3_hi, arena.w3_cb,
         arena.s3, h, wgt, block_slot, block_pair, x.stride(0), h.stride(0), float(swiglu_limit),
         TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, NB512=CB3.block_plan(DIM)[0],
-        NB256=CB3.block_plan(DIM)[1], num_warps=nw1, num_stages=ns1)
+        NB256=CB3.block_plan(DIM)[1], num_warps=nw1, num_stages=ns1, PACKED=_packed(arena))
     _cb3v3_down_kernel[(NB, DIM // bn2)](
         h, arena.w2_lo, arena.w2_hi, arena.w2_cb, arena.s2, parts, block_slot, block_pair,
         h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T,
         NB512=CB3.block_plan(INTER)[0], NB256=CB3.block_plan(INTER)[1],
-        num_warps=nw2, num_stages=ns2)
+        num_warps=nw2, num_stages=ns2, PACKED=_packed(arena))
 
 
 def moe_v3_reduce(parts: torch.Tensor, T: int, K: int) -> torch.Tensor:
@@ -977,12 +1084,12 @@ def moe_forward_v3_split(x: torch.Tensor, slots: torch.Tensor, weights: torch.Te
             arena.w3_cb, arena.s3, h, wgt, mask, block_pair, x.stride(0), h.stride(0),
             float(swiglu_limit), TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1,
             NB512=CB3.block_plan(DIM)[0], NB256=CB3.block_plan(DIM)[1],
-            num_warps=nw1, num_stages=ns1)
+            num_warps=nw1, num_stages=ns1, PACKED=_packed(arena))
         _cb3v3_down_kernel[(NB, DIM // bn2)](
             h, arena.w2_lo, arena.w2_hi, arena.w2_cb, arena.s2, parts, mask, block_pair,
             h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T,
             NB512=CB3.block_plan(INTER)[0], NB256=CB3.block_plan(INTER)[1],
-            num_warps=nw2, num_stages=ns2)
+            num_warps=nw2, num_stages=ns2, PACKED=_packed(arena))
     return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
 
 
@@ -1221,6 +1328,8 @@ def _cb2_up_kernel(
 ):
     KL: tl.constexpr = K // 4
     SG: tl.constexpr = K // 32
+    # Packed rows are [base u8][3 B per 8 groups]; unpacked are one byte per group.
+    SSTRIDE: tl.constexpr = (1 + SG * 3 // 8) if PACKED else SG
     mb = tl.program_id(0)
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
@@ -1236,8 +1345,8 @@ def _cb2_up_kernel(
     xk = 2 * tl.arange(0, 16)[None, :]
     lo1 = lo1_ptr + slot * (N * KL) + offs_n[:, None] * KL
     lo3 = lo3_ptr + slot * (N * KL) + offs_n[:, None] * KL
-    s1t = s1_ptr + slot * (N * SG) + offs_n[:, None] * SG
-    s3t = s3_ptr + slot * (N * SG) + offs_n[:, None] * SG
+    s1t = s1_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE
+    s3t = s3_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE
     A1 = _cb2_a(cb1_ptr + slot * (N * 4) + offs_n[:, None] * 4, BN)
     A3 = _cb2_a(cb3_ptr + slot * (N * 4) + offs_n[:, None] * 4, BN)
     acc_g = tl.zeros([BM, BN], dtype=tl.float32)
@@ -1271,6 +1380,8 @@ def _cb2_down_kernel(
 ):
     KL: tl.constexpr = K // 4
     SG: tl.constexpr = K // 32
+    # Packed rows are [base u8][3 B per 8 groups]; unpacked are one byte per group.
+    SSTRIDE: tl.constexpr = (1 + SG * 3 // 8) if PACKED else SG
     mb = tl.program_id(0)
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
@@ -1284,7 +1395,7 @@ def _cb2_down_kernel(
     h_base = h_ptr + offs_m[:, None].to(tl.int64) * stride_h
     xk = 2 * tl.arange(0, 16)[None, :]
     lo2 = lo2_ptr + slot * (N * KL) + offs_n[:, None] * KL
-    s2t = s2_ptr + slot * (N * SG) + offs_n[:, None] * SG
+    s2t = s2_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE
     A2 = _cb2_a(cb2_ptr + slot * (N * 4) + offs_n[:, None] * 4, BN)
     acc = tl.zeros([BM, BN], dtype=tl.float32)
     l2a = lo2 + tl.arange(0, 128)[None, :]; s2a = s2t + tl.arange(0, 16)[None, :]

@@ -398,12 +398,20 @@ class V41Engine:
         def make_expert_arena(n_slots):
             if cb3_cls is None:
                 return fp4_arena_cls(n_slots, device)
-            a = cb3_cls(n_slots, device)
+            # DSV41_PACKED_SCALES=1 stores the scale planes in the file's own 3-bit codec instead
+            # of one byte per group: +4.936 % slots for the same bytes, and three device-side
+            # unpacks per miss disappear. Off by default -- the shipped layout is unchanged until
+            # the end-to-end gate says otherwise. See notes/arena-layout-scale-packing.md.
+            _pk = os.environ.get("DSV41_PACKED_SCALES", "0") == "1"
+            a = cb3_cls(n_slots, device, packed_scales=_pk) if _pk else cb3_cls(n_slots, device)
             a.sim = self._cb3_sim
             return a
 
-        self.expert_bytes = (EX.EXPERT_BYTES if cb3_cls is None
-                             else __import__("cb3_moe").CB3_BYTES_PER_SLOT)
+        _c3 = __import__("cb3_moe")
+        self.expert_bytes = (EX.EXPERT_BYTES if cb3_cls is None else
+                             (_c3.CB3_BYTES_PER_SLOT_PACKED
+                              if os.environ.get("DSV41_PACKED_SCALES", "0") == "1"
+                              else _c3.CB3_BYTES_PER_SLOT))
 
         self.W = Weights(model_dir, index, self.args, device, log=log, act_quant=act_quant)
         if R.dense_fp4_groups():

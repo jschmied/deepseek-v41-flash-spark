@@ -63,3 +63,28 @@ def unpack_torch(p, groups: int):
         sh = _SH_CACHE[p.device] = torch.arange(8, device=p.device, dtype=torch.int32) * 3
     d = ((w.unsqueeze(-1) >> sh) & 7).reshape(rows, groups).to(torch.int16)
     return (d + base).to(torch.uint8)
+
+
+def pack_torch(x):
+    """Device-side forward, for the engine's CHECKPOINT load path. x: uint8 [rows, groups].
+
+    The builder packs on the host with `pack`; a packed ARENA also has to pack experts arriving from
+    the FP4 checkpoint, which are already on the device. Mirrors `pack` exactly -- same row base,
+    same 24-bit little-endian word, same bit positions -- and `test_pack_torch_matches_numpy` in the
+    gate asserts byte equality against it rather than assuming.
+    """
+    import torch
+    assert x.dtype == torch.uint8 and x.ndim == 2
+    rows, groups = x.shape
+    assert groups % 8 == 0, groups
+    base = x.min(dim=1, keepdim=True).values                      # [rows, 1]
+    d = (x.to(torch.int16) - base.to(torch.int16))
+    mx = int(d.max())
+    if mx > 7:
+        raise ValueError(f"intra-row range {mx} > 7; this row is not representable in 3 bits")
+    sh = _SH_CACHE.get(x.device)
+    if sh is None:
+        sh = _SH_CACHE[x.device] = torch.arange(8, device=x.device, dtype=torch.int32) * 3
+    w = (d.to(torch.int32).reshape(rows, groups // 8, 8) << sh).sum(dim=2)   # [rows, groups//8]
+    b = torch.stack([w & 0xFF, (w >> 8) & 0xFF, (w >> 16) & 0xFF], dim=2).to(torch.uint8)
+    return torch.cat([base, b.reshape(rows, groups * 3 // 8)], dim=1)
