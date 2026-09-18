@@ -734,7 +734,20 @@ class ExpertSlots:
                 # Treating it as a miss is the conservative repair: it costs a re-read that v1 avoids
                 # by re-homing the slot, and it can never serve weights that are not the expert's.
                 # Prefill keeps using the ring, where the write-then-use ordering makes it correct.
-                s = self.transient_map.get(key) if prefill else None
+                if prefill:
+                    s = self.transient_map.get(key)
+                else:
+                    # AND DROP THE STALE MAPPING. Treating the ring entry as a miss (above) stops
+                    # decode reading stale bytes, but leaving the entry in place left the key in
+                    # BOTH maps: `lru` at its new slot and `transient_map` at the old ring slot. A
+                    # later prefill then takes the transient hit and gets the stale slot -- the same
+                    # defect, moved one path over. Job 675 measured exactly that: the audit came back
+                    # clean and request 1 finally reproduced v1 token for token, while request 2
+                    # degenerated and the in-process prefill comparison stopped matching.
+                    old_slot = self.transient_map.pop(key, None)
+                    if old_slot is not None and self.slot_key.get(old_slot) == key:
+                        del self.slot_key[old_slot]
+                    s = None
             else:
                 self.lru.move_to_end(key)
                 self._ver_clock += 1

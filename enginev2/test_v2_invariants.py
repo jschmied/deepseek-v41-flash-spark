@@ -2020,3 +2020,29 @@ def test_decode_never_serves_from_the_transient_ring():
         assert slot_of3[expert] is not None
     finally:
         e.close()
+
+
+def test_decode_miss_on_a_ring_key_removes_the_stale_mapping():
+    """Re-reading a ring key into the LRU must also un-map it from the ring.
+
+    Job 675 found the half-fix by measurement: suppressing the stale READ made the bound-slot audit
+    clean and made request 1 reproduce v1 token for token, but request 2 degenerated and the
+    in-process prefill comparison stopped matching v1. The cause is that the key was then in BOTH
+    maps -- `lru` at its new slot, `transient_map` at the old ring slot -- so a later PREFILL took
+    the transient hit and got the stale slot. The same defect, one path over.
+    """
+    e = mk(V1, lru_slots=32, transient_slots=8)
+    try:
+        expert, key = 5, (0, 5)
+        slot_of, to_load, _ = e.slots.reserve(0, [expert], prefill=True)
+        e.loader.submit(to_load); e.loader.quiesce(timeout=30); e.loader.drain_forgets()
+        ring_slot = slot_of[expert]
+        assert key in e.slots.transient_map
+
+        e.slots.reserve(0, [expert], prefill=False)          # decode: miss, re-read into the LRU
+        assert key not in e.slots.transient_map, (
+            "the ring mapping survived a decode miss; a later prefill would take it as a hit and "
+            "read the stale slot")
+        assert e.slots.slot_key.get(ring_slot) != key, "the ring slot still claims the key"
+    finally:
+        e.close()
