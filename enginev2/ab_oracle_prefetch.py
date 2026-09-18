@@ -464,6 +464,12 @@ print(f"ARM {ARM} horizon {HORIZON}  {STEPS} steps  wall {wall:.2f}s  {STEPS / w
 print(f"  demand fetches {c.fetches}  reads in the wall window {reads}  "
       f"causal scored reads {causal_reads}  {causal_reads * RECORD / 1e9:.2f} GB  "
       f"achieved {reads * RECORD / wall / 1e9:.2f} GB/s")
+# THE WINDOW WALL CLOCK, PRINTED DIRECTLY. It was only ever available as the denominator of a
+# rounded percentage, so job 895's throughput comparison had to be reconstructed as idle/pct -- and
+# the oracle arm's "0.3%" put its span anywhere in 8.6-12.0 s, which is most of the effect being
+# measured. All arms replay the identical route sequence (2480/2480 reproduced), so token count is
+# equal by construction and this span IS the throughput comparison.
+print(f"  WINDOW span {span:.3f}s  steps {e2.c.steps}  {e2.c.steps / span:.3f} steps/s")
 print(f"  depth 0 {idle:.2f}s = {idle / span * 100:.1f}% of span   mean depth while reading "
       f"{sum(k * v for k, v in dur.items() if k) / 1e9 / busy if busy else 0:.2f}   "
       f"in-flight {reads * RECORD / busy / 1e9 if busy else 0:.2f} GB/s")
