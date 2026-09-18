@@ -242,3 +242,46 @@ compile yet and is the obvious next attempt.
 
 **Not included**: record-major storage so a miss is one H2D. The arena remains twelve plane-major
 tensors. Separate change, separate benchmark.
+
+---
+
+## Verified end to end, at both arena sizes (2026-09-18)
+
+**Job 865, 40 GB pinned** (18 % residency, hit ~0.75):
+
+| arm | slots | tok/s | hit | GB/tok |
+|---|---|---|---|---|
+| unpacked | 2,767 | 2.14 | 0.7477 | 1.371 |
+| packed | 2,904 | 2.65 | 0.7604 | 1.304 |
+| | **+4.95 %** | **+23.8 %** | +1.3 pp | −4.9 % |
+
+**Job 875, 86 GB** — the real operating point, each arm gated on a 26,400-token prefill first:
+
+| arm | slots | prefill wall | MemAvail floor | rep4 | rep5 | hit | GB/tok |
+|---|---|---|---|---|---|---|---|
+| unpacked | 5,949 | 77.9 s | 15.6 GiB | 5.24 | 5.51 | 0.9289 | 0.413 |
+| packed | **6,243** | 81.0 s | 16.5 GiB | 6.80 | **6.90** | 0.9347 | 0.382 |
+| | +4.94 % | +4.0 % | +0.9 GiB | | **+25.2 %** | +0.6 pp | −7.5 % |
+
+**Tokens identical in both jobs**, through the real loader, the real CB3 cache, real misses and real
+CUDA graphs. 6.90 tok/s is the highest this engine has produced.
+
+### It beats the pure-capacity slope, and that is the interesting part
+
+Job 715 measured +4.88 % slots -> +16.2 % decode by adding GB. Packing gives +4.94 % slots ->
+**+25.2 %**, about 9 pp more for the same slot count. The difference is the load path: a packed miss
+copies the record's scale bytes verbatim, where an unpacked one ran three device-side
+`_unpack_scales`. So packing is capacity *and* a cheaper miss, and only the capacity half was
+predicted. The 40 GB arm is consistent -- +23.8 % where misses are 3.7x more frequent.
+
+### Costs and scope
+
+* **Prefill is 4 % slower** (77.9 -> 81.0 s on 26,400 tokens). Not investigated; the likely cause is
+  `_unpack_into` now expanding 3-bit rows into the FP4 scratch instead of copying bytes. Decode gains
+  25 % and prefill loses 4 %, so it is a clear net win for this workload, but a prefill-dominated one
+  should see the number.
+* **Memory is not worse**: the floor under a 26.4k prefill is 16.5 GiB packed against 15.6 unpacked.
+* Both measurements are the P0 prompt at temperature 0. Job 785 showed P0 sits at the pessimistic end
+  of a 3.57-13.02 tok/s spread across five prompts, so these are comparisons, not a headline rate.
+* **Still open**: `_cb3v3_up_kernel` compiles at 254 of 255 registers. It passes and does not spill,
+  but the next edit to that kernel tips it, and that is a shipping risk independent of these numbers.
