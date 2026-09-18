@@ -718,7 +718,23 @@ class ExpertSlots:
             key = (layer, e)
             s = self.lru.get(key)
             if s is None:
-                s = self.transient_map.get(key)
+                # A TRANSIENT-RING ENTRY IS NOT SERVABLE AT DECODE. Measured (job 670, 2026-09-18):
+                # of 160 slots a decode step bound, every one of the 38 that held the WRONG EXPERT
+                # was a transient_map hit, and every lru hit (31) and fresh load (91) was correct.
+                # Perfect separation.
+                #
+                # The ring is written only by prefill and is round-robin over `transient_slots`
+                # entries, so a prompt re-takes each slot many times. Job 655 showed the ring is
+                # stale AT REST -- correct whenever prefill itself reads it, superseded afterwards --
+                # while `transient_map` and `slot_key` stay mutually consistent, so nothing here can
+                # detect it by inspecting the mapping. v1 never hits this because it PROMOTES a
+                # transient hit into the LRU (`_promote_transient`, engine/experts.py:636, fired at
+                # :733) rather than serving from the ring in place.
+                #
+                # Treating it as a miss is the conservative repair: it costs a re-read that v1 avoids
+                # by re-homing the slot, and it can never serve weights that are not the expert's.
+                # Prefill keeps using the ring, where the write-then-use ordering makes it correct.
+                s = self.transient_map.get(key) if prefill else None
             else:
                 self.lru.move_to_end(key)
                 self._ver_clock += 1

@@ -435,6 +435,39 @@ in place. Since job 655 showed the ring **is** stale at rest, a decode hit on a 
 exactly those stale bytes. That mechanism fits every measurement so far and is the review's own P1,
 currently sitting in the suite as an `xfail`. Job 670 labels all 160 instead of counting them.
 
+## Job 670 — ROOT CAUSE: decode serves stale experts from the transient ring (2026-09-18)
+
+Of the 160 slots the first decode step bound, labelled by where the mapping came from:
+
+    TRANSIENT-HIT  ring  n= 38  WRONG=38     <- every single one
+    fresh-load     lru   n= 91  WRONG=0
+    lru-hit        lru   n= 31  WRONG=0
+
+        layer=4 expert=287 slot=2497 origin=TRANSIENT-HIT ring slot_key=(4, 287)
+        layer=5 expert=176 slot=2509 origin=TRANSIENT-HIT ring slot_key=(5, 176)
+
+**Perfect separation.** Every wrong slot is a `transient_map` hit; every LRU hit and every fresh
+load is correct.
+
+The ring is written only by prefill and is round-robin over `transient_slots` entries, so a prompt
+re-takes each slot many times. Job 655 showed it is correct whenever prefill itself reads it (0 of
+154) and stale afterwards (120 of 120) — while `transient_map` and `slot_key` stay mutually
+CONSISTENT, so nothing in the mapping can detect it. v1 never reaches this state because it
+**promotes** a transient hit into the LRU (`_promote_transient`) instead of serving from the ring in
+place.
+
+So v2 was computing decode steps with weights that were not the experts the router selected. **This
+is a correctness bug, not just nondeterminism** — and it explains every earlier result at once: the
+request-history dependence (which ring entries are stale depends on history), v1's reproducibility,
+prefill being bitwise correct, the 0-to-few-ulp margins in job 575, and why the kernel invariance
+(630) and the arena audit (650, 655) were both right and both beside the point.
+
+**Fix:** `reserve(prefill=False)` no longer consults `transient_map`; a ring entry becomes a miss
+and is re-read into the LRU. Conservative — it costs a read v1 avoids by re-homing the slot, and it
+can never serve the wrong weights. Prefill still uses the ring. Test verified to fail on the parent;
+66 pass, 1 xfail. Job 675 is the gate: the audit must come back 0, v2 must be reproducible, and it
+must still match v1 bitwise.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`

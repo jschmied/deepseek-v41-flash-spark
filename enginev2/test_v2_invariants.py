@@ -1931,10 +1931,12 @@ def test_sampled_verify_is_distribution_preserving():
 
 
 @pytest.mark.xfail(strict=True, reason=
-                   "v2 has no _promote_transient; recorded as a known v1-parity gap. NOT fixed "
-                   "while the request-history divergence is being localized -- changing cache "
-                   "semantics mid-investigation would muddy the measurement. strict=True so this "
-                   "turns into an ERROR the moment someone implements it, instead of going quiet.")
+                   "v2 still has no _promote_transient. The CORRECTNESS half is fixed differently "
+                   "-- decode no longer serves from the ring at all, see "
+                   "test_decode_never_serves_from_the_transient_ring -- so v2 cannot read stale "
+                   "weights. What remains is PARITY: v1 re-homes the expert into the LRU and credits "
+                   "evict.on_hit, v2 re-reads it, so the eviction policy sees a different access "
+                   "history. strict=True so this errors the moment promotion lands.")
 def test_a_decode_hit_in_the_transient_ring_is_promoted():
     """V1 parity: a decode hit on an expert sitting in the transient ring must be PROMOTED.
 
@@ -1977,5 +1979,44 @@ def test_a_decode_hit_in_the_transient_ring_is_promoted():
             "eviction policy picks different victims than v1 would")
         assert (key_layer, expert) not in e.slots.transient_map, "promoted key still in the ring"
         assert set(e.slots.transient_ring) != before_ring, "no LRU donor was swapped into the ring"
+    finally:
+        e.close()
+
+
+def test_decode_never_serves_from_the_transient_ring():
+    """A decode reserve must not hand back a transient-ring slot.
+
+    Job 670 measured the reason. Of 160 slots one decode step bound, the 38 that held the WRONG
+    EXPERT were ALL transient_map hits; all 31 lru hits and all 91 fresh loads were correct. Perfect
+    separation.
+
+    The ring is written only by prefill and is round-robin, so a prompt re-takes each slot many
+    times; job 655 showed it is correct whenever prefill reads it and stale afterwards, while
+    `transient_map` and `slot_key` stay mutually CONSISTENT -- so no amount of inspecting the
+    mapping can detect it. v1 avoids the situation entirely by promoting a transient hit into the
+    LRU rather than serving from the ring in place.
+
+    Serving it as a miss is the conservative repair: a re-read, never stale weights.
+    """
+    e = mk(V1, lru_slots=32, transient_slots=8)
+    try:
+        expert = 5
+        slot_of, to_load, _ = e.slots.reserve(0, [expert], prefill=True)
+        e.loader.submit(to_load)
+        e.loader.quiesce(timeout=30)
+        e.loader.drain_forgets()
+        ring_slot = slot_of[expert]
+        assert (0, expert) in e.slots.transient_map, "setup: expected a transient placement"
+        assert ring_slot >= e.slots.lru_slots, "setup: expected a ring slot"
+
+        slot_of2, to_load2, _ = e.slots.reserve(0, [expert], prefill=False)
+        assert to_load2, (
+            "decode reserved a transient-ring entry as a HIT; the ring is stale once prefill has "
+            "moved past it, and job 670 measured 38 of 38 such hits returning the wrong expert")
+        assert slot_of2[expert] < e.slots.lru_slots, "decode must place it in the LRU half"
+
+        # prefill still uses the ring: that path writes then uses, which is why it stays correct
+        slot_of3, _, _ = e.slots.reserve(0, [expert], prefill=True)
+        assert slot_of3[expert] is not None
     finally:
         e.close()
