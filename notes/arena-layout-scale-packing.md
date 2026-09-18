@@ -283,5 +283,21 @@ predicted. The 40 GB arm is consistent -- +23.8 % where misses are 3.7x more fre
 * **Memory is not worse**: the floor under a 26.4k prefill is 16.5 GiB packed against 15.6 unpacked.
 * Both measurements are the P0 prompt at temperature 0. Job 785 showed P0 sits at the pessimistic end
   of a 3.57-13.02 tok/s spread across five prompts, so these are comparisons, not a headline rate.
-* **Still open**: `_cb3v3_up_kernel` compiles at 254 of 255 registers. It passes and does not spill,
-  but the next edit to that kernel tips it, and that is a shipping risk independent of these numbers.
+* **The up kernel's 254 of 255 registers is now a CLOSED question with an unwelcome answer.** The
+  aligned-`int32`-word layout -- one aligned load per 8 scales instead of three byte loads, at
+  +3.687 % capacity instead of +4.948 % -- was built and measured in the real kernel: **still 254**.
+  It helps only the down kernel (144 instead of 148), which already has 111 registers spare.
+
+  Both layouts cost the up kernel exactly +4, so the registers are **not the loads** -- they are the
+  shift/mask/add extraction itself, which is irreducible while the scales are packed. No loading
+  trick will buy headroom back. The choice is to accept 254 with 0 spills, or not to pack.
+
+  It cost several cycles to learn only because I kept printing Triton's *source context* instead of
+  its message. The actual error was one line: `Return type mismatch: uint8 and int32` -- Triton
+  unifies a function's return types BEFORE specializing on a constexpr, so `_scales_blk`'s packed
+  branch returning uint8 and its unpacked branch returning int32 is a compile error even though only
+  one branch can survive. One `.to(tl.uint8)` fixed it.
+
+  **Mitigation, since the fragility is real**: `kernel_fixture.py` gate 1 fails at >= 255 registers
+  and on any new spill, so the next edit to that kernel is caught by the routine gate rather than in
+  production. That is the guard; 254 is accepted knowingly, not overlooked.
