@@ -154,3 +154,47 @@ whether 86 GB survives at a larger scratch is an open question, not a settled on
 
 Job 830 sweeps 32/128/256/384 at fixed arena and fixed prompt, reporting prefill wall, unpack GPU
 time and unpacked-expert count. A middle value may keep most of the cache win and most of the memory.
+
+---
+
+## Register pressure: the integration gate the review asked for (2026-09-18)
+
+**Job 850 — the live decode kernels as they stand.** The path is `fastdecode.py:450` ->
+`moe_v3_phase` -> `_cb3v3_up/down_kernel` -> `_cb3v3_block_dot`, whose scales come through
+`_split16`/`_split8` (16 and 8 groups = exactly whole 24-bit packed words, so no sub-word
+addressing is needed there; `_cb3_quad_dot`'s `[BN, 4]` would need it and is not live).
+
+```
+_cb3v3_up_kernel  : n_regs=250  n_spills=0  shared=25088  warps=4
+_cb3v3_down_kernel: n_regs=128  n_spills=4  shared=12800  warps=4
+moe_forward_v3 T=6: 1908.5 us     T=24: 5555.3 us
+```
+
+**Five registers of headroom on the up kernel, and the down kernel already spills.** The review was
+right to refuse "the unpack is free" on the strength of job 810's isolated 6.2 us. It also supplies
+the denominator job 790 lacked: 810's delta was +0.0 us against a ~1,900 us MoE forward.
+
+**Job 860 — does packed decode cost registers in this consumption shape?** Same `_split8` the live
+kernel uses, two candidate shapes:
+
+| variant | n_regs | n_spills | shared | time |
+|---|---|---|---|---|
+| unpacked | 40 | 0 | 2048 | 7.0 us |
+| packed, base re-loaded per block | 40 | 0 | 256 | 8.3 us |
+| packed, base hoisted per row | 40 | 0 | 256 | 8.2 us |
+
+**Zero register cost, and shared memory falls 2048 -> 256** because the tile is smaller. Hoisting
+the row base makes no difference, so the simpler per-block form is fine.
+
+**Scope.** This probe is a 40-register kernel and the real one is 250; register allocation is not
+linear, so this removes the *shape* objection without predicting the real count. The decisive number
+is `_cb3v3_up_kernel`'s own `n_regs` after the change, measured the same way.
+
+### Four Triton authoring failures preceded these two results
+
+795 used test data the codec cannot encode (intra-row range 63 against a 3-bit format); 800 defined
+`@jit` inside a heredoc, which Triton rejects because it reads the defining source file; 805 used
+`tl.arange(0, 160)`, which must be a power of two; 855 referenced a module global from inside `@jit`.
+Each cost a queue slot and none measured anything. 860 was **compile-checked locally before being
+queued**, which caught a fifth (`s[:, 0]` scalar indexing is unsupported -- the real code uses
+`_split8`, which the probe now imports rather than reimplements). That check is the rule from here.
