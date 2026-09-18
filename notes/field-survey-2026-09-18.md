@@ -244,3 +244,38 @@ get it right.
 routes replayed identically in every arm (2480/2480). The recall arms are a recall-degraded ORACLE,
 not a real predictor -- they model what a predictor of that recall would fetch, with precision 1.0.
 A real predictor also misfires, and precision < 1 costs slots and bandwidth that these arms never pay.
+
+### The precision sweep is void, and it found something else (job 925)
+
+| arm | steps/s | vs null | pred_miss | wasted |
+|---|---|---|---|---|
+| null | 3.349 | — | 0 | 0 |
+| recall 0.60, p1.00 | 4.774 | +42.6 % | 0 | 0 |
+| recall 0.60, p0.80 | 5.529 | +65.1 % | 8,095 | 7,176 |
+| recall 0.60, p0.60 | 5.570 | +66.3 % | 22,410 | 19,936 |
+| recall 0.60, **p0.40** | **5.769** | **+72.3 %** | 50,065 | 44,644 |
+| oracle | 5.477 | +63.5 % | 0 | 0 |
+
+**Lower precision measured faster, monotonically, and p0.40 beat the oracle.** That is not a finding
+about precision; it is a broken instrument, and the flaw is in code I wrote.
+
+`_RecallFromTrace` draws misfires from outside the truth **for that call**. But a layer touches 237
+of its 384 experts across 100 steps, so an expert that is wrong for *this* step is very likely right
+for a later one. The `wasted` counter means "not used at the predicted (layer, step)" — it does not
+mean "not used". So the precision axis did not inject misfires; it injected **extra prefetch
+breadth**, and on a cache holding 29 % of the working set more breadth is simply better.
+
+Two consequences, and they point in opposite directions:
+
+1. **The precision question is unanswered.** A real predictor's misfires are experts the trace never
+   wants at that layer at all. Modelling them needs the draw taken from the complement of the layer's
+   *whole-trace* expert set, not of one call's route. Until that is fixed, the recall curve's status
+   as an upper bound is still unverified — which was the entire point of the job.
+2. **Prefetch breadth looks like a real lever, discovered by accident.** Issuing more experts per
+   layer than the predicted set was worth +30 pp over p1.00 here. That is a *width* knob, orthogonal
+   to recall and horizon, and nothing in this project has ever tested it deliberately. It is also
+   consistent with job 905: we sit at 29 % of the working set with an accelerating capacity curve, so
+   anything that pulls more of the working set in early pays.
+
+Recorded as an accident rather than a result. The next job fixes the misfire draw and tests width as
+its own axis, so the two are not confounded again.
