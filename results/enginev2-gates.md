@@ -355,6 +355,27 @@ Three mechanisms of mine have already been refuted tonight (slot-order reduction
 `_pending_slots` guard, and end-of-step recycling), so this one is not being written up as a defect
 until the instrument is shown to work.
 
+## Job 650 — the audit instrument is valid
+
+    arena class=CB3ArenaV2  sim=CodebookSim  record=13774848
+    CONTROL LRU-range  slot=100  layer=3 expert=17 -> MATCHES
+    CONTROL RING-range slot=2372 layer=3 expert=18 -> MATCHES
+
+Writing a known expert into a chosen slot through the loader's own path and then auditing it
+succeeds for both halves of the arena, so the reference is right and jobs 640 and 645 are real
+measurements rather than an artifact of the tool.
+
+**Which leaves the contradiction with job 536 as the open question, not the audit.** The untested
+resolution: `_transient_slot_for` is round-robin over 400 slots, and even a short prompt through
+~21 encoder layers wraps it. Each wrap pops the old key and maps the new, and the new key's read is
+submitted and waited on before that layer's `prefill_moe` — so a slot is correct **when it is
+used**, and may be re-taken afterwards. An audit at the end of prefill would then see a map whose
+entries were all superseded: a property of round-robin bookkeeping, not a defect. That also fits the
+shape, since 120 of 120 looks far more like a category error than like corruption.
+
+Job 655 audits the ring **at the moment of use** — inside `prefill_moe`, after the wait — and
+separately compares v2's prefill against v1's *in the same process*, which job 536 never did.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
