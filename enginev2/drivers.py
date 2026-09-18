@@ -901,5 +901,11 @@ class Engine:
             # D3 ON: this chunk's FFN waits for EVERY chunk's reads. OFF: only its own.
             self._wait(pending if self.policy.global_barrier else waits, ctx,
                        scored=self._scoring)
+            # THE H2D->COMPUTE EDGE. _wait() above is HOST-side only, and under EARLY_READY the
+            # loader publishes a slot the moment its H2D is enqueued -- so returning from _wait says
+            # nothing about the bytes having landed. replay_layer has always done this; prefill did
+            # not, and the global barrier does not cover it: waiting on more un-landed reads buys
+            # time, not ordering. Required before any all-false sched.V2 result is quoted.
+            self.c.copies_awaited += self.leaves.await_copies(reads)
             self._compute(lambda c=ci, r=route, m=slot_of: self.leaves.prefill_moe(layer, c, r, m),
                           slots=reads)

@@ -92,6 +92,65 @@ queue slot.
 
 ### Verdict: build it
 
-Expected: +4.70 % slots (5,949 -> 6,228 at 86 GB), worth ~+16 % decode on job 715's measured slope,
-plus a miss collapsing from nine plane copies and three device-side `_unpack_scales` into one
-contiguous 13.77 MB copy once the slot is byte-identical to the record.
+### Corrections from review, 2026-09-18
+
+**The capacity arithmetic was wrong, in our favour.** 679,936 / 14,454,784 = 4.704 % is the *saving
+as a fraction of the old slot*; the *capacity gain* is `old/new - 1` = 14,454,784 / 13,774,848 - 1 =
+**4.936 %**. At 86 GB that is **5,949 -> 6,243 slots**, not 6,228.
+
+**"The slot becomes byte-identical to the record, so a miss is one contiguous copy" is not true of
+this change.** The record is contiguous; the arena is *twelve independent plane-major tensors*
+(`CB3Arena.__init__`), and `CB3Cache.load_slot` copies into each. Packing the scale planes changes a
+miss from *nine plane copies + three scale-unpack kernels* to *twelve plane copies and no unpack
+kernels* — it does not produce one H2D. That needs record-major backing storage and per-slot strides
+in every kernel. **Two separate changes, and they must not be one patch:**
+
+| | change | gain | blast radius |
+|---|---|---|---|
+| **A** | packed scales in the existing plane-major arena | +4.94 % capacity, scale unpack removed | the three scale load sites |
+| **B** | record-major arena | one H2D per miss | every kernel's slot stride |
+
+A stands on capacity alone. B is a later, separate optimisation with its own benchmark.
+
+**"The unpack is free" overstates job 810.** 6.2 us vs 6.2 us gates the *extraction arithmetic in
+isolation*. It does not capture register pressure or occupancy inside `_cb3v3_up_kernel` /
+`_cb3v3_down_kernel`, which are already large — inlining a base + 3-bit extract can cross a register
+threshold even when the operation is free standing alone. The correct claim is: **scale extraction
+has no measurable standalone Triton cost; the integrated MoE cost is not yet gated.** Build it, then
+benchmark real routes (T=6 at realistic and high distinct-expert counts, BM 16/32/64 as actually
+selected, up and down) and record compiled register counts where available. Do not book the gain
+first.
+
+Expected after A: **+4.94 % slots** (5,949 -> 6,243 at 86 GB), worth ~+16 % decode on job 715's
+measured slope *if* the integration gate passes.
+
+---
+
+## `DSV41_CB3_SCRATCH_SLOTS=32` is NOT a free 6.62 GB — withdrawn
+
+Job 750 measured that scratch 32 vs 384 frees 6.62 GB of resident memory with the transient peak
+unchanged (8.38 vs 8.37 GB). I reported that as 6.62 GB the arena can have. **That does not follow,
+and the code says why.**
+
+`moe_forward_prefill` (`cb3_moe.py:1019`) takes the layer-scoped unpack cache only when
+`scratch.slots >= n`, where `n` is the chunk's distinct expert count. A layer has ~362 distinct
+experts and every chunk touches almost all of them, so at 32 slots that test is **false** and it
+falls back to re-unpacking in batches of 32 (`:1050`). The comment at `cb3_moe.py:418` is explicit
+about what that costs, and it is the reason the cache exists:
+
+> 1512 `_unpack_into` calls x <=32 experts = up to 48,384 expert-unpacks where 21 x 362 = 7,600 are
+> needed, a **6.4x redundancy**. At 33.25 MB per unpack that is **1.61 TB**, and
+> `_cb3_unpack_kernel` was the largest single GPU consumer in the profile at **7.44 s of a 40.3 s
+> GPU-busy prefill (18.5 %)**.
+
+So scratch=32 reinstates precisely the problem `SCRATCH_SLOTS` was built to solve. Job 750 measured
+**memory** and never measured **prefill time**, so it cannot price the trade either way.
+
+**This affects runs already quoted.** Jobs 755, 760, 820 and 825 all ran `SCRATCH_SLOTS=32`, so
+their absolute prefill walls (755: 76.6 s; 760: 52.3 s at 26,400 tokens) are pessimistic. Comparisons
+*within* those jobs hold — both arms carried the same setting — but the absolute numbers should not
+be quoted as this engine's prefill speed. The 86 GB arena result also depends on the 6.62 GB, so
+whether 86 GB survives at a larger scratch is an open question, not a settled one.
+
+Job 830 sweeps 32/128/256/384 at fixed arena and fixed prompt, reporting prefill wall, unpack GPU
+time and unpacked-expert count. A middle value may keep most of the cache win and most of the memory.

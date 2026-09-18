@@ -91,3 +91,35 @@ table and it is one measurement. Job 710 arms A and E measure it.
 1. job 710 (queued) — measure (b) and (c); no code change, env flags only.
 2. port lending to v2 (§1) once 705 releases the tree, with the three v2-only fixes and a test.
 3. ring-size sweep (a) — only meaningful after 2, since it is lending that makes it free.
+
+---
+
+## Corrections from review, 2026-09-18
+
+**"A bigger ring is free" is withdrawn.** Two reasons, both right:
+
+1. **It frees no memory.** The arena tensors stay fully allocated; lending repartitions ownership
+   inside memory we already hold. So it cannot enable a larger prefill activation allocation, which
+   is how I presented it in the "bigger prefills" section. Removed from there.
+2. **400 already exceeds the per-layer expert universe (384).** For the current layer-at-a-time
+   prefill, more than 400 simultaneously live transient experts is not something the algorithm can
+   use. A bigger ring only helps if some future multi-layer prefill or prefetch needs it.
+
+There is also a **cross-request cost I missed entirely**: during decode, lent ring slots fill with
+hot LRU entries; `reclaim_ring()` at the next request forcibly drops every one of them. A 1200-slot
+ring means dropping up to 1200 decode residents at *every* new prefill. Steady-state decode inside
+one request can look excellent while first-token and early-decode cache state degrade each request —
+and every ring measurement so far reads steady-state decode only. Any ring sizing test must run
+**multiple consecutive real requests** and report prefill NVMe, the first ~10 decode steps, later
+steady decode, and residents dropped by `reclaim_ring()`, separately.
+
+**`_displaced` must be handled at RECLAIM, not at lend.** I had the lifecycle point wrong. The
+danger is not the initial lend: during decode a lent ring slot becomes an LRU slot and can acquire a
+speculative `_displaced` record, and at the next request reclaim wants that physical slot back.
+Deleting the record is not enough if the speculative operation is still outstanding — a later
+cancellation can still call `rollback_speculative()` or `forget()` against a slot whose role has
+changed underneath it. The contract before `reclaim_ring()` must be: settle or cancel speculative
+attempts targeting ring slots, quiesce the loader, `drain_forgets`, assert no pending and no
+speculatively-owned ring slots, reclaim, then purge dead `_displaced` records. Prefetch is a no-op in
+today's `V2Engine`, so this cannot bite serving yet — but `ExpertSlots` is built for speculation and
+should not acquire a lifecycle bug just because the current server never exercises it.

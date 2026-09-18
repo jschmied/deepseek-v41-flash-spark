@@ -723,6 +723,19 @@ class RealLeaves(Leaves):
         out = m.moe_apply(y, slots, pf["wts"][chunk], m.W.layers[layer], self.arena)
         resid, ffn_post, ffn_comb = pf["post"][chunk]
         pf["H"][chunk] = _V41REF.hc_post(out, resid, ffn_post, ffn_comb)
+        # THE READER EVENT -- the compute->reuse edge, missing here until 2026-09-18 while both
+        # layer_b and decoder_replay_moe recorded one. Without it a later H2D can overwrite a slot
+        # this eager MoE is still reading. Review noted that the all-true policy "mostly masks" it;
+        # it does not mask it at all: _wait() is host-side only (loader.wait_all + wait_slots) and
+        # under EARLY_READY a slot is published when its H2D is ENQUEUED, not landed. The global
+        # barrier therefore buys wall-clock time, never device ordering. v2 prefill gating bitwise
+        # against v1 (jobs 536/555/690) is what a race that usually wins looks like.
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream())
+        if len(self._last_reader) < self._arena_slots:
+            self._last_reader = [None] * self._arena_slots
+        for sl in set(slot_of.values()):
+            self._last_reader[sl] = ev
 
     def finish_prefill(self) -> None:
         """Assemble the prompt-cache checkpoints, advance c.len, and seed the SWA replay buffer.
