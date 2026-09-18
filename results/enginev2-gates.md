@@ -397,6 +397,25 @@ captured graph the engine replays, and without the repeated slots and padding a 
 block produces. Job 660 re-asks it with the audit at the moment of use and records the
 distinct-slot count per layer, since `build_routing_small` emits one block per distinct slot.
 
+## Job 660 — 38 of 160 decode slots wrong at the moment of use, NOT yet a defect claim
+
+    req1 bytes-at-use: checked=160 WRONG=38
+    req2 bytes-at-use: checked=160 WRONG=37
+    layer 4: distinct slots req1=18 req2=18   <- EQUAL, so the block-count hypothesis is out
+
+Prefill at the equivalent point was 0 of 154 (655), so this is decode-specific. The difference is
+how completion is enforced: `drivers.py:424` calls `leaves.await_copies(reads)` before `layer_b` at
+`:433`, and **await_copies puts the copy events on the compute stream — it makes the GPU wait, not
+the host.** A host-side read between it and the replay can legitimately see pre-copy bytes while the
+kernel still reads the right ones. The audit does call `torch.cuda.synchronize()`, which drains
+already-enqueued copies, but not one enqueued after the hook runs — and that window is exactly what
+the device-ordered fast path exists to exploit.
+
+Having mistaken the wrong instant for a defect twice tonight already (640 and 645, withdrawn after
+655), job 665 measures three instants instead of arguing: before graph B is queued, after it is
+queued, and after a full sync plus loader quiesce — with each wrong slot labelled fresh-load or
+cache-hit.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
