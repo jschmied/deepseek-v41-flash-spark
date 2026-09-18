@@ -468,6 +468,30 @@ can never serve the wrong weights. Prefill still uses the ring. Test verified to
 66 pass, 1 xfail. Job 675 is the gate: the audit must come back 0, v2 must be reproducible, and it
 must still match v1 bitwise.
 
+## Job 675 — the stale read is gone, but the repair is the wrong one (2026-09-18)
+
+    (1) bound-slot audit: checked=160 WRONG=0     TRANSIENT-HIT 40, fresh 94, lru-hit 26, all clean
+    (2) reproducible: False
+        run1 [52480, 270, 10869, 294, 30123, 18505, 305, 18967, 18505, 14, 305, 1192]
+             <- v1's own sequence from job 570, token for token
+        run2 [343, 553, 11, 1, 30283, 1, 30283, 30283, ...]   degenerate
+        hit_rate=0.6515  nvme=41.9 GB  decode=0.73 tok/s   (was ~3.6)
+    (3) v2 vs v1 prefill in-process: logits=False mh=False
+
+Making a ring hit a MISS removes the stale read and makes request 1 reproduce v1 exactly — strong
+confirmation of the diagnosis. It is still the wrong repair: it re-reads a large share of every step
+(0.73 tok/s against ~3.6) and request 2 comes out worse than before the fix. A second pass that also
+dropped the stale mapping changed nothing measurable.
+
+Caveat on (3): job 655 compared v2 to v1 right after a prefill, job 675 does it after two full
+generations. The histories differ, so that regression is not attributable yet and is not claimed.
+
+**The unexamined assumption is why v2's ring goes stale at all.** v1 runs the same round-robin ring
+at the same size, and if v1's were equally stale then `_promote_transient` would be promoting stale
+bytes into the LRU — worse than reading them once. Nobody has audited v1's ring. Job 680 does, and
+it decides the fix: v1 clean means the defect is in v2's ring WRITE path and neither repair is
+right; both stale means promotion is the answer.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
