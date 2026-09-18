@@ -96,6 +96,12 @@ class CB3Arena:
         """Takes packed-FP4 CPU tensors as read from the checkpoint (same signature as the FP4 arena)
         and converts them to CB3 on the GPU on the way in."""
         assert self.sim is not None, "CB3Arena.sim must be a CodebookSim(3)"
+        # Only CB3ArenaV2 implements the packed path (load, dequant, and the v3 kernels). This base
+        # class would write one byte per group into a 61-byte row and read it back as if nothing had
+        # happened -- silent wrong numbers rather than a crash, which is the worst failure shape
+        # available. Refuse instead.
+        assert not self.packed_scales, (
+            "CB3Arena (v1 layout) has no packed-scale path; use CB3ArenaV2")
         dev = self.device
         for (w, s, lo_t, hi_t, cb_t, s_t) in ((w1, s1, self.w1_lo, self.w1_hi, self.w1_cb, self.s1),
                                                (w3, s3, self.w3_lo, self.w3_hi, self.w3_cb, self.s3),
@@ -540,6 +546,9 @@ class CB3ArenaV2(CB3Arena):
 def moe_forward_v2(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena: CB3ArenaV2,
                    swiglu_limit: float = 10.0, block_m: int | None = None,
                    cfg_up=None, cfg_down=None) -> torch.Tensor:
+    # The _cb3v2_* kernels have no PACKED constexpr -- only the v3 pair does. A packed arena
+    # here would read 61-byte rows as if they were 160-byte ones and return plausible garbage.
+    assert not _packed(arena), "moe_forward_v2 has no packed-scale path; use moe_forward_v3"
     assert x.dtype == torch.bfloat16 and x.shape[1] == DIM and x.is_contiguous()
     T, K = slots.shape
     P = T * K
