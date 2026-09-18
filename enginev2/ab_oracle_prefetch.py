@@ -280,6 +280,15 @@ obs = TraceObserver(capacity=1 << 18)
 # from this harness -- so the recall->win curve its docstring promises had never been measured
 # against a scheduler. It subclasses the same TraceOracle truth, degraded to RECALL activation
 # recall and PRECISION precision, so the null / recall / oracle arms differ in exactly one thing.
+# Per layer, the experts the recorded trace NEVER routes to -- the only honest source of misfires.
+_layer_used: dict = {}
+for _k, _v in routes.items():
+    _layer_used.setdefault(_k[1], set()).update(_v)
+_layer_ever_used = {L: frozenset(used) for L, used in _layer_used.items()}   # EXCLUSION set
+print("  misfire pool per layer: " + ", ".join(
+    f"L{L}={384 - len(u)}" for L, u in sorted(_layer_used.items())[:4]) + " ... (experts never routed)")
+
+
 class _RecallFromTrace(TraceOracle):
     """TraceOracle degraded to a fixed recall/precision, keeping this harness's `base` offset."""
     name = "recall_oracle"
@@ -301,7 +310,14 @@ class _RecallFromTrace(TraceOracle):
         # Misfires are drawn from OUTSIDE the whole truth, never from the recall-dropped part --
         # otherwise a dropped expert returns as a "false positive", is used when the layer arrives,
         # and the arm's realised precision quietly exceeds the requested one.
-        tset = {e[1] for e in truth}
+        # A MISFIRE MUST BE GENUINELY USELESS. Drawing from the complement of THIS CALL's route
+        # made job 925 measure prefetch BREADTH, not precision: a layer touches 237 of its 384
+        # experts across 100 steps, so an expert wrong for this step is very likely right for a
+        # later one, and "wasted" counted fetches that the cache went on to use. Lower precision
+        # then measured monotonically FASTER and beat the oracle. The draw is now from the
+        # complement of the layer's WHOLE-TRACE expert set, so a misfire is an expert this layer
+        # never wants at any step in the window.
+        tset = _layer_ever_used.get(truth[0][0], frozenset())
         want_wrong = int(round(len(keep) * (1.0 - self.precision) / max(self.precision, 1e-9)))
         wrong, L0 = [], truth[0][0]
         e = (hash((layer, step)) & 0x7fffffff) % self.n_experts
