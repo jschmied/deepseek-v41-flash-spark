@@ -416,6 +416,25 @@ Having mistaken the wrong instant for a defect twice tonight already (640 and 64
 queued, and after a full sync plus loader quiesce — with each wrong slot labelled fresh-load or
 cache-hit.
 
+## Job 665 — the 38 are real: wrong at every instant (2026-09-18)
+
+    checked=160
+    (1) before graph B queued : WRONG=38
+    (2) after  graph B queued : WRONG=38
+    (3) after sync + quiesce  : WRONG=38
+
+Identical at all three, so it is **not** a host-read-races-the-device artifact — instant (3) follows
+a full device sync and a loader quiesce. It is also not the end-of-step recycling confound that
+withdrew jobs 640 and 645: recycling would make (3) larger than (1), and it is equal. And it is
+decode-only: job 655 audited the prefill path at the same relative point and found 0 of 154.
+
+The discriminator job 665 failed to print is where each mapping came from. Decode resolves a key
+three ways — an `lru` hit, a `transient_map` hit, or a miss into `_lru_slot_for` — and only the
+second is the one v1 does differently, by calling `_promote_transient` instead of reading the ring
+in place. Since job 655 showed the ring **is** stale at rest, a decode hit on a ring key would read
+exactly those stale bytes. That mechanism fits every measurement so far and is the review's own P1,
+currently sitting in the suite as an `xfail`. Job 670 labels all 160 instead of counting them.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
