@@ -178,3 +178,34 @@ This is the cross-model check the RFC asked for, and the answer is a negative wo
 
 **Scope**: P0 prompt, 3 reps, temperature 0, single stream. The 622-1,383 slot rungs are pathological
 (hit 0.015-0.467), not serving configurations -- they exist to locate a cliff, and there isn't one.
+
+### Horizon has an optimum, and the ceiling I reported was an artifact of missing it (job 910)
+
+Same session, same null, so these are comparable to each other and **not** to job 900's:
+
+| arm | span | steps/s | vs null |
+|---|---|---|---|
+| null | 19.090 s | 3.248 | — |
+| recall 0.60, h4 | 12.821 | **4.836** | **+48.9 %** |
+| recall 0.60, h8 | 12.964 | 4.782 | +47.2 % |
+| recall 0.60, h16 | 13.149 | 4.715 | +45.2 % |
+| oracle, h4 | 10.947 | 5.663 | **+74.4 %** |
+| oracle, h8 | 10.942 | 5.666 | +74.4 % |
+
+**Horizon peaks at 4**: h1 +32.9, h2 +31.8, h4 +48.9, h8 +47.2, h16 +45.2. SP-MoE's distance decay
+is real after all -- it bites beyond 4, not at 2, which is why job 900's h1/h2/h4 slice looked like
+"longer always wins".
+
+**The +60.4 % ceiling was an h2 artifact.** At h4 the oracle reaches **+74.4 %**, close to the
+predicted +81-84 % and far from what I reported an hour ago. The tell was already in job 900: 17,610
+of the oracle's 18,780 prefetches arrived LATE. That was a lead-time failure being read as an engine
+limit. h8 ties h4 exactly, so the oracle is saturated at h4.
+
+**A methodological correction that invalidates some of my own arithmetic.** The null arm measured
+3.474 steps/s in job 900 and **3.248** in job 910 -- a **6.5 % run-to-run swing on the arm that is
+supposed to be the fixed reference**. Every cross-job percentage I computed tonight inherits that
+error. Only same-session comparisons are safe, and the recall→win fractions quoted above from job 900
+(12.9 % for recall 0.305) should be re-measured at h4 in one session before anything rests on them.
+
+What still stands: recall 0.60 at h4 captures 48.9/74.4 = **66 %** of the oracle win for 60 % recall
+-- roughly linear, not the convex shape h2 suggested. The convexity claim was also an h2 artifact.
