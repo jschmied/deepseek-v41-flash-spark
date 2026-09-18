@@ -838,6 +838,31 @@ class Engine:
             self.chain.obs = obs
 
     # ------------------------------------------------------------------ prefill
+    def replay_layer(self, layer: int, ctx: OpContext | None = None) -> None:
+        """One layer of the SWA bounded decoder replay, through THIS engine's cache.
+
+        `Model.decoder_replay` drove layers src+1..39 itself and handed each `block()` v1's
+        ExpertStore, so the shared arena had two owners inside one request. Driving them here gives
+        the replay the same reserve / submit / wait / MoE path as every other layer: one
+        ExpertSlots, one eviction policy, one generation namespace, one ring, one loader.
+
+        `prefill=False` on the reserve, unlike v1, which passed `True` here and therefore put replay
+        experts in its transient RING. These layers run immediately before decode and are read again
+        by it, so the LRU is where they belong -- and it keeps the ring for the one path whose
+        write-then-use ordering makes it safe.
+        """
+        ctx = ctx if ctx is not None else OpContext(self.request_id, self.c.steps, layer)
+        self.loader.drain_forgets()
+        route = self._compute(lambda: self.leaves.decoder_replay_attn(layer))
+        slot_of, to_load, to_wait = self.slots.reserve(layer, route.uniq, prefill=False)
+        self.c.fetches += len(to_load)
+        self.loader.submit(to_load, ctx=ctx, scored=self._scoring)
+        self._wait(to_load + to_wait, ctx, scored=self._scoring)
+        reads = sorted(set(slot_of.values()))
+        self.leaves.await_copies(reads)
+        self._compute(lambda: self.leaves.decoder_replay_moe(layer, route, dict(slot_of)),
+                      slots=reads)
+
     def prefill_chunked(self, layer: int, n_chunks: int, ctx: OpContext | None = None) -> None:
         """Chunked prefill over one layer: the only shape where D3 is reachable.
 

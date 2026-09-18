@@ -389,6 +389,29 @@ class Leaves:
         """
         raise NotImplementedError
 
+    def begin_decoder_replay(self) -> int:
+        """Set up the SWA bounded replay and return the first layer index it will drive.
+
+        `Model.decoder_replay` runs layers `candidate_source_layer+1..39` in its OWN loop, passing
+        `self.store` -- v1's ExpertStore -- into every `block()`. Inside a V2 request that gave the
+        shared arena a second owner: v2 drove layers 0..src through its ExpertSlots while v1's store
+        drove the rest into the same memory, through v1's own transient ring. These four methods
+        exist so the driver owns those layers too.
+        """
+        raise NotImplementedError
+
+    def decoder_replay_attn(self, layer: int) -> "RouteResult":
+        """One replay layer's attention + FFN-in + router. Returns its route, like `layer_a`."""
+        raise NotImplementedError
+
+    def decoder_replay_moe(self, layer: int, route: "RouteResult", slot_of: dict) -> None:
+        """That layer's routed MoE, shared expert and HC residual, once its experts are resident."""
+        raise NotImplementedError
+
+    def finish_decoder_replay(self, need_logits: bool = True):
+        """Head + the DSpark hiddens. Returns (logits, main_hidden, S) as `decoder_replay` does."""
+        raise NotImplementedError
+
     def prefill_moe(self, layer: int, chunk: int, route: "RouteResult", slot_of: dict) -> None:
         """The chunk's routed MoE plus the HC residual, once its experts are resident.
 
@@ -462,6 +485,21 @@ class ModelLeaves(Leaves):
         # caller loads `prefill_calls` before driving a prefill.
         uniq = self.prefill_calls[(layer, chunk)]
         return RouteResult(uniq=uniq)
+
+    def begin_decoder_replay(self) -> int:
+        self.replay_calls = list(getattr(self, "replay_calls", []))
+        return 0
+
+    def decoder_replay_attn(self, layer: int) -> RouteResult:
+        delay(C_PRE / self.scale)
+        return RouteResult(uniq=self.replay_calls.pop(0) if self.replay_calls else ())
+
+    def decoder_replay_moe(self, layer: int, route: RouteResult, slot_of: dict) -> None:
+        delay(C_DEP / self.scale)
+
+    def finish_decoder_replay(self, need_logits: bool = True):
+        delay(C_OTHER / self.scale)
+        return None, None, 0
 
     def prefill_moe(self, layer: int, chunk: int, route: RouteResult, slot_of: dict) -> None:
         # Keeps the mapping for the same reason bind_slots does -- so a provider that ignored the

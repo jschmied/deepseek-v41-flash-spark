@@ -744,6 +744,84 @@ class RealLeaves(Leaves):
             n = pf["tails"][ci][0].size(0)
             m._rep_keep(pf["H"][ci][-n:], pf["PM"][ci][-n:], sh, pf["S0"] + hi - n, n)
 
+    # ------------------------------------------------------------- SWA bounded decoder replay
+    # A TRANSCRIPTION of engine/model.py::decoder_replay, split the way prefill_attn/prefill_moe
+    # split encoder_prefill_layer_major. It exists because that method runs layers
+    # candidate_source_layer+1..39 in its own loop and passes `self.store` -- v1's ExpertStore --
+    # into every block(), so a V2 request had TWO owners writing one arena: v2's ExpertSlots for
+    # layers 0..src and v1's store, through v1's own transient ring, for the rest.
+    #
+    # `Model.moe` and `Model.block` already take `store` as a parameter; only the two top-level
+    # entry points (decoder_replay, forward) hardcode self.store. So the split needed here is at the
+    # LAYER, not at the store argument -- and a bare store swap would not be enough anyway, because
+    # v2's ordering comes from the reader event layer_b records after the MoE, which a v1 loop
+    # bypasses entirely.
+
+    def begin_decoder_replay(self) -> int:
+        m = self.eng.model
+        a = m.args
+        from engine.model import Shared
+        h, pre_mix, topk, cand, S = m._rep_tail()
+        sh = Shared()
+        src = a.candidate_source_layer
+        sh.ckv, sh.ik, sh.ratio = m.c.ckv[src], m.c.ik[src], a.compress_ratios[src]
+        sh.topk, sh.candidates = topk, cand
+        self._dr = dict(h=h, pre_mix=pre_mix, S=S, T=h.size(0), sh=sh, src=src,
+                        main_hiddens=[], y=None, post=None, wts=None, idxs=None)
+        return src + 1
+
+    def decoder_replay_attn(self, layer: int) -> RouteResult:
+        m = self.eng.model
+        a = m.args
+        dr = self._dr
+        w = m.W.layers[layer]
+        if layer in a.dspark_target_layer_ids:
+            dr["main_hiddens"].append(dr["h"].float().mean(dim=1))
+        freqs = m.freqs_c if w.ratio else m.freqs_w
+        h, attn_pre = m.block_attn(dr["h"], dr["pre_mix"], w, layer, dr["S"], dr["sh"],
+                                   m.c.win[layer], freqs, None, win_lo=dr["S"])
+        y, ffn_pre, ffn_post, ffn_comb = m.block_ffn_in(h, attn_pre, w)
+        dr["pre_mix"] = ffn_pre
+        dr["y"] = y
+        dr["post"] = (h, ffn_post, ffn_comb)
+        i_c, w_c = m.moe_route(y, w, layer, a.n_routed_experts)
+        dr["idxs"], dr["wts"] = i_c, w_c
+        flat = i_c.flatten().tolist()
+        return RouteResult(uniq=tuple(sorted(set(flat))), opaque=i_c, flat_cpu=flat)
+
+    def decoder_replay_moe(self, layer: int, route: RouteResult, slot_of: dict) -> None:
+        m = self.eng.model
+        dr = self._dr
+        i_c = route.opaque
+        slots = torch.as_tensor([slot_of[e] for e in route.flat_cpu],
+                                dtype=torch.long, device=i_c.device).view_as(i_c)
+        out = m.moe_apply(dr["y"], slots, dr["wts"], m.W.layers[layer], self.arena)
+        resid, ffn_post, ffn_comb = dr["post"]
+        dr["h"] = _V41REF.hc_post(out, resid, ffn_post, ffn_comb)
+        # THE READER EVENT. layer_b records one per layer so h2d cannot overwrite a slot the graph
+        # is still reading; this path runs the MoE eagerly and owes the same guarantee.
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream())
+        if len(self._last_reader) < self._arena_slots:
+            self._last_reader = [None] * self._arena_slots
+        for sl in set(slot_of.values()):
+            self._last_reader[sl] = ev
+
+    def finish_decoder_replay(self, need_logits: bool = True):
+        m = self.eng.model
+        a = m.args
+        dr = self._dr
+        h, pre_mix = dr["h"], dr["pre_mix"]
+        m.last_h, m.last_pre_mix = h, pre_mix
+        logits = None
+        if need_logits:
+            x = _V41REF.hc_pre(h, pre_mix)
+            x = _V41REF.rmsnorm(x, m.W.norm, a.norm_eps)
+            logits = _V41REF.head_logits(x, m.W.head)
+        m.stats["replay_tokens"] = m.stats.get("replay_tokens", 0) + dr["T"]
+        mh = torch.cat(dr["main_hiddens"], dim=-1) if dr["main_hiddens"] else None
+        return logits, mh, dr["S"]
+
     def bind_slots(self, route: RouteResult, slot_of: dict) -> None:
         """Give graph B its route-aligned slot tensor. This is v1's `self.slots.copy_(slots)`, with
         the mapping coming from v2's ExpertSlots instead of v1's store."""

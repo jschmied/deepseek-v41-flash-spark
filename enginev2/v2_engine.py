@@ -146,7 +146,14 @@ class V2Engine(_ServerEngine):
         for L in range(m.args.candidate_source_layer + 1):
             self.driver.prefill_chunked(L, n_chunks)
         self.leaves.finish_prefill()
-        return m.decoder_replay(need_logits=True)
+        # THE DECODER HALF IS OURS TOO. This used to be `m.decoder_replay(need_logits=True)`, whose
+        # own loop runs layers src+1..39 and passes `self.store` -- v1's ExpertStore -- into every
+        # block(). That gave one request two owners of the shared arena: v2's ExpertSlots for the
+        # encoder half and v1's store, through v1's own transient ring, for the rest.
+        first = self.leaves.begin_decoder_replay()
+        for L in range(first, self.v1.args.n_layers):
+            self.driver.replay_layer(L)
+        return self.leaves.finish_decoder_replay(need_logits=True)
 
     # ------------------------------------------------------------------ the ABC
     def generate(self, prompt_ids, *, max_tokens: int = 4096, temperature: float = 1.0,

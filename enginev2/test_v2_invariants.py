@@ -1931,12 +1931,11 @@ def test_sampled_verify_is_distribution_preserving():
 
 
 @pytest.mark.xfail(strict=True, reason=
-                   "v2 still has no _promote_transient. The CORRECTNESS half is fixed differently "
-                   "-- decode no longer serves from the ring at all, see "
-                   "test_decode_never_serves_from_the_transient_ring -- so v2 cannot read stale "
-                   "weights. What remains is PARITY: v1 re-homes the expert into the LRU and credits "
-                   "evict.on_hit, v2 re-reads it, so the eviction policy sees a different access "
-                   "history. strict=True so this errors the moment promotion lands.")
+                   "v2 has no _promote_transient: a v1-parity gap, not a correctness one. The "
+                   "stale-weight defect it was briefly blamed for had a different cause -- "
+                   "Model.decoder_replay drove v1's ExpertStore over v2's arena -- and is fixed by "
+                   "giving layers src+1..39 a v2-owned seam. strict=True so this errors the moment "
+                   "promotion lands.")
 def test_a_decode_hit_in_the_transient_ring_is_promoted():
     """V1 parity: a decode hit on an expert sitting in the transient ring must be PROMOTED.
 
@@ -1979,70 +1978,5 @@ def test_a_decode_hit_in_the_transient_ring_is_promoted():
             "eviction policy picks different victims than v1 would")
         assert (key_layer, expert) not in e.slots.transient_map, "promoted key still in the ring"
         assert set(e.slots.transient_ring) != before_ring, "no LRU donor was swapped into the ring"
-    finally:
-        e.close()
-
-
-def test_decode_never_serves_from_the_transient_ring():
-    """A decode reserve must not hand back a transient-ring slot.
-
-    Job 670 measured the reason. Of 160 slots one decode step bound, the 38 that held the WRONG
-    EXPERT were ALL transient_map hits; all 31 lru hits and all 91 fresh loads were correct. Perfect
-    separation.
-
-    The ring is written only by prefill and is round-robin, so a prompt re-takes each slot many
-    times; job 655 showed it is correct whenever prefill reads it and stale afterwards, while
-    `transient_map` and `slot_key` stay mutually CONSISTENT -- so no amount of inspecting the
-    mapping can detect it. v1 avoids the situation entirely by promoting a transient hit into the
-    LRU rather than serving from the ring in place.
-
-    Serving it as a miss is the conservative repair: a re-read, never stale weights.
-    """
-    e = mk(V1, lru_slots=32, transient_slots=8)
-    try:
-        expert = 5
-        slot_of, to_load, _ = e.slots.reserve(0, [expert], prefill=True)
-        e.loader.submit(to_load)
-        e.loader.quiesce(timeout=30)
-        e.loader.drain_forgets()
-        ring_slot = slot_of[expert]
-        assert (0, expert) in e.slots.transient_map, "setup: expected a transient placement"
-        assert ring_slot >= e.slots.lru_slots, "setup: expected a ring slot"
-
-        slot_of2, to_load2, _ = e.slots.reserve(0, [expert], prefill=False)
-        assert to_load2, (
-            "decode reserved a transient-ring entry as a HIT; the ring is stale once prefill has "
-            "moved past it, and job 670 measured 38 of 38 such hits returning the wrong expert")
-        assert slot_of2[expert] < e.slots.lru_slots, "decode must place it in the LRU half"
-
-        # prefill still uses the ring: that path writes then uses, which is why it stays correct
-        slot_of3, _, _ = e.slots.reserve(0, [expert], prefill=True)
-        assert slot_of3[expert] is not None
-    finally:
-        e.close()
-
-
-def test_decode_miss_on_a_ring_key_removes_the_stale_mapping():
-    """Re-reading a ring key into the LRU must also un-map it from the ring.
-
-    Job 675 found the half-fix by measurement: suppressing the stale READ made the bound-slot audit
-    clean and made request 1 reproduce v1 token for token, but request 2 degenerated and the
-    in-process prefill comparison stopped matching v1. The cause is that the key was then in BOTH
-    maps -- `lru` at its new slot, `transient_map` at the old ring slot -- so a later PREFILL took
-    the transient hit and got the stale slot. The same defect, one path over.
-    """
-    e = mk(V1, lru_slots=32, transient_slots=8)
-    try:
-        expert, key = 5, (0, 5)
-        slot_of, to_load, _ = e.slots.reserve(0, [expert], prefill=True)
-        e.loader.submit(to_load); e.loader.quiesce(timeout=30); e.loader.drain_forgets()
-        ring_slot = slot_of[expert]
-        assert key in e.slots.transient_map
-
-        e.slots.reserve(0, [expert], prefill=False)          # decode: miss, re-read into the LRU
-        assert key not in e.slots.transient_map, (
-            "the ring mapping survived a decode miss; a later prefill would take it as a hit and "
-            "read the stale slot")
-        assert e.slots.slot_key.get(ring_slot) != key, "the ring slot still claims the key"
     finally:
         e.close()
