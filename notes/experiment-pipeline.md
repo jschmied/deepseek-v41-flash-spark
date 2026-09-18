@@ -51,14 +51,23 @@ its missing Triton gate. That job cost a real queue slot and measured nothing.
 
 ## Still to build, from the same review
 
-- **A permanent decode-kernel fixture** from captured real data (y, route ids/weights, the CB3
-  records, real distinct-expert shapes), producing bitwise + latency + regs/spills/shared in one
-  invocation, at T=6 typical (~12 distinct), T=6 high-distinct, and T=24. Jobs 790/810/850/860 each
-  rebuilt a worse version of this.
-- **A prefill-memory stress fixture** that reproduces the peak by constructing the same
-  `begin_prefill()` state and running the worst-memory chunk/layer configuration. Correlate it once
-  against the real 26.4k run; thereafter unsafe arena/scratch/chunk settings are rejected in seconds
-  and only survivors get the long prompt.
+- ~~A permanent decode-kernel fixture~~ **BUILT**: `payloads/kernel_fixture.py`. One invocation,
+  fail-fast in increasing cost -- compile metadata (regs/spills/shared), then bitwise, then latency,
+  aborting at the first failure so a kernel that spills is never benchmarked and one that changes
+  the answer is never timed. Shapes are the engine's: T=1 (MTP single token), T=6 (~12 distinct, the
+  common decode case), T=6 high-distinct (worst cache case), T=24. `--packed` compares a
+  packed-scale arena against an unpacked one; the default self-comparison proves the fixture itself
+  is sound. Scale data is generated representably (base + 0-7), since random bytes would make it a
+  test of the generator -- which is how job 795 was wasted.
+- **A prefill-memory stress fixture** -- `payloads/prefill_stress.py` written, **not yet
+  correlated**. Runs one full chunk of the worst shape through the real forward for a few layers and
+  reports `torch peak - post-load baseline`, which is the transient the arena cannot have. It
+  deliberately does NOT decide on host MemAvailable: the caching allocator does not return freed
+  blocks to the OS, so that number is the process lifetime maximum -- the error that made jobs
+  720/735/745 conclude prefill cost was flat in chunk size when job 750 showed it is not. It is a
+  PREDICTOR: it must be correlated once against a real 26.4k run before any decision rests on it,
+  and a configuration it accepts still gets one real confirmation. What it buys is rejecting unsafe
+  settings in seconds instead of ~75 s, so the arena/scratch/chunk search can be wide.
 - **State-based stopping** instead of fixed repetitions: warm until hit rate and NVMe/token move less
   than a threshold over two consecutive windows, then measure two paired windows. Job 715 needed six
   reps because it was still climbing; that does not make six reps right everywhere. A +16 % effect

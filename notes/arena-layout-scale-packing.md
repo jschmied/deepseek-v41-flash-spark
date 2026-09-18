@@ -198,3 +198,47 @@ is `_cb3v3_up_kernel`'s own `n_regs` after the change, measured the same way.
 Each cost a queue slot and none measured anything. 860 was **compile-checked locally before being
 queued**, which caught a fifth (`s[:, 0]` scalar indexing is unsupported -- the real code uses
 `_split8`, which the probe now imports rather than reimplements). That check is the rule from here.
+
+---
+
+## Change A is implemented (2026-09-18)
+
+`DSV41_PACKED_SCALES=1`, default off. **Five sites**, not the two the plan named:
+
+| site | what changed |
+|---|---|
+| `CB3Arena.__init__` | scale planes sized by the declared layout; `CB3_BYTES_PER_SLOT_PACKED` so the engine's slot budget follows it |
+| `_cb3v3_block_dot` + both v3 kernels | `PACKED` constexpr; `_scales_blk` takes the ROW pointer, since packed needs the row base as well as the block's bytes |
+| `CB3ArenaV2.load_slot` | packs via a new `SC.pack_torch` (the builder packs host-side in numpy; the checkpoint path needs a device-side twin) |
+| `CB3Cache.load_slot` | copies the record's bytes verbatim — **three device-side `_unpack_scales` per miss disappear** |
+| `_unpack_into` | **expands** into the FP4 scratch |
+
+That last site was invisible to the plan and to the design review. The bitwise gate found it by
+crashing: `moe_forward_v3` delegates to `moe_forward_prefill` at `P >= 65`, and `_unpack_into` copied
+scale planes verbatim into a scratch that always holds one byte per group — 61-byte rows into
+160-byte ones. It is on the prefill path even though the decode kernels never reach it.
+
+### Gates, all local — no GPU queue slot, no arena load
+
+```
+registers  up   250 -> 254   0 spills either way   (only BM=16/BN=32 is ever selected)
+           down 128 -> 148   4 spills -> 0         (the packed form REMOVES existing spills)
+bitwise    T=1 / T=6 / T=6 high-distinct / T=24 -- identical, max|d| 0.000e+00
+latency    -2.6 / -0.8 / -2.4 / +2.2 %  -- neutral, within sub-window spread
+paths      checkpoint load, prefill delegation, dequant_slot all agree
+codec      pack_torch byte-identical to the numpy pack it mirrors, 3 shapes
+capacity   14,454,784 -> 13,773,312 B/slot = +4.948 %; 5,949 -> 6,243 slots at 86 GB
+```
+
+The constant is asserted against a real arena's `bytes_per_slot` rather than trusted.
+
+### Open
+
+**The up kernel is at 254 of 255 registers.** It passes and does not spill, but one register is not
+a margin to ship on — the next edit to that kernel tips it. Row-hoisting the base does not help
+(tested in the real kernel, not the probe: still 254), so the cost is the three byte loads. An
+aligned `int32`-word layout would buy headroom at +3.687 % instead of +4.948 % capacity; it does not
+compile yet and is the obvious next attempt.
+
+**Not included**: record-major storage so a miss is one H2D. The arena remains twelve plane-major
+tensors. Separate change, separate benchmark.
