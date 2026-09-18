@@ -492,11 +492,46 @@ bytes into the LRU — worse than reading them once. Nobody has audited v1's rin
 it decides the fix: v1 clean means the defect is in v2's ring WRITE path and neither repair is
 right; both stale means promotion is the answer.
 
+## The hidden second owner — `decoder_replay` drives v1's store over v2's arena (2026-09-18)
+
+`V2Engine` builds `V41Engine` with `warm_start=False`, and both sides document the invariant: v2 is
+the sole owner of residency over the shared arena. But `_prefill()` ends with
+`return m.decoder_replay(need_logits=True)`, and `decoder_replay` (engine/model.py:985-986) runs
+layers `src+1..39` as `self.block(..., True, self.store, self.arena, ...)` — **`self.store` is v1's
+ExpertStore**. `Model.moe()` then calls `store.resolve(L, indices, True)`, so those layers allocate
+through **v1's own transient ring** and write the **same physical arena**.
+
+    layers  0..20   V2 ExpertSlots + V2 loader  ->  arena
+    layers 21..39   v1 ExpertStore              ->  the SAME arena
+
+v1's ring writes the high-numbered slots, which is exactly where job 670 found its perfect split
+(38/38 ring hits wrong, 0/91 fresh, 0/26 LRU). It also explains job 675's second request: request 1's
+v1 `transient_map` survives, v2 rewrites those slots during request 2's encoder prefill, and request
+2's `decoder_replay` then takes a v1 transient HIT whose bytes v2 has overwritten — corruption
+inside the replay, before any v2 decode repair can act. That makes 675's unattributed prefill
+difference a specific mechanism.
+
+**Job 680 is withdrawn**: auditing a standalone v1 cannot discriminate this, since standalone v1 has
+one store and one arena. **And my reading that "if v1's ring is stale too, promotion is the answer"
+is withdrawn as well** — `_promote_transient` does not reload the expert, it re-homes the existing
+slot, so promoting a stale slot would preserve the wrong bytes.
+
+Job 685 audits v1's `transient_map` against physical bytes at three points (before request-1 replay,
+after it, and after request-2's v2 prefill but before request-2's replay), plus a diagnostic arm
+that clears v1's bookkeeping before the second replay.
+
+**The production fix, if confirmed, is not that clear.** It is to stop calling the hidden store:
+give layers 21..39 the same seam v2's prefill already uses — one `ExpertSlots`, one eviction policy,
+one generation namespace, one ring, one loader. And the current "decode never uses the ring" patch
+should not survive it; at 0.73 tok/s it is compensating for dual-owner corruption rather than
+repairing anything.
+
 ## Not yet gated
 
-`V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
-is wired and unexercised, and the grammar gate has only been run against a CPU fake, never against
-`server/tool_grammar.py`.
+`--engine v2` HAS been through the HTTP layer (job 600: health, models, two chat completions, SSE
+with a usage frame, per-request `x_engine_stats`). What remains untested there is the **grammar and
+tool path**: the gate has only ever run against a CPU fake, never against `server/tool_grammar.py`,
+and no request carrying tools has been served.
 
 **v2 generation is REQUEST-HISTORY DEPENDENT** (jobs 565, 575, 585, 595) where v1 is reproducible
 (570). Job 620 localized it: three requests of one prompt in one process gave **bitwise identical
