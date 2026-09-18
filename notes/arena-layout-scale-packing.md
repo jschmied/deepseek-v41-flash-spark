@@ -61,3 +61,37 @@ The file has the same 2× expansion, so shrinking it is a change on both sides. 
   5,949 slots, +25 %) as 3.78 → 5.17 tok/s (**+37 %**), superlinear because the hit rate climbs.
 - [ring-lending-port-and-prefill-memory.md](ring-lending-port-and-prefill-memory.md) — the other two
   ways to get slots back, both of which compose with this one.
+
+---
+
+## Both gates passed (2026-09-18)
+
+**Losslessness on the arena's own data — job 790.** 87 real resident scale planes packed and
+unpacked with `scale_codec`: **0 bad, EXACT**. This is stronger than the manifest's guarantee: the
+file round-trips by construction because it is built with that codec, whereas these are the planes as
+they sit in the arena after `load_slot`.
+
+**Kernel cost — job 810**, the same arithmetic as a real Triton kernel rather than a torch stand-in:
+
+```
+rows=2304 groups=160 (lanes padded to 256)   intra-row range 7
+plain 160 B/row   packed 61 B/row   (61.9 % smaller)
+BITWISE IDENTICAL   max|d| 0.000e+00
+IN TRITON: plain 6.2 us   packed 6.2 us   +0.0 us (+0.3 %)
+```
+
+**The unpack is free.** Job 790's torch stand-in had said +281 %; that was an artifact of torch
+running reshape/shift/gather as separate kernels with materialised intermediates, where Triton fuses
+the extract into registers around a load the kernel already performs. The denominator that 790 lacked
+turns out not to matter — the added cost is +0.0 us absolute.
+
+Three attempts failed before this one, all my errors and none of them measuring anything: synthetic
+scales with intra-row range 63 (the codec needs <= 7); a `@jit` kernel in a heredoc (Triton reads the
+defining source file); `tl.arange(0, 160)` (must be a power of two). Recorded because each cost a
+queue slot.
+
+### Verdict: build it
+
+Expected: +4.70 % slots (5,949 -> 6,228 at 86 GB), worth ~+16 % decode on job 715's measured slope,
+plus a miss collapsing from nine plane copies and three device-side `_unpack_scales` into one
+contiguous 13.77 MB copy once the slot is byte-identical to the record.
