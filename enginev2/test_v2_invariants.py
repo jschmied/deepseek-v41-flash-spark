@@ -1980,3 +1980,43 @@ def test_a_decode_hit_in_the_transient_ring_is_promoted():
         assert set(e.slots.transient_ring) != before_ring, "no LRU donor was swapped into the ring"
     finally:
         e.close()
+
+
+def test_decode_step_is_a_sequence_position_not_a_per_call_counter():
+    """decode(2) twice must observe steps 0,1,2,3 -- never 0,1,0,1.
+
+    This is the invariant behind jobs 825/880: `step` was `range(steps)`, so every decode() call
+    restarted at 0, and RealLeaves.select_block() deliberately does nothing at step 0 (it leaves
+    block_ids as they are). After a 30-step warm-up the first timed step replayed the warm-up's last
+    block and then resumed at corpus block 1 -- sequence 29, 1, 2, 3 at positions 30, 31, 32. The
+    harness spent three GPU jobs looking for a bad ROUTE_BASE that was never wrong; the engine was
+    generating a genuinely different sequence.
+
+    It is a production bug too, not only a harness one: serving calls decode(1) repeatedly, so every
+    invocation looked internally like step 0 and select_block never advanced the block at all.
+
+    CPU-only and fake-leaved on purpose -- this must be checkable before anything is queued.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+    e = Engine(V2, lru_slots=5328, transient_slots=400, scale=SCALE,
+               leaves=ModelLeaves(calls, Bandwidth(scale=SCALE), scale=SCALE, start=cut))
+    e.warm(calls, cut)
+    seen = []
+    orig = e.leaves.select_block
+
+    def spy(step):
+        seen.append(step)
+        return orig(step)
+
+    e.leaves.select_block = spy
+    e.decode(2)
+    e.decode(2)
+    assert seen == [0, 1, 2, 3], f"expected sequence positions [0,1,2,3], observed {seen}"
+
+    # The measurement counters are independent: replacing them must not move the sequence.
+    before = e.seq_step
+    e.c = type(e.c)()
+    e.decode(1)
+    assert seen == [0, 1, 2, 3, 4], f"a counter reset moved the sequence: {seen}"
+    assert e.seq_step == before + 1

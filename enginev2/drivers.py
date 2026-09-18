@@ -195,6 +195,8 @@ class Engine:
         # these -- see ExpertSlots.reserve_speculative's protected_slots.
         self._layer_slots: frozenset = frozenset()
         self.c = Counters()
+        # Sequence position, distinct from the measurement counters above. See decode().
+        self.seq_step = 0
         self.hostprof = HostPhases(os.environ.get("DSV41_HOST_PROFILE") == "1")
         self._route_dump = [] if os.environ.get("DSV41_ROUTE_DUMP") else None
 
@@ -670,9 +672,25 @@ class Engine:
                            scored=self._scoring)
 
     def decode(self, steps: int) -> Counters:
-        """Run `steps` decode steps. Where the expert ids come from is the provider's business."""
+        """Run `steps` decode steps. Where the expert ids come from is the provider's business.
+
+        SEQUENCE POSITION IS NOT A MEASUREMENT COUNTER. `step` used to be `range(steps)`, so every
+        decode() call restarted at 0 -- and RealLeaves.select_block() deliberately does nothing at
+        step 0, leaving block_ids as they were. After a 30-step warm-up the first timed step
+        therefore REPLAYED the warm-up's last block and then resumed at corpus block 1, giving the
+        sequence 29, 1, 2, 3, ... at positions 30, 31, 32. That is why job 825/880 saw 0 of 2400
+        timed routes match while the warm-up matched 1200/1200: nothing was mis-looked-up, the
+        engine was genuinely generating a different sequence.
+
+        It also mattered outside the harness: production calls decode(1) repeatedly, so every
+        invocation looked internally like step 0 and select_block never advanced the block at all.
+
+        `self.seq_step` is the sequence position and is NEVER reset. `self.c` is the measurement
+        window's counters and may be replaced freely between windows.
+        """
         t0 = time.perf_counter()
-        for step in range(steps):
+        for _ in range(steps):
+            step = self.seq_step
             # EDGE 8: this step's inputs depend on the PREVIOUS step's logits, through draft and
             # verify. Waited on before anything else runs, and the step-level event is keyed by step
             # number so the reset below cannot delete it before it has been consumed -- which is
@@ -712,6 +730,7 @@ class Engine:
                                          scored=self._scoring))
             self.chain.set("logits", step, ctx=ctx, scored=self._scoring)
             self.c.steps += 1
+            self.seq_step += 1        # sequence position: survives every counter reset
         self.c.wall_s = time.perf_counter() - t0
         # The window boundary, not the total: speculation issued near the last layer has not begun
         # reading yet. finalize_stats() settles it.

@@ -84,6 +84,21 @@ ENGRAM = os.environ["ENGRAM"] == "1"
 # 1.74/1.85/1.86 (job 140), and offline 94.07 % hit / 52.3 fetches per step against 92.67 % / 64.6
 # (phase 1). Running the A/B on the worse policy is a fair comparison at the wrong operating point.
 EVICT = os.environ.get("EVICT", "lru")
+# ONE PARSE, ONE BANNER. Six configuration failures in this harness so far were each a value read
+# independently somewhere and defaulted differently somewhere else: keep_free 20 vs 12, transient
+# slots 8 vs 400, ENGRAM implicit, the eviction policy implicit, worker/staging/read-QD off
+# production, and the step counter represented in two places. Printing the resolved configuration
+# BEFORE the model loads turns those into a one-second failure instead of a wasted arm.
+CFG_TS = int(os.environ.get("TRANSIENT_SLOTS", 400))
+CFG_KF = float(os.environ.get("KEEP_FREE_GB", 20))
+CFG = dict(arena_gb=float(os.environ.get("ARENA_GB", 40)), keep_free_gb=CFG_KF,
+           transient_slots=CFG_TS, evict=EVICT, arm=ARM, horizon=HORIZON,
+           recall=float(os.environ.get("RECALL", 0.305)),
+           precision=float(os.environ.get("PRECISION", 1.0)),
+           workers=int(os.environ.get("N_WORKERS", 8)), staging=int(os.environ.get("STAGING", 8)),
+           read_qd=int(os.environ.get("READ_QD", 8)),
+           h2d_inflight=int(os.environ.get("H2D_INFLIGHT", 2)))
+print("  CONFIG " + "  ".join(f"{k}={v}" for k, v in CFG.items()))
 
 
 def build(eng, obs=None, prefetch=None):
@@ -95,8 +110,13 @@ def build(eng, obs=None, prefetch=None):
     # 50bfdf2, so it stays available for a like-for-like comparison and is never the silent state.
     src = RealEngramSource(eng, rl) if ENGRAM else None
     rl.engram = src
-    e2 = v2drivers.Engine(Policy(), evict=EVICT, lru_slots=eng.store.n_slots - 8,
-                          transient_slots=8,
+    # TRANSIENT_SLOTS MUST BE THE SAME NUMBER IN BOTH ENGINES. This used to pass 8 while V41Engine
+    # above was given .env's 400, so the MEASURED v2 driver silently ran with 392 extra LRU slots --
+    # and that is exactly the quantity an oracle experiment depends on: baseline miss rate, eviction
+    # pressure, speculative capacity, and therefore the apparent value of prediction. The run would
+    # report production parity while not having it.
+    e2 = v2drivers.Engine(Policy(), evict=EVICT, lru_slots=eng.store.n_slots - CFG_TS,
+                          transient_slots=CFG_TS,
                           # ENV-OVERRIDABLE. These were fixed at 8/8/8/2 while production runs
                           # io 48/96, and job 545 then saturated at 2.8 GB/s with the queue full
                           # (depth-0 1.8 %, mean depth 5.7) against a device that does ~6.3 from
@@ -160,9 +180,9 @@ def warm_policy_BROKEN(e2, rl, routes, steps, n_layers):
 # the difference between starting and "refusing to start: ... + 20.0 GB floor (keep_free) = 109.6
 # GB, but MemAvailable is 109.5" -- a refusal by 0.1 GB that has nothing to do with the experiment.
 eng = V41Engine(os.path.expanduser("~/dsv41-lean"), max_seq=8192,
-                arena_gb=float(os.environ.get("ARENA_GB", 40)),
-                keep_free_gb=float(os.environ.get("KEEP_FREE_GB", 20)),
-                transient_slots=int(os.environ.get("TRANSIENT_SLOTS", 400)),
+                arena_gb=CFG["arena_gb"],
+                keep_free_gb=CFG_KF,
+                transient_slots=CFG_TS,
                 spec=True, expert_format="cb3")
 N_L = eng.args.n_layers
 ids = eng.tokenizer.encode(
