@@ -334,6 +334,27 @@ The ring is written only by `reserve(prefill=True)` and read by decode taking a 
 hit. Job 645 audits the ring immediately after prefill and again after one decode step, which
 separates a prefill-path defect from a decode-path one.
 
+## Job 645 — 120 of 120, which contradicts a gate, so the AUDIT is now the suspect
+
+    AFTER PREFILL, before any decode: ring entries checked=120 WRONG=120
+    AFTER one decode step:            ring entries checked=120 WRONG=120
+
+**A 100 % failure rate is the finding, and it points at the instrument.** Job 536 gates v2 prefill
+as bitwise identical to v1's layer-major pass, and prefill READS the routed experts out of exactly
+these ring slots — `moe_forward_prefill` unpacks into a separate scratch and does not write the
+arena. If every ring slot held wrong bytes, prefill could not have matched v1. Both results cannot
+be true.
+
+The audit is the newer and less-gated of the two, and its reference — a fresh `cache.read_into` plus
+`cache.load_slot(scratch, 0, buf)` — has never been validated against a slot whose contents are
+known. **Job 640's 99 and job 645's 120 are both SUSPENDED pending job 650**, which writes a known
+expert into a chosen slot through the loader's own path and then audits it: the answer must be
+"matches", for an LRU slot and a ring slot alike.
+
+Three mechanisms of mine have already been refuted tonight (slot-order reduction, a missing
+`_pending_slots` guard, and end-of-step recycling), so this one is not being written up as a defect
+until the instrument is shown to work.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
