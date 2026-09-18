@@ -155,8 +155,14 @@ def warm_policy_BROKEN(e2, rl, routes, steps, n_layers):
     return seen
 
 
+# KEEP_FREE_GB and TRANSIENT_SLOTS are read here because this harness used to take V41Engine's
+# signature defaults (keep_free 20) while every queue job passes .env's 12. At ARENA_GB=86 that is
+# the difference between starting and "refusing to start: ... + 20.0 GB floor (keep_free) = 109.6
+# GB, but MemAvailable is 109.5" -- a refusal by 0.1 GB that has nothing to do with the experiment.
 eng = V41Engine(os.path.expanduser("~/dsv41-lean"), max_seq=8192,
                 arena_gb=float(os.environ.get("ARENA_GB", 40)),
+                keep_free_gb=float(os.environ.get("KEEP_FREE_GB", 20)),
+                transient_slots=int(os.environ.get("TRANSIENT_SLOTS", 400)),
                 spec=True, expert_format="cb3")
 N_L = eng.args.n_layers
 ids = eng.tokenizer.encode(
@@ -250,7 +256,49 @@ print(f"  loaded {len(routes)} recorded routes from {ROUTES}")
 
 # ---- the timed arm, in its own process, from its own cold engine and prefill
 obs = TraceObserver(capacity=1 << 18)
-pf = TraceOracle(routes, HORIZON) if ARM == "oracle" else None
+# ARM=recall wires RecallOraclePrefetcher, which until 2026-09-18 existed but was never reachable
+# from this harness -- so the recall->win curve its docstring promises had never been measured
+# against a scheduler. It subclasses the same TraceOracle truth, degraded to RECALL activation
+# recall and PRECISION precision, so the null / recall / oracle arms differ in exactly one thing.
+class _RecallFromTrace(TraceOracle):
+    """TraceOracle degraded to a fixed recall/precision, keeping this harness's `base` offset."""
+    name = "recall_oracle"
+
+    def __init__(self, routes, horizon, recall, precision, n_experts=384):
+        super().__init__(routes, horizon)
+        self.recall, self.precision, self.n_experts = recall, precision, n_experts
+
+    def predict(self, layer, uniq, step):
+        truth = super().predict(layer, uniq, step)
+        if not truth:
+            return truth
+        # Deterministic in the key, not resampled per call: the same expert must be predicted
+        # consistently or the arm measures churn instead of recall.
+        keep = tuple(e for e in truth
+                     if ((hash((e[0], e[1], layer)) & 0xffff) / 65535.0) < self.recall)
+        if self.precision >= 1.0 or not keep:
+            return keep
+        # Misfires are drawn from OUTSIDE the whole truth, never from the recall-dropped part --
+        # otherwise a dropped expert returns as a "false positive", is used when the layer arrives,
+        # and the arm's realised precision quietly exceeds the requested one.
+        tset = {e[1] for e in truth}
+        want_wrong = int(round(len(keep) * (1.0 - self.precision) / max(self.precision, 1e-9)))
+        wrong, L0 = [], truth[0][0]
+        e = (hash((layer, step)) & 0x7fffffff) % self.n_experts
+        while len(wrong) < want_wrong:
+            if e not in tset:
+                wrong.append((L0, e))
+            e = (e + 7919) % self.n_experts
+        return keep + tuple(wrong)
+
+
+if ARM == "oracle":
+    pf = TraceOracle(routes, HORIZON)
+elif ARM == "recall":
+    pf = _RecallFromTrace(routes, HORIZON, float(os.environ.get("RECALL", 0.305)),
+                          float(os.environ.get("PRECISION", 1.0)))
+else:
+    pf = None
 e2, rl = build(eng, obs=obs, prefetch=pf)
 rl.attach(eng, nb(lg, 0), next_block=nb)
 # DOES THE ORACLE ACTUALLY KNOW THE FUTURE? Pass 2 must walk the same route sequence pass 1
@@ -268,7 +316,10 @@ def check(L, _f=_la2):
     ok = want == r.uniq
     agree[0 if ok else 1] += 1
     if not ok and agree[1] == 1:
-        print(f"  first mismatch at key {(e2.c.steps, L)}: "
+        # print the key ACTUALLY looked up, not a reconstruction: the old message omitted
+        # ROUTE_BASE and so could not distinguish a bad base from a real divergence.
+        print(f"  first mismatch at LOOKUP key {(ROUTE_BASE + e2.c.steps, L)} "
+              f"(base={ROUTE_BASE} steps={e2.c.steps}): "
               f"recorded {None if want is None else want[:6]} got {r.uniq[:6]}  "
               f"(recorded keys start {sorted(routes)[:2]})")
     return r
@@ -294,6 +345,12 @@ if _warm:
     if agree[1]:
         raise SystemExit(f"ABORT: {agree[1]} route divergences during the WARM-UP itself")
     ROUTE_BASE = _warm
+    # WHOSE COUNTER IS THIS? The harness replaces e2.c above, but drivers.py:774-775 ALSO swaps
+    # self.c and explicitly carries `steps` across its own swap. Two owners of one attribute, and
+    # the scorer's key is ROUTE_BASE + e2.c.steps -- so if steps does not actually restart at 0 the
+    # timed window is compared against recorded steps 60.. while generating 30.., which diverges
+    # totally and looks exactly like job 825's "0 of 2400 matched". Print it instead of assuming.
+    print(f"  after warm-up reset: e2.c.steps={e2.c.steps} (expected 0), ROUTE_BASE={ROUTE_BASE}")
     agree[0] = agree[1] = 0                  # the timed window is scored on its own
     if pf is not None:
         pf.base = _warm                      # the oracle must read the TIMED window's routes
@@ -390,3 +447,14 @@ if ARM == "oracle":
     if e2.pf.pred_miss or e2.pf.issued == 0:
         raise SystemExit(f"ABORT: not an oracle -- pred_miss={e2.pf.pred_miss} "
                          f"issued={e2.pf.issued}; it is not reading the timed window's routes")
+elif ARM == "recall":
+    # The SAME trap, and the recall arm is more exposed to it: a recall-degraded oracle that reads
+    # the warm-up's routes issues nothing and looks exactly like "prefetch does not help at this
+    # recall", which is the conclusion this arm exists to test. It must issue. At precision 1.0 it
+    # only ever names experts that ARE used, so pred_miss must still be 0; below 1.0 the injected
+    # misfires are supposed to miss and the check is dropped.
+    if e2.pf.issued == 0:
+        raise SystemExit("ABORT: recall arm issued nothing -- it is not reading the timed window")
+    if float(os.environ.get("PRECISION", 1.0)) >= 1.0 and e2.pf.pred_miss:
+        raise SystemExit(f"ABORT: precision 1.0 but pred_miss={e2.pf.pred_miss}; the misfire "
+                         f"exclusion is wrong and realised precision is not what was requested")
