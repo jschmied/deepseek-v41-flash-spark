@@ -209,3 +209,38 @@ error. Only same-session comparisons are safe, and the recall→win fractions qu
 
 What still stands: recall 0.60 at h4 captures 48.9/74.4 = **66 %** of the oracle win for 60 % recall
 -- roughly linear, not the convex shape h2 suggested. The convexity claim was also an h2 artifact.
+
+### The clean recall curve, and the oracle is not the ceiling (job 915)
+
+One null, one session, h4 throughout -- both confounds from the earlier runs removed:
+
+| recall | span | steps/s | vs null | % of oracle win |
+|---|---|---|---|---|
+| null | 19.290 s | 3.214 | — | — |
+| 0.15 | 17.960 | 3.452 | +7.4 % | 10.3 % |
+| **0.305** | 16.540 | 3.748 | **+16.6 %** | **23.2 %** |
+| 0.45 | 14.522 | 4.269 | +32.8 % | 45.8 % |
+| 0.60 | 12.711 | 4.878 | +51.8 % | 72.3 % |
+| **0.80** | 10.741 | **5.772** | **+79.6 %** | **111 %** |
+| oracle (1.0) | 11.243 | 5.514 | +71.6 % | 100 % |
+
+**Recall 0.80 beats perfect knowledge.** The oracle issues every prefetch it can -- 18,780, of which
+17,610 arrived late in job 900 -- and saturates the device; recall 0.80 issues fewer and lands more
+of them in time. A "perfect oracle" arm is therefore NOT an upper bound on this engine, and calling
+it the ceiling was wrong. The real optimum is a rate, not a recall: somewhere around 0.8 the benefit
+of knowing collides with the cost of asking.
+
+That reframes the design question. It is not "how much recall does a predictor need" but "how many
+prefetches per step can the device absorb, and which ones" -- a throttling and priority problem that
+a predictor feeds, rather than a prediction-accuracy problem.
+
+**Our untrained transition table (30.5 % recall) is worth +16.6 %**, capturing 23.2 % of the oracle
+win -- below the pre-registered 28-41 % band, but the shape is near-linear in recall up to 0.8, so
+training it toward 0.6 would roughly triple the payoff (+51.8 %). That is the number the "before any
+training compute is spent" decision actually needed, and it took four jobs and two confound fixes to
+get it right.
+
+**Scope**: P0 prompt, 60 timed steps after a 30-step warm-up, 40 GB arena, single stream, recorded
+routes replayed identically in every arm (2480/2480). The recall arms are a recall-degraded ORACLE,
+not a real predictor -- they model what a predictor of that recall would fetch, with precision 1.0.
+A real predictor also misfires, and precision < 1 costs slots and bandwidth that these arms never pay.
