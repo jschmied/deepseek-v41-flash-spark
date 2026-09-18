@@ -318,6 +318,14 @@ def check(L, _f=_la2):
     if not ok and agree[1] == 1:
         # print the key ACTUALLY looked up, not a reconstruction: the old message omitted
         # ROUTE_BASE and so could not distinguish a bad base from a real divergence.
+        # WHICH recorded step does this route actually belong to? The counter and the base are
+        # both correct (job 880 printed steps=0, base=30, key (30,0)) and the routes still diverge
+        # totally, so the question is no longer the lookup -- it is whether the timed window
+        # CONTINUES the warm-up's generation or restarts it. If this route is recorded step 0's,
+        # the window restarted and the whole warm-up/ROUTE_BASE design is wrong.
+        _hit = [k for k, v in routes.items() if k[1] == L and tuple(v) == tuple(r.uniq)]
+        print(f"  this route is recorded at {_hit[:3] if _hit else 'NO recorded step'} "
+              f"(looked up {(ROUTE_BASE + e2.c.steps, L)})")
         print(f"  first mismatch at LOOKUP key {(ROUTE_BASE + e2.c.steps, L)} "
               f"(base={ROUTE_BASE} steps={e2.c.steps}): "
               f"recorded {None if want is None else want[:6]} got {r.uniq[:6]}  "
