@@ -526,6 +526,30 @@ one generation namespace, one ring, one loader. And the current "decode never us
 should not survive it; at 0.73 tok/s it is compensating for dual-owner corruption rather than
 repairing anything.
 
+## Job 685 — the dual owner, proved directly (2026-09-18)
+
+Auditing **v1's** `transient_map` against physical bytes at three points in a v2 request:
+
+    A  before request-1 decoder_replay           entries=0    checked=0   WRONG=0
+    B  after  request-1 decoder_replay           entries=400  checked=80  WRONG=0
+    C  after request-2 v2 prefill, before replay  entries=400  checked=80  WRONG=80
+
+**A** confirms `warm_start=False` does what it promises — v1's store starts empty. **B** shows
+`decoder_replay` populating v1's store with 400 ring entries whose bytes are correct at that moment.
+**C** shows all 80 sampled entries wrong once v2's next prefill has rewritten those physical slots,
+while v1's mapping still points at them.
+
+So request 2's replay consumes v1's stale private mapping into memory v2 has since overwritten —
+corruption inside the replay, before any v2 decode repair can act. That is the cause of the
+request-history dependence, and it is what job 670's perfect split was pointing at.
+
+(The job also printed a prefill comparison, which came back identical in both arms. That line does
+not discriminate — it measures v2's encoder prefill, which was never in doubt. The A/B/C rows are
+the finding.)
+
+This job was queued and then withdrawn as non-discriminating once the mechanism was found by
+reading `model.py:985-986`; it had already started, so the evidence arrived anyway.
+
 ## Not yet gated
 
 `--engine v2` HAS been through the HTTP layer (job 600: health, models, two chat completions, SSE
