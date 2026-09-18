@@ -376,6 +376,27 @@ shape, since 120 of 120 looks far more like a category error than like corruptio
 Job 655 audits the ring **at the moment of use** — inside `prefill_moe`, after the wait — and
 separately compares v2's prefill against v1's *in the same process*, which job 536 never did.
 
+## Job 655 — the ring is innocent; jobs 640 and 645 WITHDRAWN (2026-09-18)
+
+    ring audited AT THE MOMENT OF USE (inside prefill_moe, after the wait): 154 checked, 0 WRONG
+    the same ring audited AT REST:                                          120 checked, 120 WRONG
+    v2 vs v1 prefill IN THE SAME PROCESS: logits, mh, s_rep identical, max|d| 0.000e+00
+
+The ring holds the right bytes whenever anything reads them. "Wrong at rest" is round-robin
+bookkeeping: `_transient_slot_for` re-takes a slot once its layer is done, pops the old key and maps
+the new, so an end-of-step audit sees entries that were superseded after they were used.
+
+**Jobs 640 and 645 are withdrawn.** They measured the wrong instant, not a defect — and the 100 %
+failure rate was the clue that it was a category error rather than corruption. Job 536's gate also
+holds in-process, so that contradiction is gone too.
+
+That returns job 625's observation to unexplained, and it remains the only hard fact: at layer 4,
+identical `h_in`, identical `route`, **different slots**, different `h_out`. Job 630's invariance
+result does not cover it — that was synthetic input through `moe_forward_v3` directly, not the
+captured graph the engine replays, and without the repeated slots and padding a real 7x6 decode
+block produces. Job 660 re-asks it with the audit at the moment of use and records the
+distinct-slot count per layer, since `build_routing_small` emits one block per distinct slot.
+
 ## Not yet gated
 
 `V2Engine` has served real requests (job 560) but has NOT been through the HTTP layer: `--engine v2`
