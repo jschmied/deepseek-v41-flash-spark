@@ -116,3 +116,65 @@ it is the kind of parameter this project has previously left implicit and then b
 - [SP-MoE: Speculative Decoding and Prefetching (arXiv:2510.10302)](https://arxiv.org/pdf/2510.10302)
 - [A Survey on Inference Optimization Techniques for MoE Models (arXiv:2412.14219)](https://arxiv.org/pdf/2412.14219)
 - [FineMoE / fine-grained expert offloading (arXiv:2502.05370)](https://arxiv.org/pdf/2502.05370)
+
+---
+
+## Both borrowed ideas measured (jobs 900, 905) — one holds, one does not
+
+### Prefetch converts, but less than the analysis said (job 900)
+
+All arms replay the identical route sequence (2480/2480 reproduced), so tokens are equal by
+construction and the window span *is* the throughput comparison. Measured directly, not reconstructed:
+
+| arm | span | steps/s | vs null | demand fetches | ready / late |
+|---|---|---|---|---|---|
+| null | 17.844 s | 3.474 | — | 19,280 | — |
+| recall 0.305, h2 | 16.551 | 3.746 | +7.8 % | 13,560 | 5,722 / 36 |
+| recall 0.60, h2 | 13.540 | 4.579 | +31.8 % | 7,942 | 9,863 / 1,543 |
+| **oracle, h2** | 11.124 | 5.573 | **+60.4 %** | 610 | 1,170 / **17,610** |
+| recall 0.60, **h1** | 13.433 | 4.616 | +32.9 % | | |
+| recall 0.60, **h4** | 12.421 | **4.992** | **+43.7 %** | | |
+
+**Two standing claims are now wrong.** The corrected ceiling put a perfect oracle at **+81-84 %**;
+measured it is **+60.4 %**. And recall 0.30 was to capture **28-41 %** of that win; it captures
+**12.9 %**. The recall→win curve is markedly *convex*, not near-linear — which matters, because the
+whole "our untrained transition table is already at 30.5 % recall" argument rests on the linear
+reading. At 12.9 % of a 60 % ceiling, an untrained table is worth ~8 % and is not obviously worth
+building on.
+
+The mechanism is visible in the last column: the oracle issues 18,780 prefetches and **17,610 arrive
+late**. Beyond some recall the binding constraint stops being knowledge and becomes device bandwidth
+(1.02 GB/s vs null's 0.81). Demand-fetch reduction stays ~1:1 with recall; throughput does not follow
+it, because a late prefetch still blocks -- just on a read already in flight.
+
+**Horizon is not a free parameter, and longer wins.** At fixed recall 0.60: h1 +32.9 %, h2 +31.8 %,
+h4 **+43.7 %**. SP-MoE's distance-decay result does **not** apply at our scale -- lead time still
+dominates. `HORIZON=2` was the harness default that nobody chose, and it was costing ~9 %.
+
+### The union law does NOT transfer (job 905)
+
+RFC #38256's sizing law: *"the expert side's value function is a cliff at the live union, not a
+curve"* -- on OLMoE at batch 8, 24 → 48 slots gave 2.59x decode. Our live union is 916 slots
+(22.9 mean experts/layer/step x 40 layers), measured from job 895's recorded routes.
+
+| slots | x union | % of 100-step working set | tok/s | hit |
+|---|---|---|---|---|
+| 622 | 0.68x | 7 % | 0.68 | 0.015 |
+| 899 | 0.98x | 9 % | 0.81 | 0.202 |
+| 1,383 | 1.51x | 15 % | 1.13 | 0.467 |
+| 2,767 | 3.02x | 29 % | 2.13 | 0.746 |
+| 6,243 (job 875) | 6.8x | 66 % | 6.90 | 0.935 |
+
+**There is no cliff at the union and no plateau above it.** Gain per slot-doubling *accelerates*:
+x1.45 slots -> x1.19 tok/s, then x1.54 -> x1.40, x2.00 -> x1.88, x2.26 -> **x3.24**. The largest
+returns are far ABOVE the union, not at it.
+
+Why it differs: their per-layer union is 35.3 of 64 experts -- **55 % of the pool**, so covering it
+is the whole problem. Ours is 22.9 of 384 -- **6 % of the pool**, while 237 distinct experts per
+layer are touched across 100 steps. Our value function is governed by the **working set (9,492
+slots)**, not the single-step union. The law is real; it is a law about a regime we are not in.
+
+This is the cross-model check the RFC asked for, and the answer is a negative worth telling them.
+
+**Scope**: P0 prompt, 3 reps, temperature 0, single stream. The 622-1,383 slot rungs are pathological
+(hit 0.015-0.467), not serving configurations -- they exist to locate a cliff, and there isn't one.
