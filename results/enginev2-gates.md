@@ -550,6 +550,32 @@ the finding.)
 This job was queued and then withdrawn as non-discriminating once the mechanism was found by
 reading `model.py:985-986`; it had already started, so the evidence arrived anyway.
 
+## Job 690 — FIXED. v2 owns the replay, and the engine is correct (2026-09-18)
+
+    (1) v1 store after a v2 prefill: lru=0 transient_map=0        <- the second owner is gone
+    (2) bound-slot audit: checked=160 WRONG=0
+            TRANSIENT-HIT  ring  n=40  WRONG=0
+            fresh-load     lru   n=53  WRONG=0
+            lru-hit        lru   n=67  WRONG=0
+    (3) reproducible: True
+            run1 [52480, 270, 10869, 294, 30123, 18505, 305, 18967, 18505, 14, 305, 1192]
+            run2 [52480, 270, 10869, 294, 30123, 18505, 305, 18967, 18505, 14, 305, 1192]
+    (4) v2 vs v1 in-process: logits=True mh=True s_rep=True  max|d|=0.000e+00
+
+v1's store stays empty, so `warm_start=False` finally means what it says. The 40 transient-ring hits
+that were 38/38 wrong in job 670 are now all correct — nothing overwrites them any more. Two
+requests in one process produce identical tokens, and those tokens are **v1's own sequence** from
+job 570. And the engine still computes exactly what v1 computes, bitwise.
+
+That closes the request-history dependence that jobs 565, 575, 585, 595, 620, 625, 660, 665 and 670
+were chasing. The cause was `Model.decoder_replay` driving v1's `ExpertStore` over v2's arena
+(model.py:985-986); the fix is `RealLeaves.begin_decoder_replay` / `decoder_replay_attn` /
+`decoder_replay_moe` / `finish_decoder_replay` driven through `Engine.replay_layer`.
+
+**Scope on the speed numbers in that run** (`hit=0.9121 nvme=6.46 GB decode=16.2 tok/s`): a
+12-token generation on a warm cache in the same process. It is not a throughput measurement and must
+not be quoted as one — it says the ring→miss workaround's 0.73 tok/s collapse is gone, nothing more.
+
 ## Not yet gated
 
 `--engine v2` HAS been through the HTTP layer (job 600: health, models, two chat completions, SSE
