@@ -736,8 +736,17 @@ class Model:
             self._ct_i = _i
             _r = _h.sha256(indices.to("cpu").numpy().tobytes()).hexdigest()[:10]
             _s = _h.sha256(slots.to("cpu").numpy().tobytes()).hexdigest()[:10]
+            self._ct_pend = (_i, L, _r, _s)
             if _i <= 200000:
-                print(f"  CT {_i:04d} L{L:02d} route {_r} slots {_s}", flush=True)
+                # the expert->slot MAP around the known first divergence, not just its hash: a hash
+                # says the slots differ, the map says WHICH expert moved and where to.
+                _extra = ""
+                if 2170 <= _i <= 2186:
+                    _e = indices.to("cpu").numpy().reshape(-1)
+                    _sl = slots.to("cpu").numpy().reshape(-1)
+                    _extra = " map " + ",".join(f"{a}:{b}" for a, b in
+                                                sorted(set(zip(_e.tolist(), _sl.tolist()))))
+                print(f"  CT {_i:04d} L{L:02d} route {_r} slots {_s}{_extra}", flush=True)
         cold_of = None
         if getattr(store, "cold", None) is not None and getattr(store, "cold_this_call", None):
             infl = store.cold.promo._inflight
@@ -768,6 +777,13 @@ class Model:
         else:
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+        if os.environ.get("DSV41_COLD_TRACE", "0") == "1" and getattr(self, "_ct_pend", None):
+            import hashlib as _h2
+            _i, _L, _r, _s = self._ct_pend
+            self._ct_pend = None
+            _o = _h2.sha256(routed.to("cpu").float().numpy().tobytes()).hexdigest()[:10]
+            print(f"  CR {_i:04d} L{_L:02d} routed {_o} cold {len(cold_of) if cold_of else 0}",
+                  flush=True)
         self._tap("moe_routed", L, routed); self._tap("moe_shared", L, shared)
         out = routed + shared
         self.stats["moe_s"] += time.perf_counter() - t0
