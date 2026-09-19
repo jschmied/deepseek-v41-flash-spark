@@ -378,3 +378,49 @@ The next measurement worth making is therefore not another prefetch arm. It is a
 concurrency curve — achieved bandwidth and per-read latency against concurrent read count on this
 NVMe — to find out whether `Bandwidth`'s n>=2 saturation is true here. Every number above is
 downstream of that constant.
+
+### The device saturates at ONE concurrent read (job 945)
+
+Real NVMe, O_DIRECT, one 13,774,848 B record per read — the engine's own shape — random offsets over
+a 211.6 GB file so neither page cache nor readahead helps. No engine, no arena, no model.
+
+| conc | aggregate | per-read mean | p99 | model says per read |
+|---|---|---|---|---|
+| 1 | 4.83 GB/s | 2.8 ms | 3.1 | 5.58 GB/s |
+| 2 | 5.15 | 5.3 | 6.1 | 3.41 |
+| 4 | 4.90 | 11.2 | 12.9 | 1.71 |
+| 8 | 4.79 | 22.6 | 32.8 | 0.85 |
+| 16 | 4.77 | 44.7 | 113.7 | 0.43 |
+| 24 | 4.88 | 64.7 | 178.7 | 0.28 |
+| 32 | 4.88 | 84.2 | 173.0 | 0.21 |
+| 48 | 4.91 | 121.0 | 257.8 | 0.14 |
+| 96 | 4.86 | 209.8 | 426.6 | 0.07 |
+
+**`total(n)/n` is the right sharing model.** Per-read latency is 2.8 ms x n to within a few percent
+across two decades of concurrency. `Bandwidth`'s structure is correct and job 940's 5x is real
+physics, not a simulator artifact — 48-way issue stretches every read 43x.
+
+**But the device saturates at n=1, not n=2, and at a lower rate than modelled**: real aggregate is
+flat at **~4.87 GB/s** everywhere, where the model uses 5.58 at n=1 and 6.82 at n>=2. The model is
+optimistic by 15 % at n=1 and **39 %** above it. So modelled reads finish sooner than real ones, and
+a late prefetch costs *more* in reality than jobs 895-940 charged it. Their ordering stands; their
+magnitudes are measured against a device kinder than this one.
+
+### The consequence is a policy split, and it is shippable
+
+There is **no aggregate benefit to read concurrency at all** — 1 read saturates the device. So
+concurrency is purely a latency tax, and the two phases want opposite settings:
+
+* **Prefill** issues reads it will all consume. Aggregate is what matters, aggregate is flat, so
+  concurrency neither helps nor hurts total time. 48 workers is harmless here.
+* **Decode** blocks on *particular* reads. Latency is what matters, and 48-way issue makes the read
+  you are waiting for 43x slower. Every concurrent read beyond the one you need is a tax.
+
+Production ships `io 48/96` globally. On this evidence decode should run a *shallow* reader and only
+prefill a deep one — which is the opposite of one setting for both, and costs nothing to try.
+
+This also reframes the prefetch results one more time. A prefetch is only worth issuing if it will
+complete before its layer arrives; at n concurrent reads that takes 2.8 ms x n. The oracle's failure
+mode in job 900 (17,610 of 18,780 arriving late) was never about knowing *what* to fetch — it is that
+issuing 18,780 reads into a device that serves one at a time cannot possibly land them in time. The
+lever is admission control, and it is bounded by 4.87 GB/s no matter what predicts.
