@@ -111,6 +111,14 @@ class ColdPool:
         ctx = torch.cuda.stream(stream) if stream is not None else torch.cuda.stream(
             torch.cuda.current_stream())
         with ctx:
+            # EVERY write to a slot must invalidate its cached unpacked FP4 copy. Both
+            # Cb3Cache.load_slot and CB3ArenaV2.load_slot do this first; the promotion did not, so a
+            # promoted slot could leave a stale FP4 scratch entry for the prefill path to read. That
+            # is a violation of the arena's documented invariant on its own, independent of whether it
+            # explains the L21 divergence.
+            inv = getattr(hot_arena, "invalidate_scratch", None)
+            if inv is not None:
+                inv(hot_slot)
             if getattr(hot_arena, "rstride", 0) == self.arena.rstride:
                 # Both record-major: ONE contiguous copy, which is the point of the layout.
                 self.arena.promote_into(hot_arena, hot_slot, slot, non_blocking=True)

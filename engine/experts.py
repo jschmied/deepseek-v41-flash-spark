@@ -989,8 +989,12 @@ class ExpertStore:
                 # bytes_read made nvme_gb fall 168.9 -> 27.6 GB and looked like a 6x win.
                 self.stats["bytes_read"] += self.cold.record_bytes
                 self.stats["loads"] = self.stats.get("loads", 0) + 1
-            # charged as LOAD time, not route time: it is NVMe, and route_s is host bookkeeping
-            self.stats["load_s"] += time.perf_counter() - t_cold
+            # charged as LOAD time, not route time: it is NVMe, and route_s is host bookkeeping.
+            # t_res started before the reservation, so route_s below would otherwise count this wall
+            # a SECOND time -- move the start forward by exactly what was spent here.
+            _cold_wall = time.perf_counter() - t_cold
+            self.stats["load_s"] += _cold_wall
+            t_res += _cold_wall
             self.stats["read_s"] += self.cold.stats["read_s"] - getattr(self, "_cold_read_s0", 0.0)
             self._cold_read_s0 = self.cold.stats["read_s"]
         lut = np.full(self.n_experts, -1, dtype=np.int32)
