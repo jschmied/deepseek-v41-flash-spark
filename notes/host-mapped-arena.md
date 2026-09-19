@@ -256,10 +256,35 @@ should not change any value: every expert still occupies a slot of its own. The 
 layer with no cold experts. So somewhere an expert's slot does not hold that expert's bytes, and the
 shift is a symptom of the same cause rather than the cause itself.
 
-**Next instrument**, chosen because it tests the remaining claim directly instead of adding another
-hypothesis: validate residency itself. For the layers around 2178, re-read each resolved expert from
-the pack and compare it against what its slot actually holds. That says which expert is wrong and
-whether it was ever promoted, and it does not depend on any theory of how it got that way.
+**RESOLVED: the promotion never called `invalidate_scratch(hot_slot)`.** Both `CB3Cache.load_slot`
+and `CB3ArenaV2.load_slot` do it first -- every write to a slot must invalidate that slot's cached
+unpacked-FP4 copy -- and the promotion path did not. So a promoted slot left a stale FP4 scratch entry
+behind, and the five-prompt equality gate now PASSES on all five prompts with every field identical:
+token ids, misses (6,423 / 3,839 / 1,800 / 4,571 / 6,669), hit rates, nvme_gb, accept_len_mean, steps,
+and the resident key set.
+
+Two things about how this was found are worth keeping, because both were my errors.
+
+**I dismissed this hypothesis on reasoning that was too narrow.** The FP4 scratch serves
+`moe_forward_prefill`, and decode at P=36 never takes that path -- so I argued it could not explain a
+decode-time divergence. But *prefill between prompts* does take it, and p3 is the fourth prompt: a
+promotion during p2's decode left a stale scratch entry that p3's prefill then read. The review that
+raised it called it "a real correctness bug regardless, not proven", which was the right calibration;
+mine was worse.
+
+**And the shift was a symptom, exactly as suspected, not the cause.** The one-position slot shift came
+from ON taking a different trajectory once a value went wrong; with the fix the trace-line counts match
+exactly (2,996 in both arms, where ON had been 2,916).
+
+Two by-products of the hunt, both kept:
+
+* `engine/test_promote_plane_major.py` gates the twelve-scatter promotion into a plane-major arena
+  against `CB3Cache.load_slot` over 20 random pack records -- all twelve planes byte-identical. That
+  branch had no gate at all, since the real-record test promotes record-major to record-major.
+* `DSV41_COLD_RESIDCHECK` validates live slot contents against the pack. It reports `cold-inflight`
+  mappings as failures, which is a false positive in the checker rather than a fault: an expert whose
+  promotion is in flight has its bytes in the COLD slot by design. What matters is that it found **zero
+  failures among settled `lru` and `transient` mappings**.
 
 **A correction to an earlier claim in this note.** Job 1105's "bitwise over 2,746 in-engine layers"
 is weaker than stated: its reference recompute ran immediately after the split and would have drawn
