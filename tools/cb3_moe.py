@@ -186,14 +186,14 @@ def _cb3_up_kernel(
     offs_c = tl.arange(0, 8)
     x_base = x_ptr + tok[:, None] * stride_x
     xk = 2 * tl.arange(0, 16)[None, :]
-    lo1 = lo1_ptr + slot * (N * KL) + offs_n[:, None] * KL
-    hi1 = hi1_ptr + slot * (N * KH) + offs_n[:, None] * KH
-    lo3 = lo3_ptr + slot * (N * KL) + offs_n[:, None] * KL
-    hi3 = hi3_ptr + slot * (N * KH) + offs_n[:, None] * KH
-    s1t = s1_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE + offs_q[None, :]
-    s3t = s3_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE + offs_q[None, :]
-    cw1 = _cbword(cb1_ptr + slot * (N * 8) + offs_n[:, None] * 8 + offs_c[None, :], BN)
-    cw3 = _cbword(cb3_ptr + slot * (N * 8) + offs_n[:, None] * 8 + offs_c[None, :], BN)
+    lo1 = lo1_ptr + slot * SLO + offs_n[:, None] * KL
+    hi1 = hi1_ptr + slot * SHI + offs_n[:, None] * KH
+    lo3 = lo3_ptr + slot * SLO + offs_n[:, None] * KL
+    hi3 = hi3_ptr + slot * SHI + offs_n[:, None] * KH
+    s1t = s1_ptr + slot * SSC + offs_n[:, None] * SSTRIDE + offs_q[None, :]
+    s3t = s3_ptr + slot * SSC + offs_n[:, None] * SSTRIDE + offs_q[None, :]
+    cw1 = _cbword(cb1_ptr + slot * SCB + offs_n[:, None] * 8 + offs_c[None, :], BN)
+    cw3 = _cbword(cb3_ptr + slot * SCB + offs_n[:, None] * 8 + offs_c[None, :], BN)
     acc_g = tl.zeros([BM, BN], dtype=tl.float32)
     acc_u = tl.zeros([BM, BN], dtype=tl.float32)
     for q in range(0, SG // 4):
@@ -233,10 +233,10 @@ def _cb3_down_kernel(
     offs_c = tl.arange(0, 8)
     h_base = h_ptr + offs_m[:, None].to(tl.int64) * stride_h
     xk = 2 * tl.arange(0, 16)[None, :]
-    lo2 = lo2_ptr + slot * (N * KL) + offs_n[:, None] * KL
-    hi2 = hi2_ptr + slot * (N * KH) + offs_n[:, None] * KH
-    s2t = s2_ptr + slot * (N * SSTRIDE) + offs_n[:, None] * SSTRIDE + offs_q[None, :]
-    cw2 = _cbword(cb2_ptr + slot * (N * 8) + offs_n[:, None] * 8 + offs_c[None, :], BN)
+    lo2 = lo2_ptr + slot * SLO + offs_n[:, None] * KL
+    hi2 = hi2_ptr + slot * SHI + offs_n[:, None] * KH
+    s2t = s2_ptr + slot * SSC + offs_n[:, None] * SSTRIDE + offs_q[None, :]
+    cw2 = _cbword(cb2_ptr + slot * SCB + offs_n[:, None] * 8 + offs_c[None, :], BN)
     acc = tl.zeros([BM, BN], dtype=tl.float32)
     for q in range(0, SG // 4):
         acc += _cb3_quad_dot(h_base + q * 128, xk, mask_m[:, None], lo2 + q * 32, hi2 + q * 16, cw2, s2t + q * 4, BN)
@@ -764,12 +764,22 @@ def _cb3v3_up_kernel(
     wgt_ptr, block_slot_ptr, block_pair_ptr,
     stride_x, stride_h, limit,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, NB512: tl.constexpr, NB256: tl.constexpr, PACKED: tl.constexpr = False):
+    BM: tl.constexpr, BN: tl.constexpr, NB512: tl.constexpr, NB256: tl.constexpr, PACKED: tl.constexpr = False,
+    RSTRIDE: tl.constexpr = 0):
     KL: tl.constexpr = K // 4
     KH: tl.constexpr = K // 8
     SG: tl.constexpr = K // 32
     # Packed rows are [base u8][3 B per 8 groups]; unpacked are one byte per group.
     SSTRIDE: tl.constexpr = (1 + SG * 3 // 8) if PACKED else SG
+    # RSTRIDE = 0 is the shipped PLANE-MAJOR arena: each plane is its own [slots, ...] tensor, so the
+    # slot stride is that plane's own size. RSTRIDE = record bytes is the RECORD-MAJOR arena: one
+    # buffer of [slots, RECORD], every plane pointer pre-offset to its position inside the record, so
+    # all planes share one slot stride. Record-major is what lets an O_DIRECT read land in the final
+    # location instead of being scattered into twelve tensors.
+    SLO: tl.constexpr = RSTRIDE if RSTRIDE else (N * KL)
+    SHI: tl.constexpr = RSTRIDE if RSTRIDE else (N * KH)
+    SCB: tl.constexpr = RSTRIDE if RSTRIDE else (N * 8)
+    SSC: tl.constexpr = RSTRIDE if RSTRIDE else (N * SSTRIDE)
     mb = tl.program_id(0)
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
@@ -820,12 +830,18 @@ def _cb3v3_down_kernel(
     block_slot_ptr, block_pair_ptr,
     stride_h, stride_y,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr, NB512: tl.constexpr, NB256: tl.constexpr, PACKED: tl.constexpr = False):
+    BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr, NB512: tl.constexpr, NB256: tl.constexpr, PACKED: tl.constexpr = False,
+    RSTRIDE: tl.constexpr = 0):
     KL: tl.constexpr = K // 4
     KH: tl.constexpr = K // 8
     SG: tl.constexpr = K // 32
     # Packed rows are [base u8][3 B per 8 groups]; unpacked are one byte per group.
     SSTRIDE: tl.constexpr = (1 + SG * 3 // 8) if PACKED else SG
+    # See _cb3v3_up_kernel: RSTRIDE = 0 keeps the shipped plane-major strides exactly.
+    SLO: tl.constexpr = RSTRIDE if RSTRIDE else (N * KL)
+    SHI: tl.constexpr = RSTRIDE if RSTRIDE else (N * KH)
+    SCB: tl.constexpr = RSTRIDE if RSTRIDE else (N * 8)
+    SSC: tl.constexpr = RSTRIDE if RSTRIDE else (N * SSTRIDE)
     mb = tl.program_id(0)
     nb = tl.program_id(1)
     slot = tl.load(block_slot_ptr + mb)
