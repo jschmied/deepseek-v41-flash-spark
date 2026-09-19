@@ -285,38 +285,54 @@ class ExpertStore:
             return 0
         _t = time.perf_counter()
         keep, n = [], 0
-        for key, slot, gen, ev in self._cold_inflight:
-            if ev.query():
+        for key, slot, gen, ev, ev_c in self._cold_inflight:
+            # BOTH events, and neither is optional. ev_c says the cold-phase kernel has finished
+            # reading this slot; ev says the promotion copy has landed. The slot is released only when
+            # the state machine has heard from both, which is what makes recycling it safe.
+            if ev_c.query() and ev.query():
+                self.cold.promo.compute_done(slot, gen)
                 self.cold.promo.promo_done(slot, gen)
                 self.stats["cold_promotions"] += 1
                 n += 1
             else:
-                keep.append((key, slot, gen, ev))
+                keep.append((key, slot, gen, ev, ev_c))
         self._cold_inflight = keep
         self.stats["cold_reap_s"] += time.perf_counter() - _t
         return n
 
     def cold_finish_layer(self, hot_arena, stream=None) -> None:
-        """After the cold PHASE has run: its slots are consumed, so promotion may be issued.
+        """The cold phase has been ENQUEUED; arrange promotion so that it cannot race it.
 
-        Order matters for ownership, not speed. Issuing the copy after the cold kernel means the cold
-        record has one reader at a time; issuing it before would give it two and releasing the slot on
-        either one's completion would corrupt the other. Job 1070 measured 'before' 2 % faster and it
-        is not worth that.
+        ENQUEUED IS NOT EXECUTED, and getting that wrong here corrupted output (job 1085: prompt 3
+        diverged at token 5, and misses moved 23,302 -> 23,046). The first version called
+        `compute_done` on this line -- immediately after `moe_forward_cold_split` returned, which only
+        queues kernels -- and issued the copy on a side stream that waited on nothing. So the
+        promotion could land, release the cold slot, and a fresh O_DIRECT read could overwrite it while
+        the previous cold-phase kernel was still reading it. That is precisely the hazard the two-party
+        handshake exists to prevent, defeated by lying to it about one of the parties.
+
+        So: one event recorded on the COMPUTE stream after the phase; the promotion stream waits on it
+        before copying; and `compute_done` is marked only when that event has actually landed, polled
+        in `cold_reap` alongside the copy's own event. Ordering is now enforced by the device, and the
+        release still needs both parties.
         """
         if not self.cold or not self.cold_this_call:
             return
         _t = time.perf_counter()
         self.stats["cold_split_layers"] += 1
+        ev_compute = torch.cuda.Event()
+        ev_compute.record(torch.cuda.current_stream())
+        if stream is not None:
+            # the copy may not begin until the kernel that reads these slots has finished
+            stream.wait_event(ev_compute)
         for e, cslot in self.cold_this_call.items():
             key = (self._cold_layer, e)
             ent = self.cold.promo._inflight.get(key)
             if ent is None:                      # already landed and released
                 continue
             slot, gen, _hot = ent
-            self.cold.promo.compute_done(slot, gen)
             _s, _g, ev = self.cold.promote(key, hot_arena, stream=stream)
-            self._cold_inflight.append((key, _s, _g, ev))
+            self._cold_inflight.append((key, _s, _g, ev, ev_compute))
         if len(self._cold_inflight) > self.stats["cold_inflight_max"]:
             self.stats["cold_inflight_max"] = len(self._cold_inflight)
         self.cold_this_call = {}
