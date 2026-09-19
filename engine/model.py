@@ -736,7 +736,7 @@ class Model:
             self._ct_i = _i
             _r = _h.sha256(indices.to("cpu").numpy().tobytes()).hexdigest()[:10]
             _s = _h.sha256(slots.to("cpu").numpy().tobytes()).hexdigest()[:10]
-            if _i <= 400:
+            if _i <= 200000:
                 print(f"  CT {_i:04d} L{L:02d} route {_r} slots {_s}", flush=True)
         cold_of = None
         if getattr(store, "cold", None) is not None and getattr(store, "cold_this_call", None):
