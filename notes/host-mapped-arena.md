@@ -292,3 +292,48 @@ the same allocator blocks, so it could not have detected a garbage-dependent dif
 fundamentally it compares split against reference WITHIN one arm -- it can never see the two arms
 being fed different inputs, which is exactly the situation that obtains here. The microbenchmark
 bitwise results (1040, 1065, and the real-record test) do not depend on that and stand.
+
+## Timing: no wall-clock gain, and the component model was wrong about why
+
+Equality established first (five prompts, every field), then job 1135: interleaved A/B/A/B/A/B, five
+prompts summed per arm, equal-token normalisation, on the build with parallel cold reads.
+
+| round | OFF | ON at equal tokens | |
+| --- | --- | --- | --- |
+| 1 | 2.086 tok/s | 2.103 | +0.8 % |
+| 2 | 2.109 | 2.102 | -0.3 % |
+| 3 | 2.064 | 2.108 | +2.1 % |
+
+**The sign flips, so there is no verdict.** Median +0.8 % is noise. Tokens (248), misses (23,302) and
+NVMe (385.8 GB) are identical in every arm, so this is a like-for-like comparison of the same work.
+
+The design does what it was built to do. `cold_reap_s` is 0.095 s over the whole run, `cold_full` 0,
+`cold_reuses` 0, `cold_inflight_max` 29 of 64 -- the promotion really is off the critical path and the
+pool is adequately sized. It simply does not buy time.
+
+### Why the -0.754 ms per cold expert did not materialise
+
+The component model counted a copy as removed that is only deferred:
+
+    OFF miss:  NVMe -> pinned staging -> device arena
+    ON  miss:  NVMe -> pinned cold slot -> (compute reads it in place) -> device arena
+
+Both move 321 GB from NVMe into pinned memory **and** 321 GB from pinned memory into the device arena.
+The cold path removes no copy at all; it moves the copy off the critical path. Job 1045's 3.249 vs
+2.357 ms/record compared "read plus twelve H2D copies" against "read alone" -- but the promotion still
+has to happen afterwards, so that 0.892 ms was deferred, not saved. Predicted 17.6 s of a ~118 s run
+(15 %); measured 0 %.
+
+That is the flaw the review anticipated in advance: three terms measured in three separate experiments
+cannot capture what they do to each other on one memory fabric. Deferring a copy only pays if the
+critical path has idle bandwidth to absorb it, and here it does not -- which is the same thing job 1070
+found when only 57 % of the promotion could be hidden.
+
+### Standing
+
+The mechanism is correct and complete: bitwise-identical output, byte-correct residency, O_DIRECT into
+mapped slots, exact split arithmetic, promotion off the critical path, pool never exhausted. It is
+performance-neutral at this operating point, so there is nothing to ship on speed grounds. What would
+change that is a configuration where the fill latency is actually exposed -- a smaller arena, a higher
+miss rate, or a path that can start computing before the whole record has arrived -- and none of those
+is a tweak to this code.
