@@ -1,9 +1,16 @@
 DRAFT — needs the user's go. GitHub issue comment, vllm-project/vllm RFC #38256 (2026-09-19).
+BEFORE POSTING: re-read the thread's exchange about "oracle hit rate 0.68 at 3x top_k on 384 experts"
+— point 3 answers it and must not repeat what was already said there.
 
-Three measurements from a single-GPU MoE offload engine on a DGX Spark (GB10, sm_121), backed by
-**NVMe** rather than pinned host RAM. Two of them cost us a shipped default, so they may be worth the
-thread's time. All figures are single-stream at temperature 0; the box is GB10 with unified memory, so
-there is no PCIe hop and our bottleneck sits one tier below this RFC's.
+Three measurements from a single-GPU MoE offload engine on a DGX Spark (GB10, sm_121). Our tier is one
+below this RFC's, and that is the only reason these numbers might be useful: the experts live on
+**NVMe**, not in pinned host RAM, as 3-bit codebook records of 13,774,848 B each — 40 layers, 384
+routed experts plus one shared, top-6. So we are the case of someone putting a **disk** under the
+cache this RFC designs, and the two findings below are about what that changes.
+
+Read them as ratios, not levels. Absolute tok/s on an NVMe-backed 3-bit engine is not comparable to a
+coherent-memory box and we are not offering it as such; every claim here is a within-pair ratio with
+the arms interleaved on one machine. All figures single-stream at temperature 0.
 
 **1. Read concurrency buys no bandwidth on this device, and taxes latency linearly.**
 
