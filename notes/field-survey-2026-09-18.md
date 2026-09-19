@@ -456,3 +456,40 @@ not a measurement, and the CB3 unpack path may interact.
 So the shippable claim is not yet "set io_threads=2". It is "read concurrency is a pure latency tax
 at decode, worth up to +22.5 % at high miss rates, and the shipped global 48 is the wrong setting for
 at least one phase." The next job measures it at 86 GB and checks prefill is unharmed.
+
+### At 86 GB the win moves to the cold phase (job 955)
+
+Same sweep at the real operating point, 26,400-token prefill first in every arm:
+
+| io_threads | prefill | rep1 (hit .897) | rep2 (.915) | rep3 (.920) | wait rep3 |
+|---|---|---|---|---|---|
+| 48 (shipped) | 87.1 s | 4.21 | 4.76 | 4.89 | 13.62 |
+| 8 | 75.3 s | 4.15 | 4.90 | 5.00 | 13.32 |
+| **2** | 70.3 s | **4.94** | 4.96 | 5.01 | 13.22 |
+| 48 again | 74.8 s | 4.17 | 4.81 | 4.91 | 13.61 |
+
+**Steady state: +2.2 %.** The +22.5 % from job 950 was a 40 GB effect at hit 0.73-0.75, and it
+shrank almost exactly as predicted when the hit rate rose to 0.92 — ~3.7x fewer misses to wait on.
+
+**First request: +17 %** (4.94 against 4.21 and 4.17). That is the same mechanism seen where it still
+has purchase: the latency tax is proportional to the number of misses waited on, so it is largest when
+the cache is cold and vanishes as it fills. io 2 also reaches 4.94 on rep1 — a number the io 48 arms
+do not reach until rep3.
+
+**Prefill: no evidence of harm, and no usable measurement either.** 70.3 s at io 2 is the fastest of
+the four, but the two *identical* io-48 arms came in at 87.1 s and 74.8 s — a 16 % spread between
+arms that differ in nothing. Prefill wall time in this harness needs repetition before it can support
+a claim in either direction; one number per arm is not enough. Recorded as untested rather than
+favourable.
+
+### What is actually shippable
+
+`DSV41_IO_THREADS=2` for decode: **+17 % on the first request, +2 % once warm, no measured prefill
+cost.** Real serving starts cold and sees varied prompts, so the cold-phase number is not a corner
+case — job 785 measured a 3.57-13.02 tok/s spread across five prompts, and every new prompt re-enters
+the warming regime for the experts it needs.
+
+The general statement is the one worth keeping: **read concurrency buys no bandwidth on this device
+(flat 4.87 GB/s from n=1 to n=96) and costs latency linearly (2.8 ms x n), so it should be set by
+which phase is latency-critical — not globally.** The shipped `io 48/96` was chosen for prefill
+throughput and silently taxes every decode miss.
