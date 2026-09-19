@@ -731,7 +731,7 @@ class CB3RecordArena:
     """
 
     def __init__(self, slots: int, device: torch.device | str = "cuda",
-                 packed_scales: bool = True, pinned: bool = False, align: int = 4096):
+                 packed_scales: bool = True, pinned: bool = False, align: int = 4096, buf=None):
         if pinned and torch.device(device).type != "cpu":
             device = "cpu"
         self.slots = slots
@@ -742,8 +742,17 @@ class CB3RecordArena:
         self.payload = payload
         self.rstride = (payload + align - 1) // align * align if align else payload
         n = slots * self.rstride
-        self.buf = (torch.empty(n, dtype=torch.uint8, pin_memory=True) if pinned
-                    else torch.empty(n, dtype=torch.uint8, device=self.device))
+        if buf is not None:
+            # Externally allocated storage -- a CUDA VMM host-NUMA range, for instance, which the
+            # kernels read at near-device speed and O_DIRECT can fill, so the arena and the read
+            # destination are the same memory. See engine/vmm_alloc.py.
+            if buf.dtype != torch.uint8 or buf.numel() < n:
+                raise ValueError(f"buf must be uint8 with >= {n} elements, got "
+                                 f"{buf.dtype} {buf.numel()}")
+            self.buf = buf[:n]
+        else:
+            self.buf = (torch.empty(n, dtype=torch.uint8, pin_memory=True) if pinned
+                        else torch.empty(n, dtype=torch.uint8, device=self.device))
         self.sim = None
 
     @property
