@@ -738,6 +738,20 @@ class Model:
             routed = _C3.moe_forward_cold_split(y, slots, weights, arena, store.cold.arena,
                                                 cold_of, a.swiglu_limit).float()
             store.cold_finish_layer(arena, stream=getattr(store, "cold_stream", None))
+            if os.environ.get("DSV41_COLD_VERIFY", "0") == "1":
+                # With DSV41_COLD_SYNC=1 the promotions have landed by here, so the hot arena holds
+                # every expert this layer used and an ordinary call over it is the reference. Compares
+                # the split against it in situ, which is the only way to find WHICH layer differs --
+                # the microbenchmark says the split is bitwise, so if the engine disagrees the
+                # difference is in what the engine feeds it, not in the split itself.
+                import torch as _t
+                _ref = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
+                if not _t.equal(_ref, routed):
+                    _d = (_ref - routed).abs()
+                    _n = int((_ref != routed).sum())
+                    print(f"  COLD-VERIFY L{L}: {_n}/{_ref.numel()} differ, max|d| "
+                          f"{_d.max().item():.6g}; cold_of {len(cold_of)} of "
+                          f"{len(set(slots.flatten().tolist()))} slots", flush=True)
         else:
             routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
