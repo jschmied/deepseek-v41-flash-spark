@@ -385,9 +385,22 @@ class V41Engine:
             log("using Triton CB3 (3-bit per-row codebook) MoE kernel for the routed experts")
 
         def moe_fn(x, slots, weights, arena, limit):
-            """Dispatch on the arena's format. The DSpark draft arena stays FP4 whatever the main
-            arena is -- it is 384 experts (7.2 GB), it is read five times per step, and a 3-bit
-            drafter would cost acceptance for nothing."""
+            """Dispatch on the arena's format.
+
+            The DSpark draft arena is still FP4 -- but not for the reason this comment used to give.
+            It said a 3-bit drafter "would cost acceptance for nothing" and that being "read five
+            times per step" made it risky. Job 980 measured both and both are wrong: CB3 is 17 %
+            FASTER at the draft-block shape (3.5507 vs 4.2757 ms per pass, T=5 top-3) and 9 % faster
+            at T=1, because the arena is resident and CB3 reads 0.769 of the bytes per slot -- being
+            read five times per step is what makes the smaller record pay. And a third party's 3-bit
+            quantization of these same 384 experts costs 1.05 pp of acceptance (53.17 vs 54.22 %),
+            not "nothing", in exchange for 1.554 GiB = 115 more main-arena slots.
+
+            What blocks it is data, not code: `FixedStore` is layout-agnostic and this dispatcher
+            already routes any CB3ArenaV2 to the CB3 kernel, so the port is `make_expert_arena(384)`
+            at line 425 -- but the CB3 pack holds only layers 0..39 (15,360 = 40 x 384 records) and
+            the drafter's 3 x 128 experts need 384 more records, 5.3 GB, packed first.
+            See notes/drafter-cb3-gate.md."""
             if cb3_cls is not None and isinstance(arena, cb3_cls):
                 return cb3_moe_fn(x, slots, weights, arena, limit)
             return fp4_moe_fn(x, slots, weights, arena, limit)
