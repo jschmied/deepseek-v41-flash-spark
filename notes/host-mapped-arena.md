@@ -61,8 +61,21 @@ enabler for this, not merely a capacity win.
 | **B hot device phase + cold mapped phase + one reduce** | **2.696** | **+4.2 % vs A2** |
 
 `B == A2` and `A2 == A1` **bitwise**, so the split reproduces the unsplit arithmetic exactly. The split
-costs **+0.108 ms/layer** for 3 cold experts, against 3 × 0.892 = 2.676 ms of fill saving: **−2.568 ms
-per layer on the critical path**, or about 0.856 ms saved per cold expert.
+costs **+0.108 ms/layer** for 3 cold experts, i.e. +0.036 ms per cold expert.
+
+### The whole accounting, per cold expert
+
+| term | ms |
+| --- | --- |
+| fill saving, O_DIRECT into the mapped slot (job 1045) | **−0.892** |
+| split overhead (job 1065) | +0.036 |
+| promotion exposed after hiding (job 1070) | +0.102 |
+| **net** | **−0.754** |
+
+So a cold expert costs about 0.75 ms less than it does today, with cache semantics preserved. What that
+becomes end to end needs the engine change and its own paired run — the per-miss figure is not a tok/s
+claim, and this project has twice had a wall-clock result dissolve under drift and token-count
+artefacts.
 
 ## Record-major addressing works (and the bug that made it look otherwise)
 
@@ -87,13 +100,29 @@ destroyed by the very change that arithmetic justifies. The design has to be:
                         |-- GPU computes the miss directly from it
                         `-- later, contiguous copy --> record-major device hot slot
 
-Two things make the promotion cheap. It is **one contiguous ~13.77 MB copy** rather than twelve plane
-scatters, because both sides are record-major. And it need not be on the critical path: the expert
-cannot be needed at the same layer again until the next token or verify step, roughly a full 40-layer
-traversal later, so it should be issued **after** the cold phase rather than overlapped with it — both
-would contend for the same DRAM bandwidth. Job 975's 0.9–2.0 ms H2D looks dominated by today's
-staging/scatter/stream machinery rather than by the physical copy, which the streaming numbers put at a
-few tenths of a millisecond; that is the next thing to measure.
+It is **one contiguous ~13.77 MB copy** rather than twelve plane scatters, because both sides are
+record-major. **Measured** (job 1070, an 8-layer chain with 3 cold experts per layer):
+
+| arm | ms/layer | vs A | |
+| --- | --- | --- | --- |
+| A no promotion | 2.660 | — | lower bound, wrong semantics |
+| B promotion synchronous after the cold phase | 3.371 | +26.7 % | upper bound |
+| **C promotion on a side stream after the cold phase** | **2.966** | **+11.5 %** | |
+| D promotion on a side stream *before* the cold phase | 2.907 | +9.3 % | |
+
+**57 % hidden, not all of it** — a side stream exposes +0.102 ms per promoted record against +0.237 ms
+synchronous. That is consistent with the copy being DRAM-to-DRAM and therefore competing for bandwidth
+with kernels that are themselves bandwidth-bound, so there is nothing to hide *behind* in the usual
+sense; a full 40-layer traversal of wall time does not help if the bytes still have to move through the
+same pool.
+
+**A prediction of mine failed here.** I pre-registered that issuing the promotion *after* the cold phase
+would beat issuing it before, on contention grounds. D (before) measured 2.907 against C's 2.966 — 2 %
+the other way. The margin is small and it is one measurement, so it does not invert the design, but the
+ordering argument is unsupported and should not be repeated as if it were established.
+
+Job 975's 0.9–2.0 ms H2D still looks dominated by today's staging and scatter rather than by the
+physical copy: one contiguous record copy costs 0.237 ms synchronous.
 
 **A wholly host-mapped arena is not the design.** At the T=6 verify shape — the decode shape, so the
 one that decides it — mapped execution costs +9.6 % on every access while the fill saving only reaches
