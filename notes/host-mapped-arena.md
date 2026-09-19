@@ -168,3 +168,20 @@ pages against roughly 21 M for a 78 GB arena -- 2.6x short. The trend over the r
 and slightly *falling* at the top, which is evidence against a translation wall rather than for one,
 but it is extrapolation and the sweep should be finished with tighter memory hygiene (free and settle
 before the availability check) before the split is built on it.
+
+
+## Job 1055 hard-reset the box, and the sweep is capped because of it
+
+The 60 GiB arm crashed the machine. It allocated a 60 GiB **pinned** host arena and then a 60 GiB
+device arena on a 121.6 GiB box; pinned pages are unreclaimable and this box resets when MemAvailable
+goes negative. The defect was mine and specifically in the guard: an in-process loop waited up to 40 s
+for the previous arena to be released and then **continued anyway** on timeout, which looks like a
+check and is only a delay. Nothing was lost -- both repos were clean and pushed, the 211.6 GB pack and
+the drafter download intact.
+
+The sweep is now one arena per PROCESS (release is the OS's job at exit), with a pre-check that aborts
+rather than proceeds, and a cap at 40 % of MemTotal. That cap stops the sweep at **45 GiB = 11.8 M
+pages**, against roughly 21 M for a 78 GB arena. So the largest point is still 1.8x short and the
+conclusion rests on the trend, not on reaching the real size: it cannot be closed safely on this box by
+this method. If the trend matters more than that, the way to settle it is huge-page-backed registered
+memory, which reduces the page count instead of raising the footprint.
