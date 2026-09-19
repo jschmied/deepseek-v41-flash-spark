@@ -44,11 +44,12 @@ It does **not** yet license changing the arena. This is a streaming sum, not the
 one gathers across slots with a different access pattern, decodes 3-bit groups, and has 250 registers
 at BM=16 with zero spills (job 850). Its behaviour on mapped memory has to be measured, not assumed.
 
-It also reframes the hot/cold split the review proposed. At a 3.5 % penalty there is no strong reason
-to keep *resident* experts in device memory either -- which, if the CB3 kernel agrees, means the arena
-itself could be host-allocated and the entire H2D path, its staging buffers, copy streams and copy
-events deleted rather than merely bypassed for cold experts. That is a much larger change than the
-review suggested and the measurement points at it.
+~~It also reframes the hot/cold split the review proposed. At a 3.5 % penalty there is no strong
+reason to keep resident experts in device memory either -- the arena itself could be host-allocated.~~
+**Withdrawn, falsified by jobs 1040 + 1045 below.** The 3.5 % came from a streaming sum; the real
+kernel costs +8.9 % at the T=6 verify shape, and that penalty is paid on EVERY access while the read
+saving only reaches the ~10 % that miss. The review's original hot/cold split was right and my
+extrapolation was wrong.
 
 ~~One constraint: `change_current_allocator` must precede any CUDA allocation, so device and host
 arenas cannot coexist in one process.~~ **Withdrawn.** Triton takes pinned CPU tensors directly, so a
@@ -106,3 +107,41 @@ equality in job 1035) and **no call site passes `RSTRIDE`**, so the broken branc
 anything that runs. But the sequencing was wrong, and the lesson is that "commit locally, push later"
 does not survive committing anything else on top of it: stage the unverified change last, or keep it
 on its own branch.
+
+
+## Step 2: O_DIRECT straight into the final mapped slot (job 1045)
+
+Possible only because of packed scales: `CB3_BYTES_PER_SLOT_PACKED` = 13,773,312 equals the pack's
+`payload_bytes` exactly, and the on-disk record is padded to 13,774,848 = 3363 x 4096. So file offsets,
+transfer lengths and arena slot offsets are all 4096-aligned and an expert needs **no transform at all**
+between disk and kernel. With unpacked scales the slot is 14,454,784 and this is impossible.
+
+Real 211.6 GB pack, randomly chosen records, O_DIRECT so nothing is page-cached:
+
+| arm | ms/record | GB/s |
+| --- | --- | --- |
+| A staging buffer + twelve H2D copies (today) | 3.249 | 4.24 |
+| **B O_DIRECT into the mapped slot** | **2.357** | **5.84** |
+
+**-27.5 %, 0.892 ms saved per record**, and the same record fetched both ways drives the kernel to
+bitwise identical output.
+
+## Putting steps 1 and 2 together: the split is required, a wholly host-mapped arena LOSES
+
+The kernel penalty is per ACCESS; the read saving is per MISS. At hit rate 0.9029 (job 1010):
+
+| | T=6 verify | T=1 draft |
+| --- | --- | --- |
+| host kernel penalty per access | +0.246 ms | -0.058 ms |
+| whole arena host-mapped | **+0.159 ms/access — LOSS** | -0.145 ms/access |
+| hot/cold split | **-0.063 ms/access — win** | -0.092 ms/access |
+
+Per miss the whole path goes 6.013 -> 5.367 ms, **-10.7 %**.
+
+So resident experts must stay in device memory and only cold ones execute in place from the read
+destination -- exactly what the review proposed and the opposite of the extrapolation struck out above.
+T=6 is the decode verify block, so it is the shape that decides this, and it is the one where a wholly
+mapped arena loses.
+
+The engine already has the machinery: `moe_forward_v3_split` runs the MoE in phases over one routing
+for the resident-first split, which is the shape a device-resident/host-cold split needs.
