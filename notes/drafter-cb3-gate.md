@@ -147,3 +147,24 @@ argmax on a near-tie. That would make the target's logits not invariant to the d
 numerical property of batched verification over a routed MoE, not a broken rule. It is consistent with
 what we already know (a 1-ulp kernel change moves acceptance by ten points) but it is a hypothesis
 with no counterfactual yet, so it is written here as one.
+
+
+## Job 995: prompt 1 alone does not diverge
+
+Both arms emitted 99 byte-identical ids for "Explain how an NVMe controller schedules writes." run on
+its own. That is the third pre-registered branch, so the divergence job 990 saw is not a property of
+prompt 1 in isolation.
+
+Which leaves two candidates, and job 1000 separates them by reproducing 990's condition exactly --
+five prompts, in order, one engine -- while recording each prompt's ids separately:
+
+  (a) it is one of prompts 2-5; or
+  (b) it is a CARRY-OVER. 990 ran all five in sequence, so arena occupancy and the prompt cache at
+      prompt N depend on every prompt before it. If prompt 1 diverges in 1000 having been identical
+      alone in 995, the drafter is not perturbing the target's logits at all -- it is changing what
+      the arena holds, and the divergence is downstream of cache state. That would reframe this as an
+      arena-occupancy effect rather than anything in the verify path.
+
+Worth noting against my own earlier wording: 990 folded all five prompts into ONE sha, so "the arms
+emit different greedy tokens" was correct but told us nothing about where. Per-prompt hashes are what
+1000 adds.
