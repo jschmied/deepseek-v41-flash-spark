@@ -747,6 +747,38 @@ class Model:
                     _extra = " map " + ",".join(f"{a}:{b}" for a, b in
                                                 sorted(set(zip(_e.tolist(), _sl.tolist()))))
                 print(f"  CT {_i:04d} L{L:02d} route {_r} slots {_s}{_extra}", flush=True)
+        _rc = os.environ.get("DSV41_COLD_RESIDCHECK", "")
+        if _rc and n_experts != 128:
+            # RESIDENCY VALIDATION. Every other axis is exhausted, and this tests the one claim left:
+            # that each logical mapping points at byte-correct expert data. For each unique
+            # (expert, slot) this layer resolved, load the expert's record from the pack into a scratch
+            # slot with the SHIPPED loader and compare it against what the live arena slot holds. It
+            # depends on no theory of how a slot might have gone wrong.
+            _lo, _hi = (int(x) for x in _rc.split("-"))
+            _i = getattr(self, "_ct_i", 0)
+            if _lo <= _i <= _hi and getattr(store, "cb3_cache", None) is not None:
+                import torch as _t, cb3_moe as _C3x
+                _sc = getattr(self, "_rc_arena", None)
+                if _sc is None:
+                    _sc = self._rc_arena = _C3x.CB3ArenaV2(1, arena.device,
+                                                           packed_scales=arena.packed_scales)
+                    _sc.sim = getattr(arena, "sim", None)
+                    self._rc_buf = _t.empty(store.cb3_cache.record, dtype=_t.uint8)
+                _e = indices.to("cpu").numpy().reshape(-1)
+                _sl = slots.to("cpu").numpy().reshape(-1)
+                for _ex, _slt in sorted(set(zip(_e.tolist(), _sl.tolist()))):
+                    store.cb3_cache.read_into(memoryview(self._rc_buf.numpy()), L, _ex)
+                    store.cb3_cache.load_slot(_sc, 0, self._rc_buf, non_blocking=False)
+                    _t.cuda.synchronize()
+                    _badp = [nm for nm in _C3x.PLANE_ORDER
+                             if not _t.equal(getattr(_sc, nm)[0], getattr(arena, nm)[_slt])]
+                    if _badp:
+                        _src = "cold-inflight" if (store.cold is not None and
+                                                   (L, _ex) in store.cold.promo._inflight) else (
+                               "transient" if (L, _ex) in getattr(store, "transient_map", {}) else
+                               "lru" if (L, _ex) in store.lru else "UNMAPPED")
+                        print(f"  RESID {_i:04d} L{L:02d} expert {_ex} slot {_slt} src {_src} "
+                              f"WRONG planes {','.join(_badp)}", flush=True)
         cold_of = None
         if getattr(store, "cold", None) is not None and getattr(store, "cold_this_call", None):
             infl = store.cold.promo._inflight
