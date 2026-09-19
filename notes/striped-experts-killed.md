@@ -32,7 +32,9 @@ Here the budget holds 5,421 of 9,492 distinct experts, 57 %, and the hottest 10 
 f=0.5 holds *all* experts at half and pays 0.43 of every access forever. 0.43 > 0.20, so it loses, and
 every finer fraction loses harder.
 
-**The crossover condition, worth keeping for when it changes:**
+**The crossover condition, worth keeping for when it changes** -- and it is the crossover for the
+*uniform-fraction* model measured here, not a theorem about every mixed adaptive stripe policy under
+skewed popularity:
 
     striping wins only when   miss_rate(whole) > 1 - slots / distinct_experts
 

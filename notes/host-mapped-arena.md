@@ -50,6 +50,54 @@ itself could be host-allocated and the entire H2D path, its staging buffers, cop
 events deleted rather than merely bypassed for cold experts. That is a much larger change than the
 review suggested and the measurement points at it.
 
-One constraint on how any of this gets tested: `torch.cuda.change_current_allocator` must be called
-before any CUDA allocation, so a device arena and a host-allocated arena cannot coexist in one process.
-Every A/B here needs separate processes, interleaved.
+~~One constraint: `change_current_allocator` must precede any CUDA allocation, so device and host
+arenas cannot coexist in one process.~~ **Withdrawn.** Triton takes pinned CPU tensors directly, so a
+device plane-major arena and a pinned host arena run interleaved in ONE process -- jobs 1025/1035/1040
+all do. The allocator only matters if you want PyTorch to treat host storage as an ordinary CUDA
+tensor, which none of this needs.
+
+## The real CB3 kernel on mapped memory (jobs 1025, 1035)
+
+| shape | device arena | mapped host arena | t_mapped / t_device |
+| --- | --- | --- | --- |
+| T=1, top-6 | 0.707 ms | 0.664 ms | **0.939** |
+| T=6, top-6 | 2.758 ms | 3.041 ms | **1.103** |
+| miss path (H2D of the slots used, then device exec) | 2.576 / 13.832 ms | -- | -- |
+
+Bitwise identical to the device arena at both shapes (job 1035), and the host arm beats the miss path
+by 74-78 %. So the streaming result does transfer to the gather: this is the 250-register kernel, whose
+occupancy is register-limited and which therefore has few spare warps to hide added latency. It passes
+a 10 % bar at T=1 and sits on it at T=6.
+
+`cudaDeviceGetAttribute` on this box: `PageableMemoryAccessUsesHostPageTables = 1` (ATS: the GPU uses
+the CPU-side page tables), `PageableMemoryAccess = 1`, `CanUseHostPointerForRegisteredMem = 1`,
+`HostRegisterSupported = 1`, `ConcurrentManagedAccess = 1`, `DirectManagedMemAccessFromHost = 0`. So
+this is mapped page-locked access, not demand-paged managed migration -- and nothing here uses
+`cudaMallocManaged`. TLB reach over an 80 GB mapped arena at 4 KiB pages remains an open risk that
+these 384-slot (5.17 GiB) measurements do not probe; huge-page-backed registered memory is the lever
+if it shows up.
+
+## Record-major: my addressing is wrong, and it is mine, not the memory's
+
+Record-major is the stronger design, because host-allocating today's arena removes the H2D but keeps
+the scatter: `load_slot` explodes one contiguous record into twelve plane-major tensors. The kernels
+now take `RSTRIDE` (0 = shipped plane-major strides, unchanged; record bytes = one shared slot stride
+with each pointer pre-offset into the record).
+
+It does not work yet, and the failure is isolated:
+
+- base offsets are right -- with SLOTS=1 (slot 0 only, so `slot * stride` is 0) record-major is
+  **bitwise equal** to plane-major;
+- the slot stride is wrong -- with SLOTS=8 it produces NaN, in BOTH kernels independently;
+- the record fill is right -- `v[s, OFF:OFF+n] == plane[s]` for every slot and every plane;
+- the address model is right -- `as_strided((S, rows, row), (RECORD, row, 1), OFF)` equals each plane
+  byte for byte, for all twelve;
+- every plane offset is 16-byte aligned, and RECORD equals `CB3_BYTES_PER_SLOT`;
+- it is NOT a Triton specialization-cache artifact -- compiling the record-major arm FIRST in a fresh
+  process still fails, so `RSTRIDE` is being honoured;
+- and it is NOT a regression in the shipped path -- with `RSTRIDE` defaulted, routing to slot 0 and to
+  slot 7 still produce different outputs, so the plane-major arithmetic is intact and job 1035's
+  bitwise equality was against a correct reference.
+
+The kernel commit is therefore held LOCAL, unpushed: its default branch is verified, its `RSTRIDE != 0`
+branch is not.
