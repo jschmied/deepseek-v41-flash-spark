@@ -493,3 +493,36 @@ The general statement is the one worth keeping: **read concurrency buys no bandw
 (flat 4.87 GB/s from n=1 to n=96) and costs latency linearly (2.8 ms x n), so it should be set by
 which phase is latency-critical — not globally.** The shipped `io 48/96` was chosen for prefill
 throughput and silently taxes every decode miss.
+
+### io 2 wins all five prompts, and prefill is faster too (job 960)
+
+Five prompts, each scored on its FIRST request at 86 GB, with io 48 run twice to pin the session:
+
+| prompt | hit | io 48 | io 48 again | **io 2** | gain | load_wait |
+|---|---|---|---|---|---|---|
+| P0 | .846 | 3.09 | 3.19 | **3.52** | +10.3 % | 27.7 -> 22.9 |
+| P1 | .925 | 11.82 | 11.63 | **12.01** | +1.6 % | 7.3 -> 6.4 |
+| P2 | .949 | 13.42 | 13.24 | **14.50** | +8.0 % | 6.3 -> 5.0 |
+| P3 | .927 | 7.44 | 7.93 | **8.05** | +1.5 % | 10.4 -> 8.8 |
+| P4 | .906 | 3.82 | 3.94 | **4.32** | +9.6 % | 19.8 -> 16.1 |
+
+**5 of 5, and `load_wait_s` falls 13-20 % in every arm.** The mechanism is not prompt-specific: it is
+the latency tax being removed wherever there are misses to wait on. Gains track miss rate loosely
+(P0 at hit .846 gains most) but the *wait* reduction is uniform, which is the cleaner signal.
+
+**Prefill is faster, not harmed**: 71.8 s cold at io 2 against 76.0 and 79.5; 8.3 s warm against 9.5
+and 9.4. So there is no phase split to make — shallow is better for both, and job 945 explains why:
+read concurrency buys no bandwidth at all on this device, so depth is pure cost everywhere.
+
+**A correction to job 955's write-up.** I reported a "16 % spread between identical io-48 arms" and
+called prefill timing too noisy to use. This job's prefill x3 shows 76.0 / 9.5 / 9.1 s — the second
+and third repetitions hit the PROMPT CACHE. That is cold-vs-warm, not variance, and 955's spread was
+almost certainly the same artifact. My x3 design did not measure what I said it measured; repeating a
+prefill on the same prompt cannot.
+
+### Shipped
+
+`DSV41_IO_THREADS=2` added to `.env` with the evidence in a comment. +1.5 to +10.3 % on first-request
+decode across five prompts, 13-20 % less load wait in every arm, prefill 6-12 % faster, hit rate and
+byte counts unchanged. The shipped 48 was chosen for prefill throughput on the assumption that read
+concurrency buys bandwidth; job 945 measured that it does not.
