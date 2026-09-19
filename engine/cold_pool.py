@@ -49,6 +49,7 @@ class ColdPool:
             raise RuntimeError(f"pinned base is not page aligned ({base % 4096}); O_DIRECT needs it")
         self._mv = memoryview(self.arena.buf.numpy())
         self.stats = {"reads": 0, "bytes": 0, "promotions": 0, "read_s": 0.0}
+        self._events: dict = {}          # key -> (slot, gen, promo_event, compute_event)
         self.last_read_s = 0.0
 
     # ------------------------------------------------------------------ fetch
@@ -56,35 +57,48 @@ class ColdPool:
         """The pack is record i = layer * n_experts + expert, per engine/cb3_cache.py."""
         return layer * self.n_experts_per_layer + expert
 
-    def fetch(self, key: tuple, hot_slot: int) -> tuple[int, int]:
-        """Reserve a cold slot for `key` and read its record straight into it. Returns (slot, gen).
+    def reserve(self, key: tuple, hot_slot: int) -> tuple[int, int]:
+        """Take a cold slot. Host-side only -- no I/O, so it is safe to do for every miss of a layer
+        before any read starts, which is what lets the reads run concurrently."""
+        return self.promo.reserve(key, hot_slot)
 
-        Raises ColdSlotBusy if every slot is still owed a compute or a promotion -- which is a real
-        condition the caller must handle, not an assertion: at T=6 top-6 a layer can want up to 36
-        distinct experts, so a pool smaller than that can genuinely run out.
+    def read_into(self, key: tuple, slot: int, gen: int) -> None:
+        """Do the O_DIRECT read for an already-reserved slot. Called on an I/O WORKER.
+
+        Split from reserve() because the first version did both inline in resolve()'s miss loop, which
+        serialised the reads: the ordinary path submits them to a pool and gets io_threads of
+        concurrency, and doing a blocking preadv per miss threw that away. Nothing here touches CUDA,
+        so it is safe off the main thread.
         """
         layer, expert = key
-        slot, gen = self.promo.reserve(key, hot_slot)
-        # Read the WHOLE PADDED record, not just the payload. Two reasons, both found by the
-        # equality gate. The payload is 13,773,312 B, which is 512-aligned but NOT 4096-aligned, so
-        # reading it works here only because this device's logical block size is 512 -- on a 4 KiB
-        # logical-block device the call would fail. And the ordinary path counts the padded record in
-        # bytes_read, so counting the payload left a 1,536 B/fetch discrepancy (0.016 GB over 10,262
-        # fetches) that showed up as the last inequality in the gate. The pad lands in the slot's own
-        # padding, which no kernel reads.
         off = slot * self.arena.rstride
         _t = time.perf_counter()
-        got = os.preadv(self.fd, [self._mv[off:off + self.record_bytes]],
-                        self.record_index(layer, expert) * self.record_bytes)
-        self.last_read_s = time.perf_counter() - _t
-        self.stats["read_s"] += self.last_read_s
+        try:
+            got = os.preadv(self.fd, [self._mv[off:off + self.record_bytes]],
+                            self.record_index(layer, expert) * self.record_bytes)
+        except OSError:
+            # A read that never delivered bytes has no compute party and never will, so the slot must
+            # be released now rather than waiting for one.
+            self.promo.abort_before_compute(slot, gen)
+            raise
+        dt = time.perf_counter() - _t
+        self.last_read_s = dt
+        self.stats["read_s"] += dt
         if got != self.record_bytes:
-            self.promo.fail(slot, gen)
+            self.promo.abort_before_compute(slot, gen)
             raise IOError(f"short read for {key}: {got} of {self.record_bytes}")
         self.stats["reads"] += 1
         self.stats["bytes"] += got
         self.promo.cold_ready(slot, gen)
+
+    def fetch(self, key: tuple, hot_slot: int) -> tuple[int, int]:
+        """reserve + read, for callers that do not need concurrency (tests)."""
+        slot, gen = self.reserve(key, hot_slot)
+        self.read_into(key, slot, gen)
         return slot, gen
+
+    def event_of(self, key: tuple):
+        return self._events.get(key)
 
     # ------------------------------------------------------------------ promotion
     def promote(self, key: tuple, hot_arena, stream=None):

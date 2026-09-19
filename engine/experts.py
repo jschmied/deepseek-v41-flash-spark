@@ -272,6 +272,16 @@ class ExpertStore:
         self.stats.setdefault("cold_inflight_max", 0)    # high-water of outstanding promotions
         self.stats.setdefault("cold_split_layers", 0)    # layers that ran two phases
         self.stats.setdefault("cold_promote_s", 0.0)     # host time issuing the copies
+        self.stats.setdefault("cold_reuse_wait_s", 0.0)
+        self.stats.setdefault("cold_read_fail", 0)
+        # PER-REQUEST RESET. _reset_stats() zeroes ZERO_STATS only, so a counter that is not in it
+        # accumulates across requests while APPEARING in per-request last_stats -- which would have
+        # made a timing report attribute five prompts' cold traffic to each of them.
+        for k in ("cold_fetches", "cold_reuses", "cold_promotions", "cold_full", "cold_split_layers",
+                  "cold_inflight_max", "cold_reap_calls", "cold_read_fail"):
+            ZERO_STATS.setdefault(k, 0)
+        for k in ("cold_reap_s", "cold_promote_s", "cold_reuse_wait_s"):
+            ZERO_STATS.setdefault(k, 0.0)
 
     def cold_reap(self) -> int:
         """Mark every promotion whose event has LANDED. Called at layer boundaries.
@@ -292,6 +302,7 @@ class ExpertStore:
             if ev_c.query() and ev.query():
                 self.cold.promo.compute_done(slot, gen)
                 self.cold.promo.promo_done(slot, gen)
+                self.cold._events.pop(key, None)
                 self.stats["cold_promotions"] += 1
                 n += 1
             else:
@@ -339,6 +350,7 @@ class ExpertStore:
             slot, gen, _hot = ent
             _s, _g, ev = self.cold.promote(key, hot_arena, stream=stream)
             self._cold_inflight.append((key, _s, _g, ev, ev_compute))
+            self.cold._events[key] = (_s, _g, ev, ev_compute)
         if _sync:
             if stream is not None:
                 stream.synchronize()
@@ -848,6 +860,7 @@ class ExpertStore:
             self._cold_layer = layer
         slot_of = {}
         to_load = []
+        cold_jobs = []      # (key, expert, hot_slot, cold_slot, gen) -- reads submitted together
         used: set[int] = set()  # slots already promised in this call -- never recycle one of them
         # pass 1: residents. Reserving them before any allocation is what keeps a later miss from
         # running the transient ring over a slot an earlier hit is already using (which used to
@@ -858,11 +871,26 @@ class ExpertStore:
             if self.cold is not None:
                 ent = self.cold.promo._inflight.get(key)
                 if ent is not None:
-                    # PUBLISHED IS NOT LANDED. The hot slot is reserved and being copied into; the
-                    # bytes are only in the cold slot, so that is where this layer must read them.
-                    cslot, _gen, hslot = ent
+                    # An expert wanted again while its promotion is outstanding. The first version
+                    # read it from the cold slot a SECOND time, which the lifecycle cannot represent:
+                    # it models one compute party and one promotion party, so a second cold consumer
+                    # would issue a second promotion for the same (slot, gen) and the first pair's
+                    # completion could release the slot while the second kernel still read it.
+                    # Instead: make the compute stream WAIT for the promotion, then use the hot slot
+                    # as an ordinary resident. Routing is uniqued so this cannot happen inside one
+                    # layer; a reuse is ~a model traversal later, by which time the event is usually
+                    # already complete and the wait is free.
+                    _cslot, _gen, hslot = ent
+                    evs = self.cold.event_of(key)
+                    if evs is not None:
+                        torch.cuda.current_stream().wait_event(evs[2])
+                        _t0 = time.perf_counter()
+                        self.stats["cold_reuse_wait_s"] += time.perf_counter() - _t0
+                    else:
+                        # promotion not issued yet (same layer is impossible, but be explicit):
+                        # fall through and read it cold, which is safe because no promotion exists.
+                        self.cold_this_call[e] = _cslot
                     slot_of[e] = hslot
-                    self.cold_this_call[e] = cslot
                     used.add(hslot)
                     self.stats["hits"] += 1
                     self.stats["cold_reuses"] += 1
@@ -898,25 +926,20 @@ class ExpertStore:
                 self.stats["misses"] += 1
                 s = self._lru_slot_for(key, used)
                 if self.cold is not None:
+                    from engine.cold_promotion import ColdSlotBusy
                     try:
-                        cslot, _gen = self.cold.fetch(key, s)
-                    except Exception as exc:     # pool full, or a short read
-                        # Fall back to the ordinary path for THIS expert. The pool running dry is a
-                        # real condition -- a layer can want up to 36 distinct experts -- and it must
-                        # degrade rather than fail.
-                        from engine.cold_promotion import ColdSlotBusy
-                        if not isinstance(exc, ColdSlotBusy):
-                            raise
+                        cslot, cgen = self.cold.reserve(key, s)
+                    except ColdSlotBusy:
+                        # The pool running dry is a real condition -- a layer can want up to 36
+                        # distinct experts -- and it must degrade to the ordinary path, not fail.
                         self.stats["cold_full"] += 1
                     else:
-                        self.cold_this_call[e] = cslot
-                        self.stats["cold_fetches"] += 1
-                        # THE BYTES MUST BE COUNTED HERE. The cold path reads exactly the same record
-                        # the ordinary path reads, so leaving it out of bytes_read made nvme_gb fall
-                        # 168.9 -> 27.6 GB in the equality gate -- a 6x "win" that was purely an
-                        # accounting hole, and precisely what that gate exists to catch.
-                        self.stats["bytes_read"] += self.cold.record_bytes
-                        self.stats["read_s"] += self.cold.last_read_s
+                        # RESERVE HERE, READ LATER. Doing the blocking preadv inline serialised the
+                        # cold reads: the ordinary path submits to self.pool and gets io_threads of
+                        # concurrency, and reading per miss on the main thread threw that away -- three
+                        # misses became ~3 x 2.4 ms instead of overlapping. The reads are submitted
+                        # together below.
+                        cold_jobs.append((key, e, s, cslot, cgen))
                         slot_of[e] = s
                         used.add(s)
                         continue
@@ -935,6 +958,32 @@ class ExpertStore:
                                         "uniq": uniq.tolist(),
                                         "miss": sorted(e for e, _ in ((k[1], v) for k, v in to_load))})
                             + "\n")
+        if cold_jobs:
+            # Same pool, same concurrency the ordinary path gets. Failures release their own cold slot
+            # (abort_before_compute) and must also un-map the hot slot, which _lru_slot_for published
+            # before the read was attempted.
+            t_cold = time.perf_counter()
+            futs = [(self.pool.submit(self.cold.read_into, k, cs, g), k, e, hs, cs)
+                    for (k, e, hs, cs, g) in cold_jobs]
+            for fu, k, e, hs, cs in futs:
+                try:
+                    fu.result()
+                except Exception as exc:                      # noqa: BLE001
+                    self._forget(k, hs)
+                    slot_of.pop(e, None)
+                    used.discard(hs)
+                    self.stats["cold_read_fail"] += 1
+                    raise IOError(f"cold read failed for {k}: {exc!r}") from exc
+                self.cold_this_call[e] = cs
+                self.stats["cold_fetches"] += 1
+                # The cold path reads exactly the record the ordinary path reads; leaving it out of
+                # bytes_read made nvme_gb fall 168.9 -> 27.6 GB and looked like a 6x win.
+                self.stats["bytes_read"] += self.cold.record_bytes
+                self.stats["loads"] = self.stats.get("loads", 0) + 1
+            # charged as LOAD time, not route time: it is NVMe, and route_s is host bookkeeping
+            self.stats["load_s"] += time.perf_counter() - t_cold
+            self.stats["read_s"] += self.cold.stats["read_s"] - getattr(self, "_cold_read_s0", 0.0)
+            self._cold_read_s0 = self.cold.stats["read_s"]
         lut = np.full(self.n_experts, -1, dtype=np.int32)
         for e, s in slot_of.items():
             lut[e] = s

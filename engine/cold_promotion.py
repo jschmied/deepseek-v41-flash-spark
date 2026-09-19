@@ -120,6 +120,28 @@ class PromotionPool:
         self._promo.add((slot, gen))
         self._maybe_release(slot, gen)
 
+    def abort_before_compute(self, slot: int, gen: int) -> tuple | None:
+        """The read never delivered bytes, so no kernel can ever be reading this slot: release NOW.
+
+        `fail()` is for a promotion that failed AFTER the cold phase consumed the slot, and it waits
+        for compute_done like the success path. A read that never landed has no compute party and
+        never will, so waiting for one leaks the slot and the in-flight entry forever. The caller must
+        also undo its own mapping -- the hot slot was published before the read was attempted -- which
+        is why this returns the key.
+        """
+        self._check(slot, gen, "abort_before_compute")
+        key = self._owner.pop(slot, None)
+        if key is not None:
+            self._inflight.pop(key, None)
+        self._compute.discard((slot, gen))
+        self._promo.discard((slot, gen))
+        self._ready.discard((slot, gen))
+        self._failed.discard((slot, gen))
+        self._free.append(slot)
+        self.stats["failed"] += 1
+        self.stats["released"] += 1
+        return key
+
     def fail(self, slot: int, gen: int) -> tuple | None:
         """Abandon this promotion. Returns the key so the caller can undo its own bookkeeping.
 

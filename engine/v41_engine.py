@@ -585,6 +585,18 @@ class V41Engine:
             if not _pack:
                 raise RuntimeError("DSV41_COLD_POOL needs DSV41_CB3_CACHE: the pool is filled by "
                                    "O_DIRECT off the pack")
+            # VALIDATE THE ARENA OBJECT, not just the environment. The cold record is packed-scale
+            # CB3 driven by the v3 kernels: an FP4 hot arena cannot share the call interface, and an
+            # unpacked-scale CB3 arena has different scale row widths so the promotion copy would be
+            # wrong. Fail at startup rather than at the first miss.
+            import cb3_moe as _C3
+            if not isinstance(self.arena, _C3.CB3Arena):
+                raise RuntimeError(f"DSV41_COLD_POOL needs a CB3 arena; the main arena is "
+                                   f"{type(self.arena).__name__} (use --expert-format cb3)")
+            if not getattr(self.arena, "packed_scales", False):
+                raise RuntimeError("DSV41_COLD_POOL needs DSV41_PACKED_SCALES=1: the cold record is "
+                                   "the pack's packed-scale payload, and an unpacked arena's scale "
+                                   "planes have different row widths")
             from engine.cold_pool import ColdPool
             _n = int(os.environ.get("DSV41_COLD_SLOTS", "64"))
             self._cold_pool = ColdPool(_pack, n_slots=_n)
