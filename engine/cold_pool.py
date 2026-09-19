@@ -39,6 +39,9 @@ class ColdPool:
             raise ValueError(f"arena payload {self.arena.payload} != pack payload {self.payload}")
         if self.arena.rstride % 4096:
             raise ValueError(f"slot stride {self.arena.rstride} is not 4096-aligned; O_DIRECT needs it")
+        if self.arena.rstride != self.record_bytes:
+            raise ValueError(f"slot stride {self.arena.rstride} != pack record stride "
+                             f"{self.record_bytes}; a whole padded record must fit a slot exactly")
         self.promo = PromotionPool(n_slots)
         self.fd = os.open(pack_path, os.O_RDONLY | os.O_DIRECT)
         base = self.arena.buf.data_ptr()
@@ -62,15 +65,22 @@ class ColdPool:
         """
         layer, expert = key
         slot, gen = self.promo.reserve(key, hot_slot)
+        # Read the WHOLE PADDED record, not just the payload. Two reasons, both found by the
+        # equality gate. The payload is 13,773,312 B, which is 512-aligned but NOT 4096-aligned, so
+        # reading it works here only because this device's logical block size is 512 -- on a 4 KiB
+        # logical-block device the call would fail. And the ordinary path counts the padded record in
+        # bytes_read, so counting the payload left a 1,536 B/fetch discrepancy (0.016 GB over 10,262
+        # fetches) that showed up as the last inequality in the gate. The pad lands in the slot's own
+        # padding, which no kernel reads.
         off = slot * self.arena.rstride
         _t = time.perf_counter()
-        got = os.preadv(self.fd, [self._mv[off:off + self.payload]],
+        got = os.preadv(self.fd, [self._mv[off:off + self.record_bytes]],
                         self.record_index(layer, expert) * self.record_bytes)
         self.last_read_s = time.perf_counter() - _t
         self.stats["read_s"] += self.last_read_s
-        if got != self.payload:
+        if got != self.record_bytes:
             self.promo.fail(slot, gen)
-            raise IOError(f"short read for {key}: {got} of {self.payload}")
+            raise IOError(f"short read for {key}: {got} of {self.record_bytes}")
         self.stats["reads"] += 1
         self.stats["bytes"] += got
         self.promo.cold_ready(slot, gen)

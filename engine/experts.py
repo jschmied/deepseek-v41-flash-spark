@@ -872,7 +872,7 @@ class ExpertStore:
                         # the ordinary path reads, so leaving it out of bytes_read made nvme_gb fall
                         # 168.9 -> 27.6 GB in the equality gate -- a 6x "win" that was purely an
                         # accounting hole, and precisely what that gate exists to catch.
-                        self.stats["bytes_read"] += self.cold.payload
+                        self.stats["bytes_read"] += self.cold.record_bytes
                         self.stats["read_s"] += self.cold.last_read_s
                         slot_of[e] = s
                         used.add(s)
