@@ -424,3 +424,35 @@ complete before its layer arrives; at n concurrent reads that takes 2.8 ms x n. 
 mode in job 900 (17,610 of 18,780 arriving late) was never about knowing *what* to fetch — it is that
 issuing 18,780 reads into a device that serves one at a time cannot possibly land them in time. The
 lever is admission control, and it is bounded by 4.87 GB/s no matter what predicts.
+
+### The prediction holds on the real engine: io 48 -> 2 is +22.5 % decode (job 950)
+
+`DSV41_IO_THREADS` swept on the real v1 engine at decode, 40 GB arena, with a repeat 48 arm to pin
+the session:
+
+| io_threads | tok/s | load_wait_s | hit | GB/tok |
+|---|---|---|---|---|
+| **48 (shipped)** | 2.12 | 42.02 | 0.7456 | 1.382 |
+| 8 | 2.17 | 40.13 | 0.7456 | 1.382 |
+| 4 | 2.48 | 34.27 | 0.7456 | 1.382 |
+| **2** | **2.61** | **32.60** | 0.7456 | 1.382 |
+| 48 again | 2.13 | 41.81 | 0.7456 | 1.382 |
+
+**+22.5 %** for one environment variable, and the mechanism is confirmed rather than inferred:
+
+* `load_wait_s` drops 42.0 -> 32.6, **-22.4 %**, matching the throughput gain almost exactly. The win
+  is the wait, which is what job 945 predicted a latency tax would look like.
+* **hit rate and GB/tok are identical to the digit in every arm.** Same reads, same bytes, same cache
+  decisions — nothing about the workload changed, only how long the engine waited for reads it was
+  always going to make. That is as clean a confirmation as this harness can produce.
+* The two 48 arms bracket at 2.12 / 2.13, so the session is pinned and the difference is not drift.
+
+**Scope, and it matters before shipping.** This is a 40 GB arena at hit 0.73-0.75, i.e. miss-heavy.
+At 86 GB the hit rate is 0.93, so there are ~3.7x fewer misses to wait on and the win should shrink —
+possibly a lot. It is also decode-only: prefill issues reads it will all consume, and job 945 says
+aggregate bandwidth is flat, so prefill *should* be indifferent to depth, but that is an inference,
+not a measurement, and the CB3 unpack path may interact.
+
+So the shippable claim is not yet "set io_threads=2". It is "read concurrency is a pure latency tax
+at decode, worth up to +22.5 % at high miss rates, and the shipped global 48 is the wrong setting for
+at least one phase." The next job measures it at 86 GB and checks prefill is unharmed.
