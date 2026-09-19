@@ -99,5 +99,10 @@ It does not work yet, and the failure is isolated:
   slot 7 still produce different outputs, so the plane-major arithmetic is intact and job 1035's
   bitwise equality was against a correct reference.
 
-The kernel commit is therefore held LOCAL, unpushed: its default branch is verified, its `RSTRIDE != 0`
-branch is not.
+I intended to hold the kernel commit local until `RSTRIDE != 0` was verified, and then pushed a notes
+commit on top of it -- which pushes the ancestor too. So it IS pushed (d0cc981). That is safe in
+substance rather than by plan: the `RSTRIDE = 0` default is verified (slot resolution intact, bitwise
+equality in job 1035) and **no call site passes `RSTRIDE`**, so the broken branch is unreachable from
+anything that runs. But the sequencing was wrong, and the lesson is that "commit locally, push later"
+does not survive committing anything else on top of it: stage the unverified change last, or keep it
+on its own branch.
