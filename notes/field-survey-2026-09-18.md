@@ -526,3 +526,37 @@ prefill on the same prompt cannot.
 decode across five prompts, 13-20 % less load wait in every arm, prefill 6-12 % faster, hit rate and
 byte counts unchanged. The shipped 48 was chosen for prefill throughput on the assumption that read
 concurrency buys bandwidth; job 945 measured that it does not.
+
+### The read-piece sweep refutes my extrapolation, and sharpens the rule (job 965)
+
+Same five prompts, io pinned at the newly shipped 2, sweeping the SECOND pool -- the one that splits
+each 13,774,848 B expert into aligned pieces:
+
+| config | pieces/expert | P0 | P1 | P2 | P3 | P4 |
+|---|---|---|---|---|---|---|
+| **96 x 4 MB (shipped)** | 3.3 | 3.73 | 12.79 | 15.79 | 8.79 | 4.66 |
+| 96 x 4 MB again | 3.3 | 3.83 | 12.85 | 13.53 | 7.82 | 4.48 |
+| 96 x 16 MB | 0.8 | 3.64 | 12.67 | 14.30 | 8.32 | 4.44 |
+| 8 x 4 MB | 3.3 | 3.67 | 13.25 | 14.96 | 8.38 | 4.28 |
+| 8 x 16 MB | 0.8 | 3.39 | 11.41 | 14.67 | 8.07 | 4.14 |
+
+**Nothing beats the shipped configuration**, and `8 x 16 MB` -- the fewest concurrent pieces, the n=1
+the device supposedly wants -- is lowest on four of five prompts. My extrapolation from job 945 was
+wrong.
+
+**Why, and this is the useful part.** Job 945's tax applies to concurrency *across independent reads*,
+where only one of them is on the critical path and the rest stretch it. Pieces of a *single* expert are
+not independent: all of them must land before that expert is usable, so splitting one 13.77 MB read
+into 3.4 concurrent pieces costs nothing — aggregate is flat, so 3.4 pieces at total/3.4 finish in the
+same 2.8 ms as one read at total. The tax needs a victim, and within one expert there is none.
+
+So the rule is narrower than I wrote it: **read concurrency is a latency tax only when it is across
+requests you do not all need yet.** `io_threads` fetches different experts, most of which the current
+step does not need — taxable. `read_threads` fetches pieces of one expert, all needed — neutral.
+
+**And a noise-floor correction that touches job 960.** The two identical 96 x 4 arms here differ by
+17 % on P2 and 12 % on P3. First-request measurements on those two prompts are not reliable to better
+than ~15 %, which means **job 960's +1.6 % (P1) and +1.5 % (P3) were noise**, not small wins. What
+survives there is P0 +10.3 %, P2 +8.0 % and P4 +9.6 %, where the repeat arms agreed to 1.4-4 % — three
+prompts, not five. `DSV41_IO_THREADS=2` still stands on those three plus the uniform 13-20 % drop in
+`load_wait_s`, which is the counter that does not have this variance problem.
