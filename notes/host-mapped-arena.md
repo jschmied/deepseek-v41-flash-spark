@@ -220,3 +220,50 @@ configuration is an upper bound. The one-contiguous-copy form needs the hot aren
 Counters worth keeping from the run: `cold_reuses: 0` over 10,262 fetches, so no expert was wanted
 again while its promotion was still in flight; and `cold_full: 0` with a 64-slot pool, so the pool
 never ran dry even though a layer can want 36 distinct experts.
+
+## The engine divergence: what it is not, and the one-position shift (jobs 1085-1125)
+
+With `DSV41_COLD_POOL=1` the five-prompt gate diverges at p3, token 5, deterministically. Eliminated,
+each by measurement rather than argument:
+
+| hypothesis | test | result |
+| --- | --- | --- |
+| async ordering | `DSV41_COLD_SYNC=1` (1095 D) | diverges identically |
+| cold-slot recycling | 256-slot pool (1095 C) | diverges identically |
+| split kernel arithmetic | per-layer reference (1100/1105) | 2,746 layers, zero differences |
+| uninitialised h/parts | `DSV41_COLD_ZERO=1` (1120) | diverges identically |
+| eviction protection bypass | `_blocked_slots()` (in 1120) | diverges identically |
+
+**Localisation (1115/1125).** First difference is trace 2178, layer 21: routes IDENTICAL, slots
+different, and the ROUTED OUTPUT different. The layer after it then routes differently, which is the
+downstream consequence. Decisively, **that layer has `cold 0` in both arms** -- no cold experts at
+all, so it ran the ordinary `moe_fn` path in both. Identical code, identical route, different value
+means the ARENA CONTENTS differ, not the split.
+
+**The shape of the slot difference is a one-position shift.** Same 37 experts; 23 of them sit in the
+slot the *previous* expert held in the baseline:
+
+    expert   7: OFF 2631  ON  868      <- a slot new to this layer
+    expert  13: OFF  831  ON 2631      <- expert 7's baseline slot
+    expert  41: OFF  348  ON  831      <- expert 13's baseline slot
+    expert  57: OFF   49  ON 2749      <- expert 22's baseline slot
+
+That is an allocation sequence offset by one, not a corrupted mapping -- and it fits ON having made
+one fewer allocation earlier (its miss count is 23,046 against the baseline's 23,302).
+
+**What is still unexplained, and it is the important part.** A shifted-but-self-consistent assignment
+should not change any value: every expert still occupies a slot of its own. The value DID change, at a
+layer with no cold experts. So somewhere an expert's slot does not hold that expert's bytes, and the
+shift is a symptom of the same cause rather than the cause itself.
+
+**Next instrument**, chosen because it tests the remaining claim directly instead of adding another
+hypothesis: validate residency itself. For the layers around 2178, re-read each resolved expert from
+the pack and compare it against what its slot actually holds. That says which expert is wrong and
+whether it was ever promoted, and it does not depend on any theory of how it got that way.
+
+**A correction to an earlier claim in this note.** Job 1105's "bitwise over 2,746 in-engine layers"
+is weaker than stated: its reference recompute ran immediately after the split and would have drawn
+the same allocator blocks, so it could not have detected a garbage-dependent difference, and more
+fundamentally it compares split against reference WITHIN one arm -- it can never see the two arms
+being fed different inputs, which is exactly the situation that obtains here. The microbenchmark
+bitwise results (1040, 1065, and the real-record test) do not depend on that and stand.
