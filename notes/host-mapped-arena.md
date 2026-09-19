@@ -72,10 +72,18 @@ costs **+0.108 ms/layer** for 3 cold experts, i.e. +0.036 ms per cold expert.
 | promotion exposed after hiding (job 1070) | +0.102 |
 | **net** | **−0.754** |
 
-So a cold expert costs about 0.75 ms less than it does today, with cache semantics preserved. What that
-becomes end to end needs the engine change and its own paired run — the per-miss figure is not a tok/s
-claim, and this project has twice had a wall-clock result dissolve under drift and token-count
-artefacts.
+So a cold expert costs about 0.75 ms less than it does today, **including the measured cost of
+restoring hot residency**. It is not a claim that cache semantics are preserved: no lifetime or
+ownership logic exists yet, and that is the next thing to build.
+
+**And the three terms come from three separate experiments, so this is a component model rather than a
+measured miss path.** The interaction none of them contains is bandwidth contention with the NVMe reads
+themselves. In production, four things share GB10's one memory fabric at the same time: NVMe DMA
+writing into DRAM, the GPU reading mapped cold records, the GPU reading hot records, and the
+DRAM-to-DRAM promotion. Job 1070 already shows the promotion cannot be fully hidden because it contends
+with the kernels; the same argument applies with several GB/s of SSD traffic landing in the same pool.
+The per-miss figure is not a tok/s claim, and this project has twice had a wall-clock result dissolve
+under drift and token-count artefacts.
 
 ## Record-major addressing works (and the bug that made it look otherwise)
 
@@ -120,6 +128,17 @@ same pool.
 would beat issuing it before, on contention grounds. D (before) measured 2.907 against C's 2.966 — 2 %
 the other way. The margin is small and it is one measurement, so it does not invert the design, but the
 ordering argument is unsupported and should not be repeated as if it were established.
+
+The design nevertheless takes **after**, on ownership grounds rather than speed: with promotion issued
+after the cold phase, the cold slot's compute lifetime is already finished when the copy starts, so the
+source slot has one reader at a time and its state machine is simpler. Issuing before gives the cold
+record two concurrent GPU readers — the cold CB3 kernel and the promotion copy — and recycling that slot
+when either one finishes would corrupt the other. 2 % is not worth that. Revisit only if the end-to-end
+gain makes it matter.
+
+**The "we have 40 layers to hide the copy" model is dead.** Temporal room is not free bandwidth. The
+copy moves bytes through the same pool as the kernels, so overlap buys only what spare bandwidth
+exists — 57 %, here.
 
 Job 975's 0.9–2.0 ms H2D still looks dominated by today's staging and scatter rather than by the
 physical copy: one contiguous record copy costs 0.237 ms synchronous.
