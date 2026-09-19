@@ -868,6 +868,12 @@ class ExpertStore:
                     else:
                         self.cold_this_call[e] = cslot
                         self.stats["cold_fetches"] += 1
+                        # THE BYTES MUST BE COUNTED HERE. The cold path reads exactly the same record
+                        # the ordinary path reads, so leaving it out of bytes_read made nvme_gb fall
+                        # 168.9 -> 27.6 GB in the equality gate -- a 6x "win" that was purely an
+                        # accounting hole, and precisely what that gate exists to catch.
+                        self.stats["bytes_read"] += self.cold.payload
+                        self.stats["read_s"] += self.cold.last_read_s
                         slot_of[e] = s
                         used.add(s)
                         continue

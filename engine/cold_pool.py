@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import torch
 
@@ -44,7 +45,8 @@ class ColdPool:
         if base % 4096:
             raise RuntimeError(f"pinned base is not page aligned ({base % 4096}); O_DIRECT needs it")
         self._mv = memoryview(self.arena.buf.numpy())
-        self.stats = {"reads": 0, "bytes": 0, "promotions": 0}
+        self.stats = {"reads": 0, "bytes": 0, "promotions": 0, "read_s": 0.0}
+        self.last_read_s = 0.0
 
     # ------------------------------------------------------------------ fetch
     def record_index(self, layer: int, expert: int) -> int:
@@ -61,8 +63,11 @@ class ColdPool:
         layer, expert = key
         slot, gen = self.promo.reserve(key, hot_slot)
         off = slot * self.arena.rstride
+        _t = time.perf_counter()
         got = os.preadv(self.fd, [self._mv[off:off + self.payload]],
                         self.record_index(layer, expert) * self.record_bytes)
+        self.last_read_s = time.perf_counter() - _t
+        self.stats["read_s"] += self.last_read_s
         if got != self.payload:
             self.promo.fail(slot, gen)
             raise IOError(f"short read for {key}: {got} of {self.payload}")
