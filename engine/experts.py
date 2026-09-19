@@ -320,6 +320,12 @@ class ExpertStore:
             return
         _t = time.perf_counter()
         self.stats["cold_split_layers"] += 1
+        # DSV41_COLD_SYNC=1 removes ALL asynchrony from the cold path: the cold phase is completed
+        # and each promotion copy finished before the layer returns. A diagnostic, not a mode -- if a
+        # divergence survives it, the fault is in the split or the residency logic, not in ordering.
+        _sync = os.environ.get("DSV41_COLD_SYNC", "0") == "1"
+        if _sync:
+            torch.cuda.current_stream().synchronize()
         ev_compute = torch.cuda.Event()
         ev_compute.record(torch.cuda.current_stream())
         if stream is not None:
@@ -333,6 +339,11 @@ class ExpertStore:
             slot, gen, _hot = ent
             _s, _g, ev = self.cold.promote(key, hot_arena, stream=stream)
             self._cold_inflight.append((key, _s, _g, ev, ev_compute))
+        if _sync:
+            if stream is not None:
+                stream.synchronize()
+            torch.cuda.synchronize()
+            self.cold_reap()
         if len(self._cold_inflight) > self.stats["cold_inflight_max"]:
             self.stats["cold_inflight_max"] = len(self._cold_inflight)
         self.cold_this_call = {}
