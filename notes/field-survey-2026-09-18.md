@@ -279,3 +279,47 @@ Two consequences, and they point in opposite directions:
 
 Recorded as an accident rather than a result. The next job fixes the misfire draw and tests width as
 its own axis, so the two are not confounded again.
+
+### Queue depth refuted — and it exposes something worse (job 935)
+
+The hypothesis: job 930 showed *genuinely useless* reads making things faster (p0.40 +82.1 % vs
+p1.00 +52.8 %, with 7x fewer useful prefetches landing in time), and the null arm leaves the device
+idle 32.5 % of the window. So maybe "prefetch" was partly measuring queue occupancy, not knowledge.
+
+**Refuted.** Giving the null arm more depth makes it dramatically worse:
+
+| arm | steps/s | device idle | in-flight |
+|---|---|---|---|
+| null 8/8/8/2 | 3.119 | 32.3 % | 4.45 GB/s |
+| null 16/16/8/4 | 1.301 | 41.2 % | 4.53 |
+| null **48/48/24/8** | **0.619** | 47.3 % | 4.90 |
+| recall 0.60, 8/8/8/2 | 4.498 | 9.5 % | 4.47 |
+| recall 0.60, 48/48/24/8 | 0.747 | 37.3 % | 5.00 |
+
+So prefetch's win is real and not a queue artifact. But the shape of the refutation is alarming:
+**48/48/24/8 is production's own loader configuration** (`io 48/96` is shipped), and in this harness
+it is **5x slower** than 8/8/8/2 — with idle time *rising* as depth rises, while in-flight bandwidth
+improves. Depth goes up, the device gets busier per read, and wall time explodes.
+
+The harness's own comment at that call site anticipated the opposite:
+
+> These were fixed at 8/8/8/2 while production runs io 48/96, and job 545 then saturated at
+> 2.8 GB/s with the queue full ... against a device that does ~6.3 from depth 2. A ceiling measured
+> at one eighth of the shipped concurrency is not a device ceiling until it has been swept.
+
+It has now been swept, and the answer is the reverse of what that note expected.
+
+**What this means for every prefetch number above.** They were all measured at 8/8/8/2 — one sixth of
+shipped concurrency — on a loader that *degrades* when corrected toward production. The relative
+ordering (more recall is better, horizon peaks at 4, precision barely matters) held across many arms
+and is probably safe. The **magnitudes** are not: +52.8 % or +82.1 % against a baseline that is itself
+a configuration production does not use.
+
+Two candidate explanations, neither tested: contention (48 worker threads serialising on the arena or
+the slot table, which would make depth actively harmful), or the mechanism already on the standing
+priorities list for job 170 — `wait_stream` records its event where CALLED, so more queued work means
+longer waits for the very reads it meant to overlap. The second would predict exactly this: depth up,
+idle up, wall up.
+
+**Next, and it is a loader question rather than a prediction one**: find out why depth hurts. Until
+that is answered, the prefetch magnitudes should be quoted as "at 8/8/8/2" or not quoted at all.
