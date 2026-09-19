@@ -872,6 +872,15 @@ class V41Engine:
                 "lease_s": round(st["lease_s"], 2), "h2d_s": round(st["h2d_s"], 2),
                 "kernel_s": round(m.stats["moe_s"] - st["resolve_s"], 2),
                 "nvme_gb_per_token": round(st["bytes_read"] / 1e9 / max(n_out, 1), 3),
+                # cold path (DSV41_COLD_POOL); all zero when it is off
+                "cold_fetches": st.get("cold_fetches", 0),
+                "cold_reuses": st.get("cold_reuses", 0),
+                "cold_promotions": st.get("cold_promotions", 0),
+                "cold_full": st.get("cold_full", 0),
+                "cold_split_layers": st.get("cold_split_layers", 0),
+                "cold_inflight_max": st.get("cold_inflight_max", 0),
+                "cold_reap_s": round(st.get("cold_reap_s", 0.0), 4),
+                "cold_promote_s": round(st.get("cold_promote_s", 0.0), 4),
                 "promoted": st["promoted"],
                 # decode-only, from the prefill snapshot: the totals above are prefill + decode and
                 # prefill dominates every I/O counter, so these are the ones to reason about.

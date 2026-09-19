@@ -264,6 +264,14 @@ class ExpertStore:
         self.stats.setdefault("cold_reuses", 0)
         self.stats.setdefault("cold_promotions", 0)
         self.stats.setdefault("cold_full", 0)
+        # PROMOTION-INDUCED BLOCKING is the number this whole design lives or dies on: the copy is
+        # allowed to cost bandwidth, it is not allowed to make the critical path wait. These name the
+        # three ways it could.
+        self.stats.setdefault("cold_reap_s", 0.0)        # time polling for landed promotions
+        self.stats.setdefault("cold_reap_calls", 0)
+        self.stats.setdefault("cold_inflight_max", 0)    # high-water of outstanding promotions
+        self.stats.setdefault("cold_split_layers", 0)    # layers that ran two phases
+        self.stats.setdefault("cold_promote_s", 0.0)     # host time issuing the copies
 
     def cold_reap(self) -> int:
         """Mark every promotion whose event has LANDED. Called at layer boundaries.
@@ -272,8 +280,10 @@ class ExpertStore:
         be in flight, it is only residency that must wait for it. An entry that has not landed stays
         in the list and its hot slot stays protected.
         """
+        self.stats["cold_reap_calls"] += 1
         if not self._cold_inflight:
             return 0
+        _t = time.perf_counter()
         keep, n = [], 0
         for key, slot, gen, ev in self._cold_inflight:
             if ev.query():
@@ -283,6 +293,7 @@ class ExpertStore:
             else:
                 keep.append((key, slot, gen, ev))
         self._cold_inflight = keep
+        self.stats["cold_reap_s"] += time.perf_counter() - _t
         return n
 
     def cold_finish_layer(self, hot_arena, stream=None) -> None:
@@ -295,6 +306,8 @@ class ExpertStore:
         """
         if not self.cold or not self.cold_this_call:
             return
+        _t = time.perf_counter()
+        self.stats["cold_split_layers"] += 1
         for e, cslot in self.cold_this_call.items():
             key = (self._cold_layer, e)
             ent = self.cold.promo._inflight.get(key)
@@ -304,7 +317,10 @@ class ExpertStore:
             self.cold.promo.compute_done(slot, gen)
             _s, _g, ev = self.cold.promote(key, hot_arena, stream=stream)
             self._cold_inflight.append((key, _s, _g, ev))
+        if len(self._cold_inflight) > self.stats["cold_inflight_max"]:
+            self.stats["cold_inflight_max"] = len(self._cold_inflight)
         self.cold_this_call = {}
+        self.stats["cold_promote_s"] += time.perf_counter() - _t
 
     def _shard(self, name: str) -> ShardFile:
         f = self.index[name]
