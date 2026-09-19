@@ -725,6 +725,19 @@ class Model:
         # promotion is issued afterwards. The lookup is inline rather than a helper so nothing new is
         # defined at module level here -- doing that once terminated the Model class body and moved
         # thirteen methods, including forward(), out of it, which ast.parse accepts happily.
+        if os.environ.get("DSV41_COLD_TRACE", "0") == "1" and n_experts != 128:
+            # Per (call, layer): a hash of the ROUTE and of the SLOTS it resolved to. COLD_VERIFY
+            # compares the split against a reference inside one arm, so it cannot see the two arms
+            # being fed different inputs -- which is exactly what is left after it found zero
+            # differing layers while the tokens still differed. Diffing this between arms localises
+            # the first divergence to routing, to slot assignment, or to neither.
+            import hashlib as _h
+            _i = getattr(self, "_ct_i", 0) + 1
+            self._ct_i = _i
+            _r = _h.sha256(indices.to("cpu").numpy().tobytes()).hexdigest()[:10]
+            _s = _h.sha256(slots.to("cpu").numpy().tobytes()).hexdigest()[:10]
+            if _i <= 400:
+                print(f"  CT {_i:04d} L{L:02d} route {_r} slots {_s}", flush=True)
         cold_of = None
         if getattr(store, "cold", None) is not None and getattr(store, "cold_this_call", None):
             infl = store.cold.promo._inflight
