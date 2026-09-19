@@ -26,6 +26,13 @@ ap.add_argument("--verify-every", type=int, default=32, help="read back and comp
 ap.add_argument("--src", default="root@10.0.0.70:/mnt/bulk/hf/deepseek-ai--DeepSeek-V4.1-Flash")
 ap.add_argument("--key", default="/home/jschmied/.ssh/id_ed25519")
 ap.add_argument("--keep-shards", action="store_true")
+# THE DRAFTER PACK. The DSpark draft experts live under a different prefix (mtp.{k}.ffn.experts.{e}.),
+# there are 128 of them per layer rather than 384, and their shards are already local -- so the
+# arithmetic shard_name(L) guess and the rsync prefetch must both be bypassed. Every default below
+# reproduces the main 0-39 build byte for byte; see notes/drafter-cb3-gate.md.
+ap.add_argument("--prefix-fmt", default="layers.{L}.ffn.experts.{e}.")
+ap.add_argument("--index", default="", help="resolve each layer's shard from this index.json "
+                                           "instead of the model-{L+3:05d} arithmetic")
 a = ap.parse_args()
 
 sys.path.insert(0, a.repo)
@@ -61,7 +68,13 @@ sim = CodebookSim(3, dev)
 SSH = f"ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i {a.key}"
 
 
+_WMAP = json.load(open(a.index))["weight_map"] if a.index else None
+FETCHED = set()
+
+
 def shard_name(L):
+    if _WMAP is not None:
+        return _WMAP[a.prefix_fmt.format(L=L, e=0) + "w1.weight"]
     return f"model-{L+3:05d}-of-00048.safetensors"
 
 
@@ -69,6 +82,7 @@ def ensure_shard(L):
     p = os.path.join(a.shard_dir, shard_name(L))
     if os.path.exists(p):
         return p
+    FETCHED.add(p)
     subprocess.run(["flock", f"/tmp/dsv41-fetch-{shard_name(L)}.lock", "-c",
                     f"[ -f {p} ] || (rsync -a --partial -e '{SSH}' {a.src}/{shard_name(L)} {p}.part "
                     f"&& mv {p}.part {p})"], check=True)
@@ -101,21 +115,24 @@ def build_layer(L, fd, f_read):
                 # the codec must be exactly lossless, every expert, no sampling
                 assert (unpack(sp, sg) == s.cpu().numpy().reshape(shape[0], sg)).all(), \
                     f"scale roundtrip failed at L{L} e{e} {tag}"
-            idx = L * N_EXPERTS + e
+            idx = L * a.experts + e
             os.pwrite(fd, bytes(rec), idx * RECORD)
             if a.verify_every and e % a.verify_every == 0:
                 back = os.pread(f_read, RECORD, idx * RECORD)
                 assert back == bytes(rec), f"read-back mismatch at L{L} e{e}"
                 nver += 1
     os.fsync(fd)
-    if not a.keep_shards:
+    if not a.keep_shards and (p in FETCHED or not a.index):
+        # The main 0-39 build MUST keep deleting: 40 shards at ~7 GB against 194 GB free, so
+        # reclamation is load-bearing there and its behaviour is unchanged. An --index build reads
+        # shards that were already local and are not ours to delete.
         os.remove(p)
     return time.time() - t0, nver
 
 
 if __name__ == "__main__":
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    total = N_LAYERS * N_EXPERTS * RECORD
+    total = (hi_l + 1) * a.experts * RECORD
     print(f"  payload {PAYLOAD:,} B  record {RECORD:,} B (pad {RECORD-PAYLOAD})  "
           f"full cache {total/1e9:.1f} GB")
     print(f"  planes: " + " ".join(f"{n}@{OFF[n][0]}" for n, _ in PLANES))
@@ -123,7 +140,7 @@ if __name__ == "__main__":
     os.ftruncate(fd, total)
     f_read = os.open(a.out, os.O_RDONLY)
     for L in range(lo_l, hi_l + 1):
-        if L + 1 <= 39:
+        if not a.index and L + 1 <= 39:
             subprocess.Popen(["flock", f"/tmp/dsv41-fetch-{shard_name(L+1)}.lock", "-c",
                               f"[ -f {a.shard_dir}/{shard_name(L+1)} ] || "
                               f"(rsync -a --partial -e '{SSH}' {a.src}/{shard_name(L+1)} "
@@ -134,8 +151,8 @@ if __name__ == "__main__":
         print(f"  layer {L:>2}: {a.experts} experts in {dt:6.1f}s  ({dt/a.experts*1e3:5.1f} ms/expert)"
               f"  {nver} read-back verified   disk free {free:.0f} GB", flush=True)
     os.close(fd); os.close(f_read)
-    man = dict(format_version=1, codec=__import__("scale_codec").CODEC, record_bytes=RECORD, payload_bytes=PAYLOAD, align=ALIGN, n_layers=N_LAYERS,
-               n_experts=N_EXPERTS, planes={n: OFF[n] for n, _ in PLANES},
+    man = dict(format_version=1, codec=__import__("scale_codec").CODEC, record_bytes=RECORD, payload_bytes=PAYLOAD, align=ALIGN, n_layers=hi_l - lo_l + 1,
+               n_experts=a.experts, prefix_fmt=a.prefix_fmt, planes={n: OFF[n] for n, _ in PLANES},
                scale_bits=3, scale_groups={"s1": SG1, "s3": SG1, "s2": SG2},
                codebook="CodebookSim(3)", source="deepseek-ai/DeepSeek-V4.1-Flash",
                built=time.strftime("%Y-%m-%dT%H:%M:%S"), layers=[lo_l, hi_l])
