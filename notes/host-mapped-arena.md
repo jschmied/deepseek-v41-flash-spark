@@ -181,12 +181,28 @@ failure cannot be confused with CUDA-graph capture.
 keys, identical sha**. That last one is the P0 hazard, and it is clean: promotion does restore
 residency, so the hit rate the design depends on survives the design.
 
-**And the gate caught a metric bug that would have manufactured a fake win.** `nvme_gb` fell from
+**The gate now PASSES in full (job 1080).** Every field identical: token ids per prompt, misses
+(6,423 / 3,839), hit rate (0.7019 / 0.7508), **nvme_gb (103.52 / 65.39)**, accept_len_mean, steps, and
+the resident key set (2,504 keys, same sha) — with 10,262 experts read by O_DIRECT into mapped slots,
+computed there and promoted back. `cold_reuses` 0, `cold_full` 0, `failed` 0. The cold path is
+semantically indistinguishable from the baseline, so timing may now be measured.
+
+It took two fixes to get there, both found by the gate rather than by reading the code.
+
+**First, a metric bug that would have manufactured a fake win.** `nvme_gb` fell from
 168.91 GB to 27.55 GB. The gap is 141.36 GB; 10,262 cold fetches at 13.775 MB is 141.36 GB, residual
 0.00. The cold path reads exactly the same records and simply never added them to
 `store.stats["bytes_read"]`. Had the first measurement been a timing run instead of an equality run,
 that would have read as a 6x reduction in NVMe traffic and been completely false. Fixed: the cold
 fetch now accounts its bytes and its read time into the store's own counters.
+
+**Second, the 0.01 GB that was left turned out to be two problems.** 1,536 B per fetch x 10,262 =
+0.016 GB, because the ordinary path counts the PADDED record (13,774,848) and the cold path counted the
+payload (13,773,312). Chasing that surfaced the more serious half: the payload is 512-aligned but **not
+4096-aligned**, so the O_DIRECT read worked only because this device's logical block size is 512 — on a
+4 KiB logical-block device it would have failed outright. Reading the whole padded record fixes both;
+the pad lands in the slot's own padding, which no kernel reads. Construction now asserts the slot
+stride equals the pack's record stride.
 
 Two implementation notes, one a correction of my own design note:
 
