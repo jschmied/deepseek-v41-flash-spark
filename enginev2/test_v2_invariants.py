@@ -2020,3 +2020,38 @@ def test_decode_step_is_a_sequence_position_not_a_per_call_counter():
     e.decode(1)
     assert seen == [0, 1, 2, 3, 4], f"a counter reset moved the sequence: {seen}"
     assert e.seq_step == before + 1
+
+
+def test_seq_step_restarts_at_a_request_boundary_but_not_at_a_counter_reset():
+    """The contract: counter reset -> survives; new window -> survives; new REQUEST -> 0.
+
+    `decode()`'s docstring originally said seq_step is "never reset", which was too broad. V2Engine
+    owns one driver across requests, so without a boundary call request 2 continues request 1's
+    numbering and `chain.wait("logits", step - 1)` on its first step depends on the PREVIOUS request's
+    final logits event. Today's speculative select_block ignores the numeric step so tokens do not
+    change, which is exactly why this needs a test rather than trust.
+    """
+    calls = load_decode()
+    cut = warmup_cut(calls)
+    e = Engine(V2, lru_slots=5328, transient_slots=400, scale=SCALE,
+               leaves=ModelLeaves(calls, Bandwidth(scale=SCALE), scale=SCALE, start=cut))
+    e.warm(calls, cut)
+    seen = []
+    orig = e.leaves.select_block
+
+    def spy(step):
+        seen.append(step)
+        return orig(step)
+
+    e.leaves.select_block = spy
+
+    e.decode(2)                      # request A
+    assert seen == [0, 1], seen
+    e.c = type(e.c)()                # a measurement reset must NOT move the sequence
+    e.decode(1)
+    assert seen == [0, 1, 2], f"a counter reset restarted the sequence: {seen}"
+
+    e.begin_request()                # request B
+    e.decode(2)
+    assert seen == [0, 1, 2, 0, 1], f"a request boundary did not restart the sequence: {seen}"
+    assert e.seq_step == 2

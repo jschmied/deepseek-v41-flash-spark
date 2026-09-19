@@ -527,7 +527,7 @@ decode across five prompts, 13-20 % less load wait in every arm, prefill 6-12 % 
 byte counts unchanged. The shipped 48 was chosen for prefill throughput on the assumption that read
 concurrency buys bandwidth; job 945 measured that it does not.
 
-### The read-piece sweep refutes my extrapolation, and sharpens the rule (job 965)
+### ~~The read-piece sweep refutes my extrapolation~~ — JOB 965 IS VOID (see below)
 
 Same five prompts, io pinned at the newly shipped 2, sweeping the SECOND pool -- the one that splits
 each 13,774,848 B expert into aligned pieces:
@@ -580,3 +580,30 @@ the median: **+9 %**, not the +19.9 % of the best round. `load_wait_s` falls in 
 
 `DSV41_IO_THREADS=2` stays shipped, now on a paired design rather than single first-request numbers.
 The pre-registered revert branch does not fire.
+
+
+### Job 965 is VOID: the knobs it swept do not reach the active read path
+
+`ExpertStore._load_into_slot` (`experts.py:352`) dispatches to `_load_into_slot_cached` whenever
+`cb3_cache is not None` — which `.env` always makes true via `DSV41_CB3_CACHE`. That path performs
+**one** `c.read_into(...)` for the complete 13,774,848 B record and never touches `self.read_pool` or
+`self.read_chunk`. Those belong to `_read_leased()`, the FP4/safetensors path we no longer use.
+
+So all four job-965 arms — 96x4, 96x16, 8x4, 8x16 — were **functionally identical**. The sweep
+measured nothing about piece sizing. What it did measure, usefully, is the **noise floor of
+first-request timing: 12-17 % on P2 and P3**, which is what invalidated job 960's small numbers and
+motivated job 970's paired design. That part stands.
+
+**Withdrawn with it**: my explanation that "3.4 concurrent pieces of one expert are free because all
+are needed and aggregate is flat". It is a plausible account of a result that never happened. The
+narrower rule I drew from it — concurrency taxes only reads you do not all need yet — is *untested*,
+not established. Removed from the RFC draft.
+
+Two follow-ups, neither needing the GPU:
+
+* **Preflight now rejects this class of job.** A sweep of `DSV41_READ_THREADS` or
+  `DSV41_READ_CHUNK_MB` while `DSV41_CB3_CACHE` is set cannot reach the code it claims to test, and
+  that is checkable statically. Knob liveness belongs in preflight next to the other gates.
+* **`engine/experts.py`'s header still explains the two-pool design as splitting each expert into
+  aligned pieces to keep the NVMe busy.** For the shipped CB3 path that is no longer what happens, and
+  the comment is now actively misleading — it is what made this sweep look sensible to me.

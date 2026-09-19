@@ -164,6 +164,11 @@ class V2Engine(_ServerEngine):
         # which makes a multi-request trace unreadable exactly when multi-request behaviour is the
         # thing under investigation.
         self.driver.request_id += 1
+        # SEQUENCE POSITION RESTARTS WITH THE REQUEST. One driver serves every request, so without
+        # this request 2 would continue request 1's numbering and chain.wait("logits", step - 1) would
+        # depend on the previous request's final logits event. Harmless today because speculative
+        # select_block ignores the numeric step; not harmless for any step-relative predictor.
+        self.driver.begin_request()
         stop = set(stop_token_ids or ())
         # SEED BEFORE ANYTHING IS SAMPLED. This used to sit inside attach(), which runs AFTER the
         # first token has been drawn -- so the first token was not reproducible from (prompt, seed),

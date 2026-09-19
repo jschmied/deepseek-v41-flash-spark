@@ -60,6 +60,10 @@ class _FakeDriver:
         # __init__ and every OpContext carries it.
         self.request_id = 0
 
+    def begin_request(self):
+        """Request boundary: the real driver restarts seq_step here. See drivers.py::begin_request."""
+        self.seq_step = 0
+
     def decode(self, n):
         for _ in range(n):
             self.leaves.step()

@@ -222,6 +222,21 @@ class ExpertStore:
         # the whole read + H2D); `read_pool` runs the individual aligned pieces of that expert's two
         # file runs. A single pool would deadlock as soon as every worker sat waiting for a piece
         # that has no worker left to run it.
+        #
+        # ON THE CB3 CACHE PATH `read_pool` AND `read_chunk` ARE DEAD. `_load_into_slot` dispatches to
+        # `_load_into_slot_cached` whenever `cb3_cache is not None`, and that path issues ONE
+        # `read_into` for the whole 13,774,848 B record -- the format exists precisely so a miss is one
+        # contiguous extent. The piece splitting above belongs to `_read_leased()`, the FP4/safetensors
+        # path, which the shipped configuration no longer uses. This comment used to describe the
+        # splitting as the live mechanism, and that is what made job 965 look like a sensible
+        # experiment: it swept DSV41_READ_THREADS and DSV41_READ_CHUNK_MB across four arms that were
+        # all identical. Preflight now refuses that sweep while DSV41_CB3_CACHE is set.
+        #
+        # `io_threads` IS live on both paths, and it is not only NVMe concurrency: it sets the worker
+        # count, the staging-buffer count, the worker-local copy streams and H2D concurrency together.
+        # Job 970 measured 48 -> 2 as a median +9 % (3 of 3 paired), but that A/B cannot attribute the
+        # win to read latency alone -- only job 945's raw O_DIRECT curve makes that the leading
+        # explanation.
         self.pool = ThreadPoolExecutor(io_threads, thread_name_prefix="expert-io")
         self.read_pool = ThreadPoolExecutor(max(1, read_threads), thread_name_prefix="expert-read")
         self.lock = threading.Lock()

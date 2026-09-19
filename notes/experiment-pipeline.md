@@ -78,3 +78,16 @@ its missing Triton gate. That job cost a real queue slot and measured nothing.
   register pressure, codec validity, bitwise arithmetic and most decode latency never need it.
 - **One bundle per question, fail-fast**: compile metadata, bitwise, T=6 and T=24 timing belong in
   one script that aborts at the first failed gate, not four queue jobs.
+
+## Retention: the predicted failure happened (2026-09-19)
+
+The review warned that "keep last 8 worktrees is not enough if job 790's measurement code disappears
+by job 900", and asked for the manifest to retain payload contents permanently. It was not done, and
+by job 970 the consequence arrived: verifying whether job **875** and job **905** ran comparable
+configurations was impossible, because `submit.sh` had pruned both worktrees and `jobs/` holds only
+the generated wrapper. The 6,243-slot row was dropped from the RFC draft for want of a parity check
+that the archive should have made trivial.
+
+Fixed: `submit.sh` now copies the resolved job script and its payloads into `logs/archive/<job>/`
+alongside a SHA256 manifest, before the worktree can be pruned. Worktrees stay disposable; the
+evidence does not.

@@ -291,7 +291,13 @@ print("  misfire pool per layer: " + ", ".join(
 
 class _RecallFromTrace(TraceOracle):
     """TraceOracle degraded to a fixed recall/precision, keeping this harness's `base` offset."""
-    name = "recall_oracle"
+    # NAME IT FOR WHAT IT MODELS. "precision" here injects false positives drawn from experts the
+    # target layer NEVER routes to anywhere in the window, so they are guaranteed useless. That is
+    # ADVERSARIAL precision, not a predictor's: a real false positive for step N can legitimately be
+    # useful at N+5, which is exactly the effect job 925 stumbled into when the draw came from one
+    # call's complement. Results from this arm bound the cost of guaranteed-useless speculation and
+    # must NOT be read as "predictor precision barely matters".
+    name = "recall_oracle_adversarial_precision"
 
     def __init__(self, routes, horizon, recall, precision, n_experts=384):
         super().__init__(routes, horizon)

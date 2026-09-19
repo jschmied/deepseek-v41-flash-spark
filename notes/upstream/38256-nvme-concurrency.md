@@ -32,11 +32,9 @@ with arms interleaved 48/2/48/2/48/2:
 | 3 | 4.847 | 5.811 | 18.7 -> 14.3 s |
 
 Three of three paired wins, median **+9 %**, and hit rate and bytes read are unchanged — the same
-reads, the same bytes, less waiting. The rule we ended with is narrower than we first wrote it:
-concurrency is a tax only **across reads you do not all need yet**. Splitting one expert into ~3.4
-concurrent pieces is free (all pieces are needed before it is usable, and aggregate is flat); fetching
-three experts when this step needs one is not. A separate sweep of the piece pool found nothing —
-fewer, larger pieces were slightly *worse*.
+reads, the same bytes, less waiting. We have not isolated the mechanism inside the
+engine: `io_threads` also sets the staging-buffer count, the worker-local copy streams and H2D
+concurrency, so the raw device curve above is the leading explanation rather than a proven one.
 
 **3. A cross-model check on the union law, since the thread asked for one.** The sizing law here — "the
 expert side's value function is a cliff at the live union, not a curve" — does not transfer to our
@@ -49,10 +47,10 @@ across 40 layers.
 | 899 | 0.98x | 9 % | 0.81 | 0.202 |
 | 1,383 | 1.51x | 15 % | 1.13 | 0.467 |
 | 2,767 | 3.02x | 29 % | 2.13 | 0.746 |
-| 6,243 | 6.8x | 66 % | 6.90 | 0.935 |
 
-No cliff at the union and no plateau above it — gain per slot-doubling *accelerates* all the way
-(x1.45 slots -> x1.19 tok/s, then x1.54 -> x1.40, x2.00 -> x1.88, x2.26 -> x3.24). We think the
+**No cliff at the live union, and performance keeps improving strongly through 3x union.** (We have a
+6,243-slot point at 6.90 tok/s, but it comes from a different job with a different scale-plane layout,
+so we are leaving it out rather than assert parity we cannot check.) We think the
 difference is pool fraction: your per-layer union is 35.3 of 64 experts, **55 % of the pool**, so
 covering it is the whole problem. Ours is 22.9 of 384, **6 %**, while 237 distinct experts per layer are
 touched across 100 steps — so our value function is governed by the working set, not the single-step

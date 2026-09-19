@@ -200,6 +200,16 @@ class Engine:
         self.hostprof = HostPhases(os.environ.get("DSV41_HOST_PROFILE") == "1")
         self._route_dump = [] if os.environ.get("DSV41_ROUTE_DUMP") else None
 
+    def begin_request(self) -> None:
+        """Start a new request: sequence position restarts, measurement counters are untouched.
+
+        The contract, which the invariants encode:
+            counter reset      -> seq_step SURVIVES
+            new window         -> seq_step SURVIVES
+            new request        -> seq_step = 0
+        """
+        self.seq_step = 0
+
     def close(self):
         self.loader.shutdown()
 
@@ -685,8 +695,12 @@ class Engine:
         It also mattered outside the harness: production calls decode(1) repeatedly, so every
         invocation looked internally like step 0 and select_block never advanced the block at all.
 
-        `self.seq_step` is the sequence position and is NEVER reset. `self.c` is the measurement
-        window's counters and may be replaced freely between windows.
+        `self.seq_step` is the sequence position. It survives every counter reset and every measurement
+        window, and is reset ONLY at a request boundary, by `begin_request()`. "Never reset" was too
+        broad: V2Engine owns one driver across requests, so without that call request 2 would begin at
+        the step after request 1 and `chain.wait("logits", step - 1)` would depend on the final logits
+        event of the PREVIOUS request. Today's speculative `select_block` ignores the numeric value so
+        tokens are unaffected, but any step-relative predictor would inherit cross-request numbering.
         """
         t0 = time.perf_counter()
         for _ in range(steps):
