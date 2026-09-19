@@ -95,8 +95,14 @@ def build_layer(L, fd, f_read):
     t0 = time.time()
     nver = 0
     with safe_open(p, framework="pt") as f:
+        # Fail on the prefix before spending a layer on it: get_tensor's error names one tensor and
+        # says nothing about which of --prefix-fmt / --index / the shard is wrong.
+        probe = a.prefix_fmt.format(L=L, e=0) + "w1.weight"
+        if probe not in f.keys():
+            raise SystemExit(f"prefix {a.prefix_fmt!r} gives {probe!r}, which is not in "
+                             f"{os.path.basename(p)}; --index resolved this shard for layer {L}")
         for e in range(a.experts):
-            pre = f"layers.{L}.ffn.experts.{e}."
+            pre = a.prefix_fmt.format(L=L, e=e)
             rec = bytearray(RECORD)
             for tag, wname, shape, sg in (("w1", "w1", W13, SG1), ("w3", "w3", W13, SG1),
                                           ("w2", "w2", W2, SG2)):
