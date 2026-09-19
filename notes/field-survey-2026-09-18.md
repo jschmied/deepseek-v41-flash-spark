@@ -607,3 +607,29 @@ Two follow-ups, neither needing the GPU:
 * **`engine/experts.py`'s header still explains the two-pool design as splitting each expert into
   aligned pieces to keep the NVMe busy.** For the shipped CB3 path that is no longer what happens, and
   the comment is now actively misleading — it is what made this sweep look sensible to me.
+
+### Attribution: read dominates but H2D is real too (job 975)
+
+Store's own per-phase counters, identical `loads=4465` and `bytes=61.5 GB` in every arm:
+
+| arm | read/load | h2d/load | lease/load | read total | h2d total |
+|---|---|---|---|---|---|
+| io 48 r1 | **11.461 ms** | 4.870 | 0.005 | 51.17 s | 21.75 s |
+| io 2 r1 | **4.468** | 0.936 | 0.003 | 19.95 | 4.18 |
+| io 48 r2 | 11.495 | 4.830 | 0.005 | 51.33 | 21.56 |
+| io 2 r2 | 4.140 | 2.034 | 0.006 | 18.49 | 9.08 |
+
+**The pre-registered "clean NVMe attribution" branch did NOT fire.** Read time per load falls 61 %
+(31 s of the ~46 s saved), which makes it the dominant term — but H2D falls 58-81 % as well, worth
+12-17 s. `io_threads` sets the copy streams and H2D concurrency alongside the reader, and both move.
+The review was right to call the pure-latency-tax phrasing too strong; the draft now says read
+dominates rather than read explains.
+
+**And a calibration that resizes the whole finding.** Job 945 predicts 121 ms per read at n=48; we
+measure **11.5 ms**. So the 48-thread pool never holds 48 reads in flight — effective concurrency is
+~4 (11.46 ≈ 2.8 x 4.1), falling to ~1.5 at two threads. That is why this is a ~9 % win and not the 5x
+the device curve would permit, and it means the remaining headroom on this axis is small. Worth
+knowing before anyone tries to chase it further.
+
+`load_wait_s` reads 0.00 from `eng.store.stats` in this job while jobs 950-960 reported 13-42 s from
+`eng.stats()`. Different accessor, not a contradiction — the engine computes that field itself.

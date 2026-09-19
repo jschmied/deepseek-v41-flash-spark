@@ -32,9 +32,16 @@ with arms interleaved 48/2/48/2/48/2:
 | 3 | 4.847 | 5.811 | 18.7 -> 14.3 s |
 
 Three of three paired wins, median **+9 %**, and hit rate and bytes read are unchanged — the same
-reads, the same bytes, less waiting. We have not isolated the mechanism inside the
-engine: `io_threads` also sets the staging-buffer count, the worker-local copy streams and H2D
-concurrency, so the raw device curve above is the leading explanation rather than a proven one.
+reads, the same bytes, less waiting. Attributed with the store's own per-phase
+counters, identical `loads` and bytes in every arm: **read time per load falls 11.5 -> 4.1-4.5 ms
+(-61 %, 31 s of 46 s saved)**, and H2D also falls (4.87 -> 0.94-2.03 ms, 12-17 s), with lease/sync/
+submit negligible. So read latency is the dominant term but not the only one -- `io_threads` also sets
+the copy streams and H2D concurrency, and both move.
+
+One calibration worth stating: the curve above predicts 121 ms/read at n=48, and we measure 11.5 ms,
+so the 48-thread pool never actually holds 48 reads in flight -- effective concurrency is ~4, falling
+to ~1.5 at two threads. The tax is real; the pool was simply never saturated, which is why this is
+~9 % and not the 5x the curve would allow.
 
 **3. A cross-model check on the union law, since the thread asked for one.** The sizing law here — "the
 expert side's value function is a cliff at the live union, not a curve" — does not transfer to our
