@@ -166,3 +166,41 @@ The defect was the guard, not the sizing — an in-process loop waited for the p
 released and then continued anyway on timeout, which looks like a check and is only a delay. Nothing
 was lost. Any sweep over large allocations must be one arena per **process**, with a pre-check that
 aborts. That experiment is retired rather than fixed, since the cold pool is under 1 GiB.
+
+## Engine wiring, and what the boring gate caught (job 1075)
+
+The cold path is wired behind `DSV41_COLD_POOL=1`, default off: `ExpertStore.attach_cold_pool`,
+a decode miss in `resolve()` fetched by O_DIRECT into a mapped slot instead of loaded into its hot
+slot, `Model.moe()` running `moe_forward_cold_split` when any expert of the layer is cold, and
+promotion issued on a side stream afterwards with `cold_reap()` retiring the landed ones at the next
+layer boundary. The first gate is equality, on the graph-free decode path (`DSV41_FAST=0`) so a
+failure cannot be confused with CUDA-graph capture.
+
+**Everything semantic matched on the first run** — emitted token ids per prompt, `expert_misses`
+(6,423 and 3,839), `expert_hit_rate`, `accept_len_mean`, `steps`, and the **resident key set: 2,504
+keys, identical sha**. That last one is the P0 hazard, and it is clean: promotion does restore
+residency, so the hit rate the design depends on survives the design.
+
+**And the gate caught a metric bug that would have manufactured a fake win.** `nvme_gb` fell from
+168.91 GB to 27.55 GB. The gap is 141.36 GB; 10,262 cold fetches at 13.775 MB is 141.36 GB, residual
+0.00. The cold path reads exactly the same records and simply never added them to
+`store.stats["bytes_read"]`. Had the first measurement been a timing run instead of an equality run,
+that would have read as a 6x reduction in NVMe traffic and been completely false. Fixed: the cold
+fetch now accounts its bytes and its read time into the store's own counters.
+
+Two implementation notes, one a correction of my own design note:
+
+**Residency is shadowed, not withheld.** The note above says the hot mapping must not be published
+until the copy lands. In practice `_lru_slot_for` publishes `lru[key] = hot_slot` eagerly, as the
+engine already does for every ordinary miss, and pass 1 of `resolve()` consults the in-flight table
+*before* `lru` — so the cold slot shadows the hot mapping until promotion lands. Equivalent given the
+ordering and simpler than withholding, but it is shadowing and the note should say so.
+
+**Promotion is twelve scatters here, not one copy.** The main arena is still plane-major, so
+`ColdPool.promote` falls back to per-plane copies. That is deliberate: it lets the cold path be gated
+on without converting the main arena first, and it means any promotion cost measured in this
+configuration is an upper bound. The one-contiguous-copy form needs the hot arena record-major too.
+
+Counters worth keeping from the run: `cold_reuses: 0` over 10,262 fetches, so no expert was wanted
+again while its promotion was still in flight; and `cold_full: 0` with a 64-slot pool, so the pool
+never ran dry even though a layer can want 36 distinct experts.
