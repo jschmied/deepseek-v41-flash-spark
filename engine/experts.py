@@ -601,7 +601,7 @@ class ExpertStore:
             if self.slot_key.get(slot) == key:
                 del self.slot_key[slot]
         self.transient_map.clear()
-        lent = [s for s in self.transient_ring if s not in self._pending_slots]
+        lent = [s for s in self.transient_ring if s not in self._blocked_slots()]
         self.free_lru.extend(lent)
         self._ring_lent = True
         return len(lent)
@@ -677,6 +677,20 @@ class ExpertStore:
         self.stats["evict_cmps"] += cmps
         return best
 
+    def _blocked_slots(self) -> set[int]:
+        """Slots no allocator may hand out: a deferred read is writing them, or a promotion is.
+
+        `_transient_slot_for` and `lend_ring_to_lru` consulted `self._pending_slots` DIRECTLY, so the
+        promotion-destination protection added to `_protect_pending` never reached them -- prefill's
+        transient ring could hand out a slot a cold promotion was still copying into. Not the cause of
+        job 1115's divergence (that survives DSV41_COLD_SYNC=1, where nothing is ever in flight across
+        a layer), but a real hazard on the async path, so every site now reads the same set.
+        """
+        if self.cold is None:
+            return self._pending_slots
+        hot = self.cold.promo.pending_hot()
+        return self._pending_slots | hot if hot else self._pending_slots
+
     def _protect_pending(self, used: set | frozenset) -> set | frozenset:
         """`used` widened with the slots a deferred read is still landing in.
 
@@ -690,14 +704,9 @@ class ExpertStore:
         Costs one set union per miss ONLY while something is pending; today nothing defers on the
         decode path, so it is a single empty-set test per miss.
         """
-        pend = self._pending_slots
-        if self.cold is not None:
-            # A promotion destination holds no key yet, so nothing else in the eviction path keeps
-            # its hands off it -- and being unmapped is exactly what makes it attractive to a victim
-            # search. Handing it to another expert mid-copy would corrupt both.
-            hot = self.cold.promo.pending_hot()
-            if hot:
-                pend = pend | hot
+        # A promotion destination holds no key yet, so nothing else in the eviction path keeps its
+        # hands off it -- and being unmapped is exactly what makes it attractive to a victim search.
+        pend = self._blocked_slots()
         if not pend:
             return used
         return set(used) | pend
@@ -750,7 +759,7 @@ class ExpertStore:
         for _ in range(n):
             slot = self.transient_ring[self.transient_pos % n]
             self.transient_pos += 1
-            if slot not in used and slot not in self._pending_slots:
+            if slot not in used and slot not in self._blocked_slots():
                 break
         else:
             raise RuntimeError(

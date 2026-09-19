@@ -1208,8 +1208,13 @@ def moe_forward_cold_split(x: torch.Tensor, slots: torch.Tensor, weights: torch.
     dev = bs.device
     bs_hot = torch.tensor(hot_l, dtype=bs.dtype, device=dev)
     bs_cold = torch.tensor(cold_l, dtype=bs.dtype, device=dev)
-    h = torch.empty((P, INTER), dtype=torch.bfloat16, device=x.device)
-    parts = torch.empty((P, DIM), dtype=torch.float32, device=x.device)
+    # DSV41_COLD_ZERO=1 zeroes these instead of torch.empty. A diagnostic: if any row of h or parts
+    # is never written by either phase, torch.empty leaves allocator garbage there -- deterministic
+    # within one process (so each arm reproduces itself) and different between arms (so they diverge).
+    # That is the only mechanism left that survives DSV41_COLD_SYNC=1.
+    _mk = torch.zeros if os.environ.get("DSV41_COLD_ZERO", "0") == "1" else torch.empty
+    h = _mk((P, INTER), dtype=torch.bfloat16, device=x.device)
+    parts = _mk((P, DIM), dtype=torch.float32, device=x.device)
     moe_v3_phase(x, slots, weights, hot, h, parts, swiglu_limit, block_m=BM,
                  routing=(bs_hot, bp, NB))
     moe_v3_phase(x, slots, weights, cold, h, parts, swiglu_limit, block_m=BM,
