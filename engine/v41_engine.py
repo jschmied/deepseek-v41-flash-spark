@@ -434,8 +434,27 @@ class V41Engine:
             log(f"dense fp4 groups: {','.join(sorted(R.dense_fp4_groups()))}; "
                 f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated after weights")
         self.caches = Caches(self.args, max_seq, device)
-        # DSpark experts: all resident
-        self.W.dspark_arena = arena_cls(384, device)
+        # DSpark experts: all resident.
+        #
+        # DSV41_DRAFT_CB3=1 makes the draft arena CB3 instead of FP4. Job 980: 17 % FASTER at the
+        # draft-block shape and 9 % at T=1, because the arena is resident so the kernel is
+        # bandwidth-bound and CB3 reads 0.769 of the bytes per slot; and 1.554 GiB freed, which flows
+        # straight into the main arena because its budget is computed below this line. A third party
+        # measured 3-bit draft experts at -1.05 pp acceptance (notes/drafter-cb3-gate.md); our codec
+        # is a different one, so DSV41_DRAFT_CB3 is off until that is confirmed on our own harness.
+        #
+        # Built directly rather than through make_expert_arena() because packed scales MUST stay off
+        # here whatever DSV41_PACKED_SCALES says: mtp.2 contains a row whose intra-row UE8M0 range is
+        # 8, which ue8m0-3bit-rowbase-v1 cannot represent, so load_slot's pack_torch would raise at
+        # startup (job 985). The codec's exactness survey covered layers 0-39 only.
+        if os.environ.get("DSV41_DRAFT_CB3", "0") == "1" and cb3_cls is not None:
+            _da = cb3_cls(384, device)      # packed_scales defaults off -- see above, keep it off
+            _da.sim = self._cb3_sim
+            self.W.dspark_arena = _da
+            log(f"DSpark draft arena is CB3 ({_da.slots} slots); "
+                f"load_slot converts the same FP4 tensors the FP4 arena takes")
+        else:
+            self.W.dspark_arena = arena_cls(384, device)
         self.W.dspark_store = FixedStore(self.W.dspark_arena)
         # main expert arena: size from what is left.
         # On GB10 the GPU and the host share one pool, and `torch.cuda.mem_get_info()` counts the

@@ -74,3 +74,37 @@ EXL3 saves more: 2,562,494,976 B/rank packed against 3,609,722,880 native = 0.97
 at our TP1 against CB3's 1.67 GB. That extra 0.42 GB (about 29 slots) costs a trellis kernel port, a
 TP2 -> TP1 re-layout, and pulls in AGPL-3.0-only serving code. We already ship the kernel that gets
 94 % of the benefit. The download's value was the evaluation, not the tensors.
+
+
+## The pack turned out to be unnecessary, and would not have worked anyway (job 985)
+
+Two things came out of trying to build it.
+
+**The scale codec is not lossless outside layers 0-39.** `ue8m0-3bit-rowbase-v1` stores one u8 row
+base plus 3 bits per group, and its exactness rests on a survey of 149,422,080 rows in which the
+intra-row exponent range never exceeds 7. That survey is the **routed** experts only. mtp.0 and mtp.1
+packed clean, 128 experts each in 22.1 s and 18.7 s, and then mtp.2 raised on a row of range **8**.
+So the correct statement is that the codec is lossless on the routed experts, not on the checkpoint,
+and any new tensor family must be surveyed before it is packed. `tools/scale_codec.py` now says so.
+
+**And the drafter needs no pack at all.** `CB3ArenaV2.load_slot` takes exactly the same six FP4
+tensors as `ExpertArena.load_slot` and runs `fp4_to_cb3_v2` itself, so the existing load loop at
+`v41_engine.py:542` is already correct for either arena -- the whole port is the one line above it.
+The draft arena is resident and never reads a record off disk, so the packed-scale disk format it was
+going to need buys it nothing. Job 980's 1.554 GiB and 17 % were measured on the unpacked-scale arena
+(14,454,784 B/slot) in the first place.
+
+One interaction had to be blocked rather than inherited: with `DSV41_PACKED_SCALES=1` a CB3 draft
+arena would call `pack_torch` on mtp.2 and **raise at startup**. `DSV41_DRAFT_CB3` therefore builds
+the arena directly instead of through `make_expert_arena()`, keeping scales unpacked whatever the
+main arena does.
+
+The packer changes are kept -- `--prefix-fmt` and `--index` are what made the codec limit visible,
+and they leave the main 0-39 build byte-identical (verified against the shipped manifest: total,
+n_layers, n_experts, and idx at (0,0), (17,200), (39,383)).
+
+## The EXL3 weights verified, and their filenames are not their hashes
+
+All three shards match `release-manifest.json`'s sha256 at 1,704,542,280 B each. Worth recording that
+the CDN served them under 64-hex-character filenames that are **not** the content hashes -- treating
+the filename as the checksum would have looked like verification and been none.

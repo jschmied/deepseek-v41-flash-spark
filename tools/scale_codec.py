@@ -5,6 +5,14 @@ Measured over all 40 layers, 149,422,080 rows (notes/data/scale-survey-20260913.
 range inside one output row never exceeds 7. So a row stores one 8-bit base plus 3 bits per group,
 exactly, with no escape path. 2 bits would NOT be lossless -- range <= 3 fails on 0.2% of layer 39.
 
+THAT SURVEY IS LAYERS 0-39 ONLY, and the bound does not hold outside it. Job 985 tried to pack the
+DSpark draft experts (mtp.0/1/2) and layers 0 and 1 went through clean, 128 experts each, while mtp.2
+raised on a row of intra-row range 8. So "lossless on this checkpoint" means lossless on the ROUTED
+experts, not on the checkpoint: any new tensor family has to be surveyed before it is packed, and the
+raise below is the thing that catches it. A CB3 draft arena therefore keeps its scales unpacked
+(engine/v41_engine.py, DSV41_DRAFT_CB3) -- which costs it nothing, because a resident arena never
+reads a record off disk.
+
 Layout per row: [base u8][ceil(groups*3/8) bytes], groups packed 8-at-a-time as a 24-bit
 little-endian word, value i at bit 3*i. Both real group counts are multiples of 8 (160 -> 60 B,
 72 -> 27 B), so no partial word ever occurs.
