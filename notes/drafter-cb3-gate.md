@@ -168,3 +168,49 @@ five prompts, in order, one engine -- while recording each prompt's ids separate
 Worth noting against my own earlier wording: 990 folded all five prompts into ONE sha, so "the arms
 emit different greedy tokens" was correct but told us nothing about where. Per-prompt hashes are what
 1000 adds.
+
+
+## Job 1000: there is no divergence. I was wrong about what job 990's hash showed.
+
+Per-prompt, five prompts in order in one engine -- 990's exact condition:
+
+| prompt | fp4 | cb3 | verdict |
+| --- | --- | --- | --- |
+| p0 | 99 ids, sha a0dc37b6 | 99 ids, sha a0dc37b6 | identical |
+| p1 | 96 ids | 101 ids | **same prefix, lengths differ** |
+| p2 | 100, sha 7ce69124 | 100, sha 7ce69124 | identical |
+| p3 | 97, sha 0210ab81 | 97, sha 0210ab81 | identical |
+| p4 | 99, sha a36c5ce8 | 99, sha a36c5ce8 | identical |
+
+**No token ever differs.** On p1 the shorter output is a prefix of the longer: `max_tokens=96` with
+block-granularity emission, so a verify block that starts near the limit overshoots it, and the two
+arms overshoot by different amounts because their acceptance differs. That is all job 990's single
+folded hash was showing.
+
+So the verification is exactness-preserving, as reading the rule said it was. p0 is the clean
+demonstration: byte-identical output while accept_len_mean moves 2.33 -> 2.45, steps 42 -> 40 and
+misses 5,802 -> 5,316. A better drafter changes how fast you get there and nothing about where you
+arrive. **The routed-MoE-reduction-order hypothesis in the section above is withdrawn** -- it was
+invented to explain something that is not happening.
+
+### And the speed claim shrinks to nothing established
+
+Once the token-count artifact is removed, 990's advantage mostly goes with it. cb3 emitted 496 tokens
+against fp4's 491, +1.02 %, purely from that p1 overshoot:
+
+| | fp4 | cb3 raw | cb3 at equal tokens | per step |
+| --- | --- | --- | --- | --- |
+| round 1 | 5.422 tok/s | 5.481 (+1.1 %) | 5.426 (**+0.1 %**) | 576.8 -> 583.8 ms (**+1.2 %**) |
+| round 2 | 5.447 | 5.649 (+3.7 %) | 5.592 (**+2.7 %**) | 574.1 -> 566.5 ms (**-1.3 %**) |
+
++0.1 % then +2.7 %, and the per-step sign flips between rounds. **The end-to-end gain is not
+established**; round-to-round variation is larger than the effect. Job 980's 17 % kernel result stands
+on its own measurement and is not contradicted -- the draft MoE is simply a small enough share of a
+step that a 17 % kernel win does not survive to the wall clock at this arena size.
+
+### What was never measured
+
+The memory half. Every arm so far passes `arena_gb=86.0`, which pins the arena and overrides the
+auto-sizer, so the 1.554 GiB the CB3 draft arena frees has been sitting unused in all eight arms.
+That is the only untested part of the case and the only one with a plausible mechanism left: 115 more
+resident expert slots against a miss rate that costs ~236 MiB of NVMe per emitted token.
