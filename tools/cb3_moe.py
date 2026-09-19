@@ -680,6 +680,116 @@ def _pair_dot(x_base, xk, mask_m, Lk, Hm, A, B, sA, sB, KPAR: tl.constexpr):
 # with its own benchmark. A stands on capacity alone.
 
 
+PLANE_ORDER = ("w1_lo", "w1_hi", "w1_cb", "s1", "w3_lo", "w3_hi", "w3_cb", "s3",
+               "w2_lo", "w2_hi", "w2_cb", "s2")
+
+
+def plane_layout(packed_scales: bool) -> tuple[dict[str, tuple[int, int]], int, int]:
+    """(offsets, rows, record_bytes) for one expert laid out RECORD-MAJOR, in the pack's own order.
+
+    This is deliberately the same order and the same sizes the on-disk record uses, because that is
+    the whole point: with packed scales the record and the slot are byte-identical, so an O_DIRECT
+    read lands in its final location with no transform (notes/host-mapped-arena.md, job 1045).
+    """
+    sg1 = packed_row_bytes(SG1) if packed_scales else SG1
+    sg2 = packed_row_bytes(SG2) if packed_scales else SG2
+    per = {"w1_lo": (INTER, DIM // 4), "w1_hi": (INTER, DIM // 8), "w1_cb": (INTER, 8),
+           "s1": (INTER, sg1),
+           "w3_lo": (INTER, DIM // 4), "w3_hi": (INTER, DIM // 8), "w3_cb": (INTER, 8),
+           "s3": (INTER, sg1),
+           "w2_lo": (DIM, INTER // 4), "w2_hi": (DIM, INTER // 8), "w2_cb": (DIM, 8),
+           "s2": (DIM, sg2)}
+    off, o = {}, 0
+    for nm in PLANE_ORDER:
+        r, c = per[nm]
+        off[nm] = (o, o + r * c)
+        o += r * c
+    return off, per, o
+
+
+def _rstride(arena) -> int:
+    """The kernels' RSTRIDE for this arena: 0 for plane-major (each plane its own tensor, the shipped
+    layout), record bytes for record-major. An arena without the attribute is plane-major, so every
+    existing caller keeps the arithmetic it has."""
+    return int(getattr(arena, "rstride", 0))
+
+
+class CB3RecordArena:
+    """One [slots, RECORD] buffer instead of twelve plane-major tensors.
+
+    Two things need this. The promotion of a cold expert into the hot cache becomes ONE contiguous
+    ~13.8 MB copy rather than twelve plane scatters; and with `packed_scales` the record equals the
+    pack's payload exactly, so an O_DIRECT read can be issued straight into a slot.
+
+    It presents the twelve plane names as offset VIEWS of the one buffer, so the kernels take it
+    unchanged -- they only need `RSTRIDE`, which `_rstride` reads off `self.rstride`. The views are
+    1-D on purpose: the kernels index them by `slot * RSTRIDE + row * row_stride`, so a shaped view
+    would only invite someone to index it as if slots were contiguous per plane, which they are not.
+
+    `align` pads the record so slot offsets stay usable for O_DIRECT (the pack's own records are
+    padded to 4096 for the same reason).
+    """
+
+    def __init__(self, slots: int, device: torch.device | str = "cuda",
+                 packed_scales: bool = True, pinned: bool = False, align: int = 4096):
+        if pinned and torch.device(device).type != "cpu":
+            device = "cpu"
+        self.slots = slots
+        self.device = torch.device(device)
+        self.packed_scales = packed_scales
+        self.pinned = pinned
+        self._off, self._per, payload = plane_layout(packed_scales)
+        self.payload = payload
+        self.rstride = (payload + align - 1) // align * align if align else payload
+        n = slots * self.rstride
+        self.buf = (torch.empty(n, dtype=torch.uint8, pin_memory=True) if pinned
+                    else torch.empty(n, dtype=torch.uint8, device=self.device))
+        self.sim = None
+
+    @property
+    def bytes_per_slot(self) -> int:
+        return self.rstride
+
+    def plane(self, name: str):
+        """A 1-D view whose data_ptr is the plane's base inside slot 0's record."""
+        return self.buf[self._off[name][0]:]
+
+    def record(self, slot: int):
+        """Slot `slot`'s whole record as one contiguous 1-D view -- the promotion unit."""
+        base = slot * self.rstride
+        return self.buf[base:base + self.payload]
+
+    def slot_view(self, slot: int, name: str):
+        """One plane of one slot, shaped [rows, cols]. For verification, not for the kernels."""
+        r, c = self._per[name]
+        b0, b1 = self._off[name]
+        base = slot * self.rstride
+        return self.buf[base + b0:base + b1].view(r, c)
+
+    def __getattr__(self, name: str):
+        # w1_lo .. s2 resolve to plane views, so a CB3ArenaV2 call site works unchanged.
+        if name in PLANE_ORDER:
+            return self.plane(name)
+        raise AttributeError(name)
+
+    def load_from_record(self, slot: int, src) -> None:
+        """Copy one whole on-disk record (uint8, payload bytes) into `slot`. No transform: with
+        packed scales the record IS the slot."""
+        if not self.packed_scales:
+            raise RuntimeError("load_from_record needs packed_scales=True; with unpacked scales the "
+                               "slot is larger than the record and the scale planes must be expanded")
+        v = src.view(torch.uint8).reshape(-1)
+        if v.numel() != self.payload:
+            raise ValueError(f"record is {v.numel()} B, slot payload is {self.payload}")
+        self.record(slot).copy_(v)
+
+    def promote_into(self, dst, dst_slot: int, slot: int, non_blocking: bool = True) -> None:
+        """The promotion: one contiguous record copy from this arena's slot into `dst`'s slot."""
+        if dst.rstride != self.rstride or dst.payload != self.payload:
+            raise ValueError("promotion between arenas of different record layout")
+        dst.record(dst_slot).copy_(self.record(slot), non_blocking=non_blocking)
+
+
 def _packed(arena) -> bool:
     """Does this arena hold packed scale planes? Declared by the ARENA, not by a module global, so a
     packed arena and an unpacked one can coexist in one process -- which is exactly what the bitwise
@@ -904,10 +1014,10 @@ def moe_forward_v3(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, 
     _cb3v3_up_kernel[(NB, INTER // bn1)](
         x, arena.w1_lo, arena.w1_hi, arena.w1_cb, arena.s1, arena.w3_lo, arena.w3_hi, arena.w3_cb, arena.s3, h,
         wgt, block_slot, block_pair, x.stride(0), h.stride(0), float(swiglu_limit),
-        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, NB512=CB3.block_plan(DIM)[0], NB256=CB3.block_plan(DIM)[1], num_warps=nw1, num_stages=ns1, PACKED=_packed(arena))
+        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, NB512=CB3.block_plan(DIM)[0], NB256=CB3.block_plan(DIM)[1], num_warps=nw1, num_stages=ns1, PACKED=_packed(arena), RSTRIDE=_rstride(arena))
     _cb3v3_down_kernel[(NB, DIM // bn2)](
         h, arena.w2_lo, arena.w2_hi, arena.w2_cb, arena.s2, parts, block_slot, block_pair,
-        h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, NB512=CB3.block_plan(INTER)[0], NB256=CB3.block_plan(INTER)[1], num_warps=nw2, num_stages=ns2, PACKED=_packed(arena))
+        h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, NB512=CB3.block_plan(INTER)[0], NB256=CB3.block_plan(INTER)[1], num_warps=nw2, num_stages=ns2, PACKED=_packed(arena), RSTRIDE=_rstride(arena))
     return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
 
 
@@ -1055,12 +1165,13 @@ def moe_v3_phase(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, ar
         x, arena.w1_lo, arena.w1_hi, arena.w1_cb, arena.s1, arena.w3_lo, arena.w3_hi, arena.w3_cb,
         arena.s3, h, wgt, block_slot, block_pair, x.stride(0), h.stride(0), float(swiglu_limit),
         TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, NB512=CB3.block_plan(DIM)[0],
-        NB256=CB3.block_plan(DIM)[1], num_warps=nw1, num_stages=ns1, PACKED=_packed(arena))
+        NB256=CB3.block_plan(DIM)[1], num_warps=nw1, num_stages=ns1, PACKED=_packed(arena),
+        RSTRIDE=_rstride(arena))
     _cb3v3_down_kernel[(NB, DIM // bn2)](
         h, arena.w2_lo, arena.w2_hi, arena.w2_cb, arena.s2, parts, block_slot, block_pair,
         h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T,
         NB512=CB3.block_plan(INTER)[0], NB256=CB3.block_plan(INTER)[1],
-        num_warps=nw2, num_stages=ns2, PACKED=_packed(arena))
+        num_warps=nw2, num_stages=ns2, PACKED=_packed(arena), RSTRIDE=_rstride(arena))
 
 
 def moe_v3_reduce(parts: torch.Tensor, T: int, K: int) -> torch.Tensor:
@@ -1109,12 +1220,12 @@ def moe_forward_v3_split(x: torch.Tensor, slots: torch.Tensor, weights: torch.Te
             arena.w3_cb, arena.s3, h, wgt, mask, block_pair, x.stride(0), h.stride(0),
             float(swiglu_limit), TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1,
             NB512=CB3.block_plan(DIM)[0], NB256=CB3.block_plan(DIM)[1],
-            num_warps=nw1, num_stages=ns1, PACKED=_packed(arena))
+            num_warps=nw1, num_stages=ns1, PACKED=_packed(arena), RSTRIDE=_rstride(arena))
         _cb3v3_down_kernel[(NB, DIM // bn2)](
             h, arena.w2_lo, arena.w2_hi, arena.w2_cb, arena.s2, parts, mask, block_pair,
             h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T,
             NB512=CB3.block_plan(INTER)[0], NB256=CB3.block_plan(INTER)[1],
-            num_warps=nw2, num_stages=ns2, PACKED=_packed(arena))
+            num_warps=nw2, num_stages=ns2, PACKED=_packed(arena), RSTRIDE=_rstride(arena))
     return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
 
 
