@@ -214,3 +214,48 @@ The memory half. Every arm so far passes `arena_gb=86.0`, which pins the arena a
 auto-sizer, so the 1.554 GiB the CB3 draft arena frees has been sitting unused in all eight arms.
 That is the only untested part of the case and the only one with a plausible mechanism left: 115 more
 resident expert slots against a miss rate that costs ~236 MiB of NVMe per emitted token.
+
+
+## Job 1005 (auto-sized): the memory half is real in TRAFFIC, still null in wall clock. Closing.
+
+`arena_gb=None`, three rounds alternating. The comparison that matters is within the arm pair, not
+against the pinned 86 GB runs -- `keep_free_gb=12.0` sizes both arms lower than the pinned arena did,
+consistently.
+
+| arm | main slots | tok/s | ms/step | misses | nvme GB | hit |
+| --- | --- | --- | --- | --- | --- | --- |
+| fp4 r1 | 5,417 | 4.871 | 642.0 | 15,827 | 259.2 | 0.8894 |
+| cb3 r1 | 5,544 | 5.436 | 588.7 | 14,820 | 244.2 | 0.8942 |
+| fp4 r2 | 5,420 | 5.021 | 622.9 | 15,815 | 259.0 | 0.8896 |
+| cb3 r2 | 5,542 | 5.239 | 610.8 | 14,830 | 244.4 | 0.8942 |
+| fp4 r3 | 5,426 | 5.249 | 595.8 | 15,795 | 258.7 | 0.8898 |
+| cb3 r3 | 5,542 | 5.191 | 616.4 | 14,830 | 244.4 | 0.8942 |
+
+**The auto-sizer does pick the memory up: +122 slots**, against the +115 predicted from 1.554 GiB at
+14,454,784 B. And those slots buy real traffic:
+
+| | fp4 mean | cb3 mean | delta |
+| --- | --- | --- | --- |
+| expert misses | 15,812 | 14,827 | **-6.2 %** |
+| NVMe | 259.0 GB | 244.3 GB | **-5.7 %** |
+| hit rate | 0.8896 | 0.8942 | **+0.46 pp** |
+
+Reproducible to under 0.1 % within each arm across three rounds. That is the one mechanism that was
+still untested, and it is well clear of the 1 % threshold at which this work would have been closed.
+
+**Wall clock is still not established, and now for a different reason: a monotone drift that runs
+OPPOSITE in the two arms.** fp4 improves round over round (642.0 -> 622.9 -> 595.8 ms/step) while cb3
+degrades (588.7 -> 610.8 -> 616.4), and by round 3 fp4 is ahead. Interleaving the arms does not remove
+this because it is not a warm/cold asymmetry between arms but a trend within each. So the means
+(+4.8 % tok/s) are not a result, and I am not reporting one.
+
+### Verdict
+
+The drafter CB3 port is **correct, and worth keeping for traffic, not for speed**: byte-identical
+output, 17 % faster draft MoE kernel (job 980), +122 resident expert slots, -5.7 % NVMe traffic and
+-6.2 % misses. No wall-clock gain is demonstrated at this arena size, twice, by two different
+confounds. That is the honest close, and the flag's default should be decided on the traffic number --
+which matters on a box where NVMe is the bottleneck -- not on a tok/s figure we do not have.
+
+Nothing further on the drafter. The open measurement is the cumulative one: what all the shipped work
+together buys over the fixed five-prompt suite against a pinned baseline configuration.
