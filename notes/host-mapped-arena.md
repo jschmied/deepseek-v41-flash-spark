@@ -145,3 +145,26 @@ mapped arena loses.
 
 The engine already has the machinery: `moe_forward_v3_split` runs the MoE in phases over one routing
 for the resident-first split, which is the shape a device-resident/host-cold split needs.
+
+
+## TLB reach: flat to 30 GiB, but the largest point is still 2.6x short of the real arena (job 1050)
+
+Record-major host vs record-major device, T=6 verify shape, one arena at a time, slots drawn over the
+whole arena so a bigger arena means a wider translation footprint:
+
+| arena | slots | 4 KiB pages | host | device | ratio |
+| --- | --- | --- | --- | --- | --- |
+| 5 GiB | 371 | 1.31 M | 2.982 ms | 2.765 ms | 1.078 |
+| 15 GiB | 1,114 | 3.93 M | 3.079 | 2.796 | 1.101 |
+| 30 GiB | 2,228 | 7.86 M | 3.081 | 2.817 | 1.094 |
+
+**Ratio 1.078 -> 1.094 over a 6x size increase, +1.4 %.** TLB reach is not biting at this access
+pattern. The device arm also rises slightly (2.765 -> 2.817, +1.9 %), so both layouts pay a small
+locality cost with size and the ratio stays the decision variable -- the third pre-registered branch.
+
+**What this does not cover.** The 50 GiB arm was skipped: the guard requires MemAvailable >= size + 20
+GiB and the previous arena had only released back to 60 GiB. So the largest point measured is 7.86 M
+pages against roughly 21 M for a 78 GB arena -- 2.6x short. The trend over the range measured is flat
+and slightly *falling* at the top, which is evidence against a translation wall rather than for one,
+but it is extrapolation and the sweep should be finished with tighter memory hygiene (free and settle
+before the availability check) before the split is built on it.
