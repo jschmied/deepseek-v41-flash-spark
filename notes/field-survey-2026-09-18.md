@@ -560,3 +560,23 @@ than ~15 %, which means **job 960's +1.6 % (P1) and +1.5 % (P3) were noise**, no
 survives there is P0 +10.3 %, P2 +8.0 % and P4 +9.6 %, where the repeat arms agreed to 1.4-4 % — three
 prompts, not five. `DSV41_IO_THREADS=2` still stands on those three plus the uniform 13-20 % drop in
 `load_wait_s`, which is the counter that does not have this variance problem.
+
+### io_threads=2 verified properly: 3 of 3 paired wins (job 970)
+
+Summed over five prompts, arms interleaved 48/2/48/2/48/2 so drift cannot pass for an effect:
+
+| round | io 48 | io 2 | gain | load_wait |
+|---|---|---|---|---|
+| 1 | 4.849 tok/s | 5.179 | +6.8 % | 19.1 -> 16.4 s |
+| 2 | 4.817 | 5.244 | +8.9 % | 18.4 -> 16.9 s |
+| 3 | 4.847 | 5.811 | +19.9 % | 18.7 -> 14.3 s |
+
+**The summed metric fixes the noise problem that job 965 exposed.** The three io-48 arms land at
+4.849 / 4.817 / 4.847 — a **0.7 %** spread, against 12-17 % on individual first-request prompts. Summing
+five prompts averages out exactly the variance that made job 960's small numbers meaningless.
+
+io 2 wins all three pairs. Its own spread is wider (5.18-5.81, round 3 high), so the honest headline is
+the median: **+9 %**, not the +19.9 % of the best round. `load_wait_s` falls in every pair.
+
+`DSV41_IO_THREADS=2` stays shipped, now on a paired design rather than single first-request numbers.
+The pre-registered revert branch does not fire.
