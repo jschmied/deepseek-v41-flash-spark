@@ -108,3 +108,42 @@ n_layers, n_experts, and idx at (0,0), (17,200), (39,383)).
 All three shards match `release-manifest.json`'s sha256 at 1,704,542,280 B each. Worth recording that
 the CDN served them under 64-hex-character filenames that are **not** the content hashes -- treating
 the filename as the checksum would have looked like verification and been none.
+
+## End to end (job 990): the output check failed, which voids this job's speed number
+
+Four arms, DSV41_DRAFT_CB3 0/1 interleaved, two rounds, `arena_gb=86.0`.
+
+| arm | draft arena | main slots | tok/s | accept_len_mean | steps | misses | tokens_sha |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cb3=0 r1 | ExpertArena | 5,949 | 5.422 | 3.0952 | 157 | 13,849 | 47c29400 |
+| cb3=1 r1 | CB3ArenaV2 | 5,949 | 5.481 | 3.1681 | 155 | 13,342 | 37cf84d3 |
+| cb3=0 r2 | ExpertArena | 5,949 | 5.447 | 3.0952 | 157 | 13,849 | 47c29400 |
+| cb3=1 r2 | CB3ArenaV2 | 5,949 | 5.649 | 3.1681 | 155 | 13,342 | 37cf84d3 |
+
+**Check 1 (output) failed, and it was pre-registered as outranking the rest.** The arms emit different
+greedy tokens. This is not nondeterminism: each arm reproduces its own hash, accept, steps, nvme and
+miss count *exactly* across both rounds, so it is deterministic and drafter-dependent.
+
+That voids checks 3 and 4 as stated. The arms do not decode the same tokens, so 5.422 -> 5.481/5.649
+is not a like-for-like speed comparison and 3.0952 -> 3.1681 is not an acceptance comparison -- the
+CB3 arm took a different trajectory with 507 fewer misses and 7.1 GB less NVMe, and some unknown part
+of its advantage is that trajectory rather than the kernel. The clean kernel number stays job 980's.
+
+**Check 2 (slots) failed for a reason in the harness, not the engine.** Main slots are 5,949 in every
+arm because the job passes `arena_gb=86.0`, which pins the arena and overrides the auto-sizer. So the
+1.554 GiB the CB3 draft arena frees was simply left unused here, and the memory half of the case is
+still unmeasured. That also means whatever speed difference is real is the kernel alone.
+
+**What the divergence is not.** The verification rule is exact greedy and is drafter-independent in
+exact arithmetic: `engine/v41_engine.py` computes `am = logits.argmax(-1)` over the six rows, accepts
+the leading run where `am[i] == drafts[i]`, and then emits `cand[:a]` -- which is `am[:a]`, the
+TARGET's argmax, never the draft's value -- with `bonus = am[a]` conditioned only on accepted tokens.
+So a worse drafter cannot change what is emitted by that rule.
+
+**What it might be, untested.** A verify block is six tokens processed together, and its routed-expert
+set is the union over all six. Different drafts give a different expert set and so a different
+grouped-GEMM reduction order, which perturbs the target's own logits at the ulp level and can flip an
+argmax on a near-tie. That would make the target's logits not invariant to the draft tokens -- a
+numerical property of batched verification over a routed MoE, not a broken rule. It is consistent with
+what we already know (a 1-ulp kernel change moves acceptance by ten points) but it is a hypothesis
+with no counterfactual yet, so it is written here as one.
