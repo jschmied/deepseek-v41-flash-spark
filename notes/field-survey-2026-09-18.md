@@ -323,3 +323,58 @@ idle up, wall up.
 
 **Next, and it is a loader question rather than a prediction one**: find out why depth hurts. Until
 that is answered, the prefetch magnitudes should be quoted as "at 8/8/8/2" or not quoted at all.
+
+### Which knob, and the retraction that follows (job 940)
+
+One knob at a time from 8/8/8/2, because job 935 moved four together:
+
+| arm | steps/s | vs baseline |
+|---|---|---|
+| baseline 8/8/8/2 | 3.290 | — |
+| **workers 48** | **0.743** | **-77 %** |
+| staging 48 | 3.354 | +1.9 % (noise) |
+| read_qd 24 | 3.173 | -3.6 % |
+| h2d 8 | 2.721 | -17.3 % |
+| all four 48/48/24/8 | 0.622 | -81 % (job 935: 0.619 — session pinned) |
+
+`N_WORKERS` alone reproduces nearly the whole degradation. That is the *contention* branch of the
+pre-registered discriminator, not job 170's — `read_qd` and `h2d` were its signature and are minor.
+
+**And then the mechanism turns out not to be contention either.** `enginev2/leaves.py::Bandwidth`
+says what it is:
+
+> The NVMe device, shared by every read in flight. EXACT, not sliced. total(n) = 5.58 GB/s at n=1 and
+> 6.82 GB/s at n>=2, **flat above 2 because the device saturates near 2 concurrent reads. Each read
+> gets total(n)/n.**
+
+**The v2 harness models its reads; it does not perform them.** With 48 workers each read receives
+6.82/48 ≈ 0.14 GB/s and takes ~24x longer than at n=2, so the demand read being waited on finishes
+much later. The 5x is precisely what this model predicts. It is not a loader defect, and
+"the v2 loader does not scale with worker count" is **withdrawn**.
+
+It may still be real physics: for a device that saturates at 2 concurrent reads, 48-way issue
+genuinely does stretch every individual read, and aggregate bandwidth being flat is exactly why.
+That would make high loader concurrency harmful to *latency-critical* demand reads while leaving
+throughput counters unchanged — consistent with `in-flight` staying 4.6-5.0 GB/s across every arm
+above while wall time moved 5x.
+
+### The caveat this puts on the whole night's prefetch sequence
+
+Jobs 895-940 run **real model compute with modelled I/O**: `RealLeaves` drives the actual engine for
+compute, while expert reads go through `Bandwidth`. So the prefetch results are statements about a
+device model whose parameters were fitted, not about the NVMe in this box.
+
+What that does and does not undermine:
+
+* **Safe**: the *ordering* and *shape* results, which held across many arms and two confound fixes —
+  more recall is better; horizon peaks at 4; precision barely matters; a perfect oracle is not an
+  upper bound because it over-issues.
+* **Not safe**: every magnitude. `+52.8 %`, `+82.1 %`, `+74.4 %` are all against a modelled device at
+  8/8/8/2, and the model's own saturation point (n=2) is what makes worker count so punishing.
+* **Untested**: whether the real NVMe saturates at 2 concurrent reads at all. Production ships
+  `io 48/96` and works, which is weak evidence that it does not.
+
+The next measurement worth making is therefore not another prefetch arm. It is a real-device
+concurrency curve — achieved bandwidth and per-read latency against concurrent read count on this
+NVMe — to find out whether `Bandwidth`'s n>=2 saturation is true here. Every number above is
+downstream of that constant.
