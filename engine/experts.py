@@ -250,6 +250,62 @@ class ExpertStore:
         self.stats = dict(ZERO_STATS)
 
     # ------------------------------------------------------------------ io
+    # ---------------------------------------------------------------- cold pool (DSV41_COLD_POOL)
+    # Off unless a pool is attached. When it is, a DECODE miss is read by O_DIRECT straight into a
+    # mapped record slot and computed there, and the hot slot it was promised becomes valid only when
+    # the promotion copy lands. See notes/host-mapped-arena.md and engine/cold_promotion.py.
+    cold = None
+
+    def attach_cold_pool(self, pool) -> None:
+        self.cold = pool
+        self.cold_this_call: dict[int, int] = {}     # expert id -> COLD slot, for the current call
+        self._cold_inflight: list = []               # (key, cold_slot, gen, event) awaiting landing
+        self.stats.setdefault("cold_fetches", 0)
+        self.stats.setdefault("cold_reuses", 0)
+        self.stats.setdefault("cold_promotions", 0)
+        self.stats.setdefault("cold_full", 0)
+
+    def cold_reap(self) -> int:
+        """Mark every promotion whose event has LANDED. Called at layer boundaries.
+
+        Polling `Event.query()` rather than synchronising is the whole point: the copy is allowed to
+        be in flight, it is only residency that must wait for it. An entry that has not landed stays
+        in the list and its hot slot stays protected.
+        """
+        if not self._cold_inflight:
+            return 0
+        keep, n = [], 0
+        for key, slot, gen, ev in self._cold_inflight:
+            if ev.query():
+                self.cold.promo.promo_done(slot, gen)
+                self.stats["cold_promotions"] += 1
+                n += 1
+            else:
+                keep.append((key, slot, gen, ev))
+        self._cold_inflight = keep
+        return n
+
+    def cold_finish_layer(self, hot_arena, stream=None) -> None:
+        """After the cold PHASE has run: its slots are consumed, so promotion may be issued.
+
+        Order matters for ownership, not speed. Issuing the copy after the cold kernel means the cold
+        record has one reader at a time; issuing it before would give it two and releasing the slot on
+        either one's completion would corrupt the other. Job 1070 measured 'before' 2 % faster and it
+        is not worth that.
+        """
+        if not self.cold or not self.cold_this_call:
+            return
+        for e, cslot in self.cold_this_call.items():
+            key = (self._cold_layer, e)
+            ent = self.cold.promo._inflight.get(key)
+            if ent is None:                      # already landed and released
+                continue
+            slot, gen, _hot = ent
+            self.cold.promo.compute_done(slot, gen)
+            _s, _g, ev = self.cold.promote(key, hot_arena, stream=stream)
+            self._cold_inflight.append((key, _s, _g, ev))
+        self.cold_this_call = {}
+
     def _shard(self, name: str) -> ShardFile:
         f = self.index[name]
         if f not in self.shards:
@@ -579,9 +635,17 @@ class ExpertStore:
         Costs one set union per miss ONLY while something is pending; today nothing defers on the
         decode path, so it is a single empty-set test per miss.
         """
-        if not self._pending_slots:
+        pend = self._pending_slots
+        if self.cold is not None:
+            # A promotion destination holds no key yet, so nothing else in the eviction path keeps
+            # its hands off it -- and being unmapped is exactly what makes it attractive to a victim
+            # search. Handing it to another expert mid-copy would corrupt both.
+            hot = self.cold.promo.pending_hot()
+            if hot:
+                pend = pend | hot
+        if not pend:
             return used
-        return set(used) | self._pending_slots
+        return set(used) | pend
 
     def _lru_slot_for(self, key: tuple, used: set | frozenset = frozenset()) -> int:
         """Reserve an LRU slot for `key` (evicting if needed). Caller loads it.
@@ -732,6 +796,13 @@ class ExpertStore:
         # per token, for 36 numbers.
         ex = experts.to("cpu", dtype=torch.int32, non_blocking=False).numpy()
         uniq = np.unique(ex)
+        if self.cold is not None:
+            # Retire any promotion that has LANDED before this layer decides residency, so an expert
+            # promoted during the previous layer counts as an ordinary resident here rather than
+            # being fetched again.
+            self.cold_reap()
+            self.cold_this_call = {}
+            self._cold_layer = layer
         slot_of = {}
         to_load = []
         used: set[int] = set()  # slots already promised in this call -- never recycle one of them
@@ -741,6 +812,18 @@ class ExpertStore:
         # the duplicate index in moe_forward's `y[t] +=` dropped one contribution).
         for e in uniq.tolist():
             key = (layer, e)
+            if self.cold is not None:
+                ent = self.cold.promo._inflight.get(key)
+                if ent is not None:
+                    # PUBLISHED IS NOT LANDED. The hot slot is reserved and being copied into; the
+                    # bytes are only in the cold slot, so that is where this layer must read them.
+                    cslot, _gen, hslot = ent
+                    slot_of[e] = hslot
+                    self.cold_this_call[e] = cslot
+                    used.add(hslot)
+                    self.stats["hits"] += 1
+                    self.stats["cold_reuses"] += 1
+                    continue
             s = self.lru.get(key)
             if s is None:
                 s = self.transient_map.get(key)
@@ -771,6 +854,23 @@ class ExpertStore:
             else:
                 self.stats["misses"] += 1
                 s = self._lru_slot_for(key, used)
+                if self.cold is not None:
+                    try:
+                        cslot, _gen = self.cold.fetch(key, s)
+                    except Exception as exc:     # pool full, or a short read
+                        # Fall back to the ordinary path for THIS expert. The pool running dry is a
+                        # real condition -- a layer can want up to 36 distinct experts -- and it must
+                        # degrade rather than fail.
+                        from engine.cold_promotion import ColdSlotBusy
+                        if not isinstance(exc, ColdSlotBusy):
+                            raise
+                        self.stats["cold_full"] += 1
+                    else:
+                        self.cold_this_call[e] = cslot
+                        self.stats["cold_fetches"] += 1
+                        slot_of[e] = s
+                        used.add(s)
+                        continue
             slot_of[e] = s
             used.add(s)
             to_load.append((key, s))

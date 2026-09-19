@@ -116,6 +116,25 @@ def test_compute_before_the_read_landed_is_refused():
         raise AssertionError("the cold phase was allowed to consume bytes that had not arrived")
 
 
+def test_model_class_structure_is_intact():
+    """A structural guard, because ast.parse is not one.
+
+    Inserting a module-level def between Model's methods terminates the class body and silently moves
+    every following method out of it -- 13 of them, including forward(), block() and moe(). That
+    parses cleanly and breaks the engine at import-time-plus-one. This asserts the shape instead.
+    """
+    import ast, os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tree = ast.parse(open(os.path.join(root, "engine", "model.py")).read())
+    classes = {n.name: [f.name for f in n.body if isinstance(f, ast.FunctionDef)]
+               for n in tree.body if isinstance(n, ast.ClassDef)}
+    model = classes.get("Model")
+    assert model is not None, "engine/model.py has no Model class"
+    for must in ("forward", "block", "moe", "moe_apply", "dspark_draft", "decoder_replay"):
+        assert must in model, f"Model.{must} is missing -- the class body was terminated early"
+    assert len(model) >= 20, f"Model has only {len(model)} methods; expected 20+"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for f in fns:

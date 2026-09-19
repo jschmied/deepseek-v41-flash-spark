@@ -1174,6 +1174,49 @@ def moe_v3_phase(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, ar
         num_warps=nw2, num_stages=ns2, PACKED=_packed(arena), RSTRIDE=_rstride(arena))
 
 
+def moe_forward_cold_split(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor,
+                           hot, cold, cold_of: dict, swiglu_limit: float = 10.0,
+                           block_m: int | None = None) -> torch.Tensor:
+    """One layer where some experts' bytes are resident and the rest are in the mapped cold pool.
+
+    `cold_of` maps HOT slot id -> COLD pool slot id for the experts whose bytes have not been
+    promoted yet. Both arenas are record-major and the kernels take each one's own RSTRIDE, so the
+    two phases differ only in which buffer they read.
+
+    The arithmetic is the unsplit arithmetic. One routing built from the full slot list, the other
+    phase's blocks masked to -1 (which both kernels early-out on), ONE h/parts across both, and one
+    fixed-order reduction at the end -- the contract moe_v3_phase documents and
+    tools/test_moe_split_bitwise.py gates. Masking the SLOTS instead would overrun
+    build_routing_small's per-block pair list; masking the BLOCK LIST is what is correct.
+
+    Builds its masks on the host, so this is the non-graph path. The graph path needs them produced
+    on device from the routing itself, which is a separate change.
+    """
+    T, K = slots.shape
+    P = T * K
+    BM = block_m or _pick_bm(P)
+    if P <= 64:
+        bs, bp, NB = build_routing_small(slots, BM)
+    else:
+        bs, bp, NB = build_routing(slots, hot.slots, BM)
+    bsl = bs.tolist()
+    hot_l, cold_l = [], []
+    for sv in bsl:
+        c = cold_of.get(sv)
+        hot_l.append(-1 if (sv < 0 or c is not None) else sv)
+        cold_l.append(c if (sv >= 0 and c is not None) else -1)
+    dev = bs.device
+    bs_hot = torch.tensor(hot_l, dtype=bs.dtype, device=dev)
+    bs_cold = torch.tensor(cold_l, dtype=bs.dtype, device=dev)
+    h = torch.empty((P, INTER), dtype=torch.bfloat16, device=x.device)
+    parts = torch.empty((P, DIM), dtype=torch.float32, device=x.device)
+    moe_v3_phase(x, slots, weights, hot, h, parts, swiglu_limit, block_m=BM,
+                 routing=(bs_hot, bp, NB))
+    moe_v3_phase(x, slots, weights, cold, h, parts, swiglu_limit, block_m=BM,
+                 routing=(bs_cold, bp, NB))
+    return moe_v3_reduce(parts, T, K)
+
+
 def moe_v3_reduce(parts: torch.Tensor, T: int, K: int) -> torch.Tensor:
     """The one fixed-order reduction, unchanged from moe_forward_v3 and called once per layer."""
     return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)

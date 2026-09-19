@@ -720,7 +720,26 @@ class Model:
             self.stats["hits"] = self.stats.get("hits", 0) + indices.numel()
         else:
             slots = store.resolve(L, indices, prefill)
-        routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
+        # COLD PATH (DSV41_COLD_POOL). resolve() has put any expert whose bytes live in the mapped
+        # pool into store.cold_this_call; those are computed from the pool in a second phase and the
+        # promotion is issued afterwards. The lookup is inline rather than a helper so nothing new is
+        # defined at module level here -- doing that once terminated the Model class body and moved
+        # thirteen methods, including forward(), out of it, which ast.parse accepts happily.
+        cold_of = None
+        if getattr(store, "cold", None) is not None and getattr(store, "cold_this_call", None):
+            infl = store.cold.promo._inflight
+            cold_of = {}
+            for _e, _c in store.cold_this_call.items():
+                _ent = infl.get((store._cold_layer, _e))
+                if _ent is not None:
+                    cold_of[_ent[2]] = _c            # hot slot -> cold slot
+        if cold_of:
+            import cb3_moe as _C3
+            routed = _C3.moe_forward_cold_split(y, slots, weights, arena, store.cold.arena,
+                                                cold_of, a.swiglu_limit).float()
+            store.cold_finish_layer(arena, stream=getattr(store, "cold_stream", None))
+        else:
+            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
         self._tap("moe_routed", L, routed); self._tap("moe_shared", L, shared)
         out = routed + shared

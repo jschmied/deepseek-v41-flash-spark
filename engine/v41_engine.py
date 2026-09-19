@@ -564,6 +564,10 @@ class V41Engine:
         # the machine (see MemoryWatchdog)
         self.mem_watchdog = MemoryWatchdog(floor_gb=float(os.environ.get("DSV41_MEM_FLOOR_GB", "2.5")),
                                            log=log).start()
+        # DSV41_COLD_POOL: read a decode miss by O_DIRECT straight into a mapped record slot, compute
+        # it there, and promote it into the hot arena afterwards. Off by default. The pool is
+        # allocated once because decode graphs bake base pointers. See notes/host-mapped-arena.md.
+        self._cold_pool = None
         self.arena = make_expert_arena(slots)
         self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
                                     io_threads=io_threads)
@@ -576,6 +580,19 @@ class V41Engine:
                                               s3.view(*EX.S13_SHAPE))
         log("DSpark experts resident")
 
+        if os.environ.get("DSV41_COLD_POOL", "0") == "1":
+            _pack = os.environ.get("DSV41_CB3_CACHE")
+            if not _pack:
+                raise RuntimeError("DSV41_COLD_POOL needs DSV41_CB3_CACHE: the pool is filled by "
+                                   "O_DIRECT off the pack")
+            from engine.cold_pool import ColdPool
+            _n = int(os.environ.get("DSV41_COLD_SLOTS", "64"))
+            self._cold_pool = ColdPool(_pack, n_slots=_n)
+            self.store.attach_cold_pool(self._cold_pool)
+            self.store.cold_stream = torch.cuda.Stream()
+            log(f"cold pool: {_n} mapped record slots "
+                f"({_n * self._cold_pool.arena.rstride / 2**20:.0f} MiB pinned), promotion on a side "
+                f"stream after the cold phase")
         self.model = Model(self.W, self.store, self.caches, self.moe_fn, act_quant=act_quant)
         self.model.hash_state = make_hash_state(model_dir, self.tokenizer, max_seq, device)
         self.tables = {L: EngramTable(model_dir, index, L, device) for L in self.args.engram_layer_ids}

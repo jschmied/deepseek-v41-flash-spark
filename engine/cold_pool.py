@@ -82,7 +82,17 @@ class ColdPool:
         ctx = torch.cuda.stream(stream) if stream is not None else torch.cuda.stream(
             torch.cuda.current_stream())
         with ctx:
-            self.arena.promote_into(hot_arena, hot_slot, slot, non_blocking=True)
+            if getattr(hot_arena, "rstride", 0) == self.arena.rstride:
+                # Both record-major: ONE contiguous copy, which is the point of the layout.
+                self.arena.promote_into(hot_arena, hot_slot, slot, non_blocking=True)
+            else:
+                # Plane-major destination: twelve scatters, the very thing record-major removes.
+                # Kept so the cold path can be gated on without converting the main arena first --
+                # correct, slower, and the promotion cost measured this way is an upper bound.
+                import cb3_moe as _C3
+                for nm in _C3.PLANE_ORDER:
+                    getattr(hot_arena, nm)[hot_slot].view(-1).copy_(
+                        self.arena.slot_view(slot, nm).view(-1), non_blocking=True)
             ev = torch.cuda.Event()
             ev.record()
         self.stats["promotions"] += 1
